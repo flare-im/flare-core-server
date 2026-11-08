@@ -6,7 +6,11 @@
 //! - `flare:conn-builds:{<tenant>}:gateways`：有序集合，成员是写过这个租户的网关，分数是最后一次写入
 //!   的毫秒时间；读时只取 [`LIVE_WINDOW_MS`] 以内的成员，写时顺手删掉窗口外的。不用 KEYS/SCAN。
 //!
-//! 花括号里的租户是 Redis Cluster 的 hash tag：同一租户的键落在同一槽，MULTI 在集群下也成立。
+//! 网关一轮上报把各租户的 MULTI 块排进同一条流水线，一次往返写完；每个租户仍是自己的事务。
+//!
+//! 写端和读端现在都用单节点连接（`redis::Client`，不是集群客户端）。键名里花括号包住的租户是
+//! Redis Cluster 的 hash tag，同一租户的键落在同一槽，所以将来换集群客户端时每个租户的 MULTI 仍然
+//! 成立；跨租户不在一个事务里，本来也不需要。
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -127,10 +131,23 @@ pub async fn write_gateway_builds(
     fields: &[(String, u64)],
     now_ms: i64,
 ) -> redis::RedisResult<()> {
+    let mut pipe = redis::pipe();
+    queue_gateway_builds(&mut pipe, tenant_id, gateway_id, fields, now_ms);
+    pipe.query_async::<()>(connection).await
+}
+
+/// 把 [`write_gateway_builds`] 的一个租户排进 `pipe`：自成一个 `MULTI … EXEC` 块，多个租户可以排进
+/// 同一条（非 atomic 的）流水线一次发出。所有回复都忽略，任何一条出错整条流水线报错。
+pub fn queue_gateway_builds(
+    pipe: &mut redis::Pipeline,
+    tenant_id: &str,
+    gateway_id: &str,
+    fields: &[(String, u64)],
+    now_ms: i64,
+) {
     let key = builds_key(tenant_id, gateway_id);
     let gateways = gateways_key(tenant_id);
-    let mut pipe = redis::pipe();
-    pipe.atomic();
+    pipe.cmd("MULTI").ignore();
     pipe.cmd("DEL").arg(&key).ignore();
     if fields.is_empty() {
         pipe.cmd("ZREM").arg(&gateways).arg(gateway_id).ignore();
@@ -157,7 +174,7 @@ pub async fn write_gateway_builds(
         .arg("-inf")
         .arg(format!("({}", now_ms - LIVE_WINDOW_MS))
         .ignore();
-    pipe.query_async::<()>(connection).await
+    pipe.cmd("EXEC").ignore();
 }
 
 /// 汇总一个租户在存活网关上的构建分布；返回（各行，参与汇总的网关数）。

@@ -3,7 +3,7 @@
 //! 策略来自应用的 `client_policy` 投影，按发布清单平台段（`web`、`android`、`ios`、`tauri`、
 //! `electron`）取；没报构建号的连接按 0 判（预发布期不留宽容窗口）。
 
-use flare_access::manifest::release_platform;
+use flare_access::manifest::{normalize_device_platform, release_platform};
 use flare_im_contracts::domain::tenant::TenantClientPolicy;
 
 /// 为什么要求升级。
@@ -70,19 +70,20 @@ pub fn upgrade_verdict(
 }
 
 /// 门禁与构建分布用的平台：CONNECT 设备平台按 `flare_access::manifest::release_platform` 映射成
-/// 发布清单平台段；没有清单的平台（鸿蒙等）不设门禁，返回 `None`。
+/// 发布清单平台段（别名先归一，与 Social 网关同一处）。没有清单的平台（鸿蒙等）和认不出外壳的桌面
+/// （`distribution` 不是 `tauri` / `electron`）不设门禁，返回 `None`。
 pub fn gate_platform(device_platform: &str, distribution: Option<&str>) -> Option<&'static str> {
     release_platform(device_platform, distribution)
 }
 
-/// 构建分布统计里的平台标签：发布清单平台段；鸿蒙记 `harmonyos`，其余认不出的记 `other`
-/// （客户端自报的平台字符串不进指标标签）。
+/// 构建分布统计里的平台标签：发布清单平台段；鸿蒙记 `harmonyos`，其余认不出的（包括认不出外壳的
+/// 桌面）记 `other`（客户端自报的平台字符串不进指标标签）。
 pub fn stats_platform(device_platform: Option<&str>, distribution: Option<&str>) -> &'static str {
     let Some(device_platform) = device_platform else {
         return "other";
     };
     gate_platform(device_platform, distribution).unwrap_or_else(|| {
-        if device_platform.trim().eq_ignore_ascii_case("harmonyos") {
+        if normalize_device_platform(device_platform) == Some("harmonyos") {
             "harmonyos"
         } else {
             "other"
@@ -282,7 +283,13 @@ mod tests {
     #[test]
     fn platforms_follow_the_shared_release_mapping() {
         assert_eq!(gate_platform("pc", Some("electron")), Some("electron"));
-        assert_eq!(gate_platform("pc", None), Some("tauri"));
+        assert_eq!(gate_platform("pc", Some("tauri")), Some("tauri"));
+        assert_eq!(gate_platform("pc", None), None);
+        assert_eq!(gate_platform("pc", Some("direct")), None);
+        assert_eq!(gate_platform("desktop", Some("tauri")), Some("tauri"));
+        assert_eq!(gate_platform("iphone", None), Some("ios"));
+        assert_eq!(stats_platform(Some("pc"), None), "other");
+        assert_eq!(stats_platform(Some("harmony"), None), "harmonyos");
         assert_eq!(gate_platform("web", None), Some("web"));
         assert_eq!(gate_platform("harmonyos", None), None);
         assert_eq!(stats_platform(Some("harmonyos"), None), "harmonyos");

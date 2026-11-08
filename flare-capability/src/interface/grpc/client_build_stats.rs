@@ -1,9 +1,10 @@
 //! `flare.control.v1.ClientBuildStats` gRPC 实现：平台读一个应用在各接入网关上的（平台，构建）
 //! 在线连接数（版本分布）。
 //!
-//! 鉴权与 `TenantProjection` 相同：平台 worker 的控制断言（`FLARE_PLATFORM_PUBLIC_KEY`，audience
-//! `flare-core-projection`），令牌租户必须是请求的 `app_id` 或平台级 `*`。数据来自网关每 30s
-//! 写进 token_store Redis 的快照，最多滞后一个上报周期。
+//! 鉴权：平台 worker 的控制断言（`FLARE_PLATFORM_PUBLIC_KEY`，主体 `flare-platform-worker`），
+//! audience 是只读的 `flare-core-build-stats`（`CORE_BUILD_STATS_AUDIENCE`），与写投影的
+//! `flare-core-projection` 互不通用。令牌只能针对一个应用：租户必须正是请求的 `app_id`，平台级 `*`
+//! 拒绝。数据来自网关每 30s 写进 token_store Redis 的快照，最多滞后一个上报周期。
 
 use std::sync::Arc;
 
@@ -12,7 +13,8 @@ use flare_grpc_proto::control::{
     ConnectionBuildCount, ConnectionBuilds, GetConnectionBuildsRequest,
 };
 use flare_im_service_kit::control_auth::{
-    PlatformActorKind, PlatformAssertionVerifier, require_platform_assertion,
+    CORE_BUILD_STATS_AUDIENCE, PlatformActorKind, PlatformAssertionVerifier,
+    require_platform_assertion_for,
 };
 use tonic::{Request, Response, Status};
 
@@ -62,7 +64,11 @@ impl ClientBuildStats for ClientBuildStatsGrpcServer {
         &self,
         request: Request<GetConnectionBuildsRequest>,
     ) -> Result<Response<ConnectionBuilds>, Status> {
-        let actor = require_platform_assertion(&request, self.control_verifier.as_ref())?;
+        let actor = require_platform_assertion_for(
+            &request,
+            self.control_verifier.as_ref(),
+            CORE_BUILD_STATS_AUDIENCE,
+        )?;
         actor.require_kind(PlatformActorKind::ProjectionWorker)?;
         let app_id = request.into_inner().app_id;
         if !flare_im_contracts::domain::tenant::is_valid_tenant_id(&app_id)
@@ -70,9 +76,8 @@ impl ClientBuildStats for ClientBuildStatsGrpcServer {
         {
             return Err(Status::invalid_argument("app_id must be canonical"));
         }
-        if actor.tenant_id != "*" {
-            actor.require_tenant(&app_id)?;
-        }
+        // 一张令牌只读一个应用：平台级 `*` 在这里不算数。
+        actor.require_tenant(&app_id)?;
         let now_ms = now_ms();
         let summary = self
             .source
@@ -145,6 +150,15 @@ mod tests {
     }
 
     fn signed<T>(payload: T, tenant_id: &str, subject: &str) -> Request<T> {
+        signed_for(
+            payload,
+            tenant_id,
+            subject,
+            flare_im_service_kit::control_auth::CORE_BUILD_STATS_AUDIENCE,
+        )
+    }
+
+    fn signed_for<T>(payload: T, tenant_id: &str, subject: &str, audience: &str) -> Request<T> {
         let key = SigningKey::from_bytes(&[71; 32]);
         let private = key.to_pkcs8_pem(Default::default()).unwrap();
         let signer = flare_server_core::TokenService::from_ed25519_private_key(
@@ -154,12 +168,7 @@ mod tests {
         )
         .unwrap();
         let token = signer
-            .generate_with_ed25519(
-                subject,
-                Some(tenant_id),
-                "control",
-                flare_im_service_kit::control_auth::CORE_PROJECTION_AUDIENCE,
-            )
+            .generate_with_ed25519(subject, Some(tenant_id), "control", audience)
             .unwrap();
         let mut request = Request::new(payload);
         request
@@ -205,14 +214,28 @@ mod tests {
             ]
         );
         assert_eq!(*source.asked.lock().unwrap(), vec!["t1".to_string()]);
+    }
 
-        // 平台级令牌可以读任一应用
-        assert!(
-            server
-                .get_connection_builds(signed(ask("t2"), "*", WORKER))
-                .await
-                .is_ok()
-        );
+    #[tokio::test]
+    async fn platform_wide_and_projection_credentials_cannot_read_the_distribution() {
+        let (source, server) = server();
+        let status = server
+            .get_connection_builds(signed(ask("t1"), "*", WORKER))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+        let status = server
+            .get_connection_builds(signed_for(
+                ask("t1"),
+                "t1",
+                WORKER,
+                flare_im_service_kit::control_auth::CORE_PROJECTION_AUDIENCE,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(source.asked.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

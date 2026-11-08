@@ -323,6 +323,8 @@ impl Authenticator for AuthHandler {
                     .await
                 {
                     self.record_rejection(upgrade.reason.metric_label());
+                    // `release_hint` 恒为空：网关手里只有投影的构建策略，没有发布清单（版本说明、
+                    // 下载入口都在客户端已验签的发布清单里，客户端按 min_build 从那里取）。
                     return Ok(AuthResult::upgrade_required(upgrade.min_build, None));
                 }
 

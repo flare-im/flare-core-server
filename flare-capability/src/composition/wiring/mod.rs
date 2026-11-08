@@ -91,6 +91,10 @@ pub(crate) async fn initialize(
         TenantProjectionGrpcServer::new(Arc::clone(repository), platform_verifier.clone())
             .with_notices(notices.clone())
     });
+    // 在线构建分布：网关每 30s 写进 token_store Redis，这里汇总；鉴权与投影接收端相同。
+    let client_build_stats = connection_build_stats(&config)?.map(|source| {
+        crate::interface::grpc::ClientBuildStatsGrpcServer::new(source, platform_verifier.clone())
+    });
     // 管理员只读与投影接收端读同一张 `tenants` 表；开关读同一个策略后端。只认 admin-gateway
     // 转发的 Staff 上下文（Cell 公钥集，Staff 钉死 kid=gateway）。
     let capability_admin = CapabilityAdminGrpcServer::new(
@@ -158,6 +162,7 @@ pub(crate) async fn initialize(
         capability_grpc,
         capability_runtime,
         tenant_projection,
+        client_build_stats,
         tenant_notice,
         capability_admin,
         hook_config_listener,
@@ -165,6 +170,21 @@ pub(crate) async fn initialize(
         entity_lifecycle_worker,
         tenant_notice_relay,
     })
+}
+
+/// The online build distribution, read from the notice (token store) Redis the gateways write to.
+fn connection_build_stats(
+    config: &CapabilityServiceConfig,
+) -> Result<Option<Arc<dyn crate::domain::repository::connection_builds::ConnectionBuildStats>>> {
+    use crate::infrastructure::adapters::redis_connection_builds::RedisConnectionBuildStats;
+    let Some(url) = config.notice_redis_url.as_deref() else {
+        tracing::warn!("no token store Redis; ClientBuildStats is not served");
+        return Ok(None);
+    };
+    let client = redis::Client::open(url).map_err(|_| {
+        flare_server_core::error::FlareError::system("invalid connection build Redis URL")
+    })?;
+    Ok(Some(Arc::new(RedisConnectionBuildStats::new(client))))
 }
 
 /// The tenant notice channel, from the notice Redis URL. Absent: accepted plugin projections are

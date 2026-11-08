@@ -43,6 +43,8 @@ pub struct ApplicationContext {
     pub capability_runtime: Arc<CapabilityRuntimeConfig>,
     /// 控制面租户投影接收端（`flare.control.v1.TenantProjection`）；仅当配置了 PostgreSQL。
     pub tenant_projection: Option<TenantProjectionGrpcServer<PostgresTenantProjectionRepository>>,
+    /// 平台读在线构建分布（`flare.control.v1.ClientBuildStats`）；没有 token_store Redis 时缺席。
+    pub client_build_stats: Option<crate::interface::grpc::ClientBuildStatsGrpcServer>,
     /// 业务服务发布租户配置通知（`TenantNoticeService`）；没有通知通道或验签器时 fail closed。
     pub tenant_notice: crate::interface::grpc::TenantNoticeGrpcServer,
     /// 管理员只读（`CapabilityAdminService`）：租户开关与本地租户投影，只认转发的 Staff 上下文。

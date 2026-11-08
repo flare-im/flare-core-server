@@ -76,6 +76,17 @@ impl ConnectionBuildCounts {
         snapshot
     }
 
+    /// 有在线连接的全部租户各平台的构建分布，租户与平台都按名字排序。
+    pub fn snapshot(&self) -> Vec<(String, Vec<PlatformBuildDistribution>)> {
+        let mut tenants: Vec<&String> = self.counts.keys().map(|(tenant, _)| tenant).collect();
+        tenants.sort();
+        tenants.dedup();
+        tenants
+            .into_iter()
+            .map(|tenant| (tenant.clone(), self.tenant(tenant)))
+            .collect()
+    }
+
     /// 一个租户各平台的构建分布，平台按名字排序。
     pub fn tenant(&self, tenant_id: &str) -> Vec<PlatformBuildDistribution> {
         let mut platforms: Vec<_> = self
@@ -146,6 +157,22 @@ mod tests {
         // 1..=5 没列出：1、3 各两条，2、4、5 各一条
         assert_eq!(snapshot.other, 7);
         assert_eq!(snapshot.total(), 27);
+    }
+
+    #[test]
+    fn the_snapshot_lists_every_tenant_once() {
+        let mut counts = ConnectionBuildCounts::default();
+        counts.opened("t2", "web", 1);
+        counts.opened("t1", "web", 1);
+        counts.opened("t1", "ios", 2);
+        let snapshot = counts.snapshot();
+        assert_eq!(
+            snapshot
+                .iter()
+                .map(|(tenant, platforms)| (tenant.as_str(), platforms.len()))
+                .collect::<Vec<_>>(),
+            vec![("t1", 2), ("t2", 1)]
+        );
     }
 
     #[test]

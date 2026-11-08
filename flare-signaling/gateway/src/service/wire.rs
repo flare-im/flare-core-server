@@ -44,6 +44,9 @@ pub struct ApplicationContext {
     pub zone: Option<String>,
     /// 网关租约续期器（没配 Online 会话 Redis 时为 `None`）；startup 把续租循环挂进运行时。
     pub lease: Option<Arc<crate::service::gateway_lease::GatewayLeaseWriter>>,
+    /// 构建分布上报（没配 token_store Redis 时为 `None`）；startup 把上报循环挂进运行时。
+    pub build_reporter:
+        Option<Arc<crate::service::connection_build_reporter::ConnectionBuildReporter>>,
     /// 指标端点配置。带进上下文是为了让 startup 能真正起 serve_prometheus_metrics
     /// —— 网关此前只注册指标、从不暴露。
     pub metrics_config: flare_im_service_kit::metrics::MetricsEndpointConfig,
@@ -114,6 +117,29 @@ pub async fn initialize(
         None => {
             tracing::warn!(
                 "Online session redis not configured; gateway lease disabled (dead-gateway sessions expire with the session TTL)"
+            );
+            None
+        }
+    };
+
+    // 4a'. 构建分布上报：写进 token_store Redis（capability 从同一个 Redis 汇总），没配时不上报。
+    let build_reporter = match access_config.token_store_redis_url.as_deref() {
+        Some(url) => {
+            match crate::service::connection_build_reporter::ConnectionBuildReporter::open(
+                url,
+                gateway_id.clone(),
+                metrics.clone(),
+            ) {
+                Ok(reporter) => Some(Arc::new(reporter)),
+                Err(error) => {
+                    tracing::warn!(%error, "invalid token store redis url; connection build report disabled");
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "token store redis not configured; connection build distribution is not reported"
             );
             None
         }
@@ -377,5 +403,6 @@ pub async fn initialize(
         region,
         zone,
         lease,
+        build_reporter,
     })
 }

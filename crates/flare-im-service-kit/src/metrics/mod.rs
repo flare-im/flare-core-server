@@ -961,6 +961,15 @@ impl AccessGatewayMetrics {
             .tenant(tenant_id)
     }
 
+    /// 本网关全部租户的在线构建分布，供周期上报 Redis（见 `gateway::connection_builds`）。
+    pub fn connection_build_snapshot(&self) -> Vec<(String, Vec<PlatformBuildDistribution>)> {
+        self.builds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_tenant
+            .snapshot()
+    }
+
     fn update_builds(&self, tenant_id: &str, platform: &str, build: u64, opened: bool) {
         let mut guard = self.builds.lock().unwrap_or_else(PoisonError::into_inner);
         let state = &mut *guard;

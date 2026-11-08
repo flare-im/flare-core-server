@@ -142,41 +142,6 @@ pub fn requires_proof(message: &Message) -> bool {
     matches!(message.content.as_ref().and_then(|c|c.content.as_ref()),Some(Content::System(s)) if s.event_kind.starts_with("platform."))
 }
 
-#[cfg(test)]
-mod initial_key_encoding_tests {
-    use super::*;
-    use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
-
-    #[test]
-    fn purpose_inputs_load_canonical_der_pair_and_sign() {
-        let key = SigningKey::from_bytes(&[47; 32]);
-        let private = STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
-        let public = STANDARD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes());
-        let signer = ProofSigner::from_base64_der(&private).unwrap();
-        let verifier = ProofVerifier::from_base64_der(&public).unwrap();
-        let message = b"generic durable write provenance";
-        verifier.0.verify(message, &signer.0.sign(message)).unwrap();
-    }
-
-    #[test]
-    fn purpose_inputs_reject_swapped_keys_raw_bytes_and_pem() {
-        let key = SigningKey::from_bytes(&[48; 32]);
-        let private = STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
-        let public = STANDARD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes());
-        assert!(ProofSigner::from_base64_der(&public).is_err());
-        assert!(ProofVerifier::from_base64_der(&private).is_err());
-        for invalid in [
-            "",
-            "not a key",
-            "-----BEGIN PRIVATE KEY-----",
-            &STANDARD.encode([0; 32]),
-            &(private.clone() + "\n"),
-        ] {
-            assert!(ProofSigner::from_base64_der(invalid).is_err());
-            assert!(ProofVerifier::from_base64_der(invalid).is_err());
-        }
-    }
-}
 impl ProofVerifier {
     /// Canonical Base64 SPKI DER, never a private key or token encoding.
     pub fn from_base64_der(value: &str) -> Result<Self> {
@@ -287,4 +252,40 @@ pub fn queue_headers(
         );
     }
     Ok(headers)
+}
+
+#[cfg(test)]
+mod initial_key_encoding_tests {
+    use super::*;
+    use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+
+    #[test]
+    fn purpose_inputs_load_canonical_der_pair_and_sign() {
+        let key = SigningKey::from_bytes(&[47; 32]);
+        let private = STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
+        let public = STANDARD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes());
+        let signer = ProofSigner::from_base64_der(&private).unwrap();
+        let verifier = ProofVerifier::from_base64_der(&public).unwrap();
+        let message = b"generic durable write provenance";
+        verifier.0.verify(message, &signer.0.sign(message)).unwrap();
+    }
+
+    #[test]
+    fn purpose_inputs_reject_swapped_keys_raw_bytes_and_pem() {
+        let key = SigningKey::from_bytes(&[48; 32]);
+        let private = STANDARD.encode(key.to_pkcs8_der().unwrap().as_bytes());
+        let public = STANDARD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes());
+        assert!(ProofSigner::from_base64_der(&public).is_err());
+        assert!(ProofVerifier::from_base64_der(&private).is_err());
+        for invalid in [
+            "",
+            "not a key",
+            "-----BEGIN PRIVATE KEY-----",
+            &STANDARD.encode([0; 32]),
+            &(private.clone() + "\n"),
+        ] {
+            assert!(ProofSigner::from_base64_der(invalid).is_err());
+            assert!(ProofVerifier::from_base64_der(invalid).is_err());
+        }
+    }
 }

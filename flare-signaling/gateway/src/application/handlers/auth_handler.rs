@@ -9,12 +9,16 @@ use flare_server_core::auth::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 use crate::constants::{
     AUTH_FAILURE_MSG_AUTH_PROVIDER_UNAVAILABLE, AUTH_FAILURE_MSG_TENANT_RUNTIME_UNREADABLE,
     AUTH_FAILURE_MSG_TENANT_UNAVAILABLE, AUTH_FAILURE_MSG_TOKEN_INVALID, DEFAULT_TENANT_ID,
-    ENV_DEFAULT_TENANT_ID, METADATA_KEY_DEVICE_ID, METADATA_KEY_USER_ID,
+    ENV_DEFAULT_TENANT_ID, METADATA_KEY_APP_BUILD, METADATA_KEY_DEVICE_ID,
+    METADATA_KEY_DISTRIBUTION, METADATA_KEY_USER_ID,
+};
+use crate::domain::service::client_build_gate::{
+    UpgradeRequired, gate_platform, reported_build, upgrade_verdict,
 };
 
 /// 令牌校验的结论。
@@ -97,6 +101,47 @@ impl AuthHandler {
             metrics.record_connect_access_serial(tenant_id, reported, latest);
         }
         latest
+    }
+
+    /// 记一次被拒的 CONNECT（`handshake_rejected_total{reason}`）。
+    fn record_rejection(&self, reason: &str) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_handshake_rejected(reason);
+        }
+    }
+
+    /// 版本门禁：按应用的客户端策略判定这台设备的构建是否必须升级。没有设备信息、平台没有发布清单
+    /// （鸿蒙等）或应用没有策略时放行；没报构建号按 0 判。
+    async fn upgrade_gate(
+        &self,
+        tenant_id: &str,
+        device_info: Option<&DeviceInfo>,
+        connection_id: &str,
+    ) -> Option<UpgradeRequired> {
+        let device = device_info?;
+        let distribution = device
+            .metadata
+            .get(METADATA_KEY_DISTRIBUTION)
+            .map(String::as_str);
+        let platform = gate_platform(device.platform.as_str(), distribution)?;
+        let policy = self.tenant_runtime.client_policy(tenant_id).await?;
+        let build = reported_build(
+            device
+                .metadata
+                .get(METADATA_KEY_APP_BUILD)
+                .map(String::as_str),
+        );
+        let verdict = upgrade_verdict(&policy, platform, build, now_ms())?;
+        info!(
+            connection_id = %connection_id,
+            tenant_id = %tenant_id,
+            platform,
+            app_build = build,
+            min_build = verdict.min_build,
+            reason = verdict.reason.metric_label(),
+            "connection rejected: client build must be upgraded"
+        );
+        Some(verdict)
     }
 
     /// 租户闸门：`suspended` / `deleting` 一律拒；未投影或投影库不可用按策略（宽松放行、严格拒绝）。
@@ -250,12 +295,14 @@ impl Authenticator for AuthHandler {
                 match self.tenant_admission(&tenant_id, connection_id).await {
                     TenantAdmission::Admitted => {}
                     TenantAdmission::Rejected => {
+                        self.record_rejection("tenant_unavailable");
                         return Ok(AuthResult::failure(
                             AUTH_FAILURE_MSG_TENANT_UNAVAILABLE.to_string(),
                         ));
                     }
                     // flare-core 以 SERVICE_UNAVAILABLE 拒绝 CONNECT；说明文本不下发给客户端
                     TenantAdmission::Unreadable => {
+                        self.record_rejection("tenant_unreadable");
                         return Ok(AuthResult::retryable_failure(
                             AUTH_FAILURE_MSG_TENANT_RUNTIME_UNREADABLE.to_string(),
                         ));
@@ -264,8 +311,20 @@ impl Authenticator for AuthHandler {
                 let device_id =
                     match self.resolve_bound_device_id(&principal, device_info, connection_id) {
                         Ok(device_id) => device_id,
-                        Err(reason) => return Ok(AuthResult::failure(reason)),
+                        Err(reason) => {
+                            self.record_rejection("device_binding_mismatch");
+                            return Ok(AuthResult::failure(reason));
+                        }
                     };
+                // 版本门禁在租户准入之后：停用的租户先按租户不可用拒，不提示升级。
+                // flare-core 以 UPGRADE_REQUIRED 拒绝 CONNECT，客户端进入强制更新、不重连。
+                if let Some(upgrade) = self
+                    .upgrade_gate(&tenant_id, device_info, connection_id)
+                    .await
+                {
+                    self.record_rejection(upgrade.reason.metric_label());
+                    return Ok(AuthResult::upgrade_required(upgrade.min_build, None));
+                }
 
                 // 构建用户元数据（包含 tenant_id、device_id 等信息）
                 let mut user_metadata = std::collections::HashMap::new();
@@ -292,16 +351,27 @@ impl Authenticator for AuthHandler {
                     token_sha256 = %Self::token_fingerprint(token),
                     "Token 验证失败"
                 );
+                self.record_rejection("token_invalid");
                 Ok(AuthResult::failure(
                     AUTH_FAILURE_MSG_TOKEN_INVALID.to_string(),
                 ))
             }
             // flare-core 以 SERVICE_UNAVAILABLE 拒绝 CONNECT；说明文本不下发给客户端
-            TokenVerdict::ProviderUnavailable => Ok(AuthResult::retryable_failure(
-                AUTH_FAILURE_MSG_AUTH_PROVIDER_UNAVAILABLE.to_string(),
-            )),
+            TokenVerdict::ProviderUnavailable => {
+                self.record_rejection("auth_provider_unavailable");
+                Ok(AuthResult::retryable_failure(
+                    AUTH_FAILURE_MSG_AUTH_PROVIDER_UNAVAILABLE.to_string(),
+                ))
+            }
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn default_tenant_id() -> String {
@@ -800,6 +870,160 @@ mod tests {
                 .unwrap();
             assert_eq!(counter.get(), before + 1, "{reported:?}");
         }
+    }
+
+    /// 应用 tenant-a 在 android 上要求最低构建 200，并封禁 300–301。
+    struct BuildPolicies;
+
+    #[async_trait]
+    impl TenantRuntimeSource for BuildPolicies {
+        async fn load(&self, _tenant_id: &str) -> Result<Option<TenantRuntimeSnapshot>, String> {
+            Ok(None)
+        }
+
+        async fn load_client_policy(
+            &self,
+            tenant_id: &str,
+        ) -> Result<Option<TenantClientPolicy>, String> {
+            use flare_im_contracts::domain::tenant::{ClientBuildPolicy, ClientBuildRange};
+            Ok((tenant_id == "tenant-a").then(|| TenantClientPolicy {
+                tenant_id: tenant_id.to_string(),
+                version: 1,
+                build_policies: std::collections::BTreeMap::from([(
+                    "android".to_string(),
+                    ClientBuildPolicy {
+                        min_build: 200,
+                        min_build_effective_from_ms: 0,
+                        blocked: vec![ClientBuildRange { from: 300, to: 301 }],
+                    },
+                )]),
+                ..Default::default()
+            }))
+        }
+    }
+
+    fn device_with_build(platform: DevicePlatform, build: Option<&str>) -> DeviceInfo {
+        let device = DeviceInfo::new("device-a".to_string(), platform);
+        match build {
+            Some(build) => {
+                device.with_metadata(METADATA_KEY_APP_BUILD.to_string(), build.to_string())
+            }
+            None => device,
+        }
+    }
+
+    /// 版本门禁：低于最低构建、没报构建、命中封禁区间都以升级拒绝并计数；达到最低构建、
+    /// 没有策略的平台（ios）和没有发布清单的平台（鸿蒙）放行。
+    #[tokio::test]
+    async fn the_version_gate_refuses_old_and_blocked_builds() {
+        let metrics = Arc::new(flare_im_service_kit::metrics::AccessGatewayMetrics::new());
+        let handler = handler(
+            Some(principal(None)),
+            TenantRuntimeCache::with_source(
+                Arc::new(BuildPolicies),
+                TenantRuntimeCacheOptions::default(),
+            ),
+            TenantAccessPolicy::Lenient,
+        )
+        .with_metrics(metrics.clone());
+        let rejected = |reason: &str| {
+            metrics
+                .handshake_rejected_total
+                .with_label_values(&[reason])
+                .get()
+        };
+
+        for (name, device, expected_min_build, reason) in [
+            (
+                "below min",
+                device_with_build(DevicePlatform::Android, Some("199")),
+                Some(200),
+                "below_min_build",
+            ),
+            (
+                "missing build",
+                device_with_build(DevicePlatform::Android, None),
+                Some(200),
+                "below_min_build",
+            ),
+            (
+                "unparseable build",
+                device_with_build(DevicePlatform::Android, Some("1.2.3")),
+                Some(200),
+                "below_min_build",
+            ),
+            (
+                "blocked build",
+                device_with_build(DevicePlatform::Android, Some("300")),
+                Some(302),
+                "blocked_build",
+            ),
+            (
+                "at min",
+                device_with_build(DevicePlatform::Android, Some("200")),
+                None,
+                "",
+            ),
+            (
+                "platform without policy",
+                device_with_build(DevicePlatform::IOS, Some("1")),
+                None,
+                "",
+            ),
+            (
+                "platform without release manifest",
+                device_with_build(DevicePlatform::HarmonyOS, Some("1")),
+                None,
+                "",
+            ),
+        ] {
+            let before = (!reason.is_empty()).then(|| rejected(reason));
+            let result = handler
+                .authenticate("token", "conn-a", Some(&device), None)
+                .await
+                .unwrap();
+            match expected_min_build {
+                Some(min_build) => {
+                    assert!(!result.authenticated, "{name}");
+                    assert!(!result.retryable, "{name}");
+                    assert_eq!(
+                        result.upgrade_required.map(|upgrade| upgrade.min_build),
+                        Some(min_build),
+                        "{name}"
+                    );
+                    assert_eq!(rejected(reason), before.unwrap() + 1, "{name}");
+                }
+                None => {
+                    assert!(result.authenticated, "{name}");
+                    assert_eq!(result.upgrade_required, None, "{name}");
+                }
+            }
+        }
+
+        // 别的应用没有策略：同样的旧构建放行
+        let mut other = principal(None);
+        other.tenant_id = Some("tenant-b".to_string());
+        let result = handler_with(other)
+            .authenticate(
+                "token",
+                "conn-a",
+                Some(&device_with_build(DevicePlatform::Android, Some("1"))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.authenticated);
+    }
+
+    fn handler_with(principal: AuthenticatedPrincipal) -> AuthHandler {
+        handler(
+            Some(principal),
+            TenantRuntimeCache::with_source(
+                Arc::new(BuildPolicies),
+                TenantRuntimeCacheOptions::default(),
+            ),
+            TenantAccessPolicy::Lenient,
+        )
     }
 
     /// 令牌校验按给定错误失败。

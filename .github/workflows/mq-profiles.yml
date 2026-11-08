@@ -51,6 +51,7 @@ jobs:
           clone https://github.com/flare-im/flare-protocol.git "../flare-protocol"
           clone https://github.com/flare-im/flare-protocol-grpc.git "../flare-protocol-grpc"
           clone https://github.com/flare-im/flare-server-runtime.git "../flare-server-runtime"
+          clone https://github.com/flare-im/flare-core-sdk-engine.git "../flare-core-sdk-engine"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -100,6 +101,7 @@ jobs:
           clone https://github.com/flare-im/flare-protocol.git "../flare-protocol"
           clone https://github.com/flare-im/flare-protocol-grpc.git "../flare-protocol-grpc"
           clone https://github.com/flare-im/flare-server-runtime.git "../flare-server-runtime"
+          clone https://github.com/flare-im/flare-core-sdk-engine.git "../flare-core-sdk-engine"
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

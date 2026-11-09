@@ -25,18 +25,15 @@ if [ -n "$missing" ]; then
   exit 0
 fi
 
-# 平台 SDK：packages/ 下的目录，排除非平台的共享包。
-# 这个排除清单本身是约定——新增一个共享目录时要记得加进来，
-# 否则平台数会莫名其妙多一。
-# flare-core-flutter-storage 是 Flutter SDK 的凭据存储附加包，flare-core-plugin-vue-ui
-# 是 Vue 宿主的插件页面层：都依附某个平台 SDK，本身不是平台。
-NON_PLATFORM="shared dart flare-core-flutter-storage flare-core-plugin-vue-ui"
+# 平台 SDK：packages/ 下名为 `flare-core-<平台>-sdk` 的目录，一个平台一个。
+# packages/ 里还有挂在某个平台 SDK 上的附加包：更新（-update、-update-play、-update-ui）、
+# 生命周期（-lifecycle）、推送（-push）、凭据存储（-storage）、Vue 插件页面层（-plugin-vue-ui）。
+# 它们依附某个平台 SDK，本身不是平台。以前按「全部目录减排除清单」计数，
+# 每加一个附加包平台数就凭空多一（更新中心一次加了九个，数成 15），所以改成按后缀认平台。
+# 新增平台时目录名要以 -sdk 结尾，否则不计入。
 platform_count=0
-for d in "$CLIENT_SDK"/packages/*/; do
-  name="$(basename "$d")"
-  skip=0
-  for x in $NON_PLATFORM; do [ "$name" = "$x" ] && skip=1; done
-  [ "$skip" -eq 0 ] && platform_count=$((platform_count+1))
+for d in "$CLIENT_SDK"/packages/*-sdk/; do
+  [ -d "$d" ] && platform_count=$((platform_count+1))
 done
 
 # 只认 components 这一个字段，不做「取不到就退回数顶层键」的兜底。

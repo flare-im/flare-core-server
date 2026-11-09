@@ -356,6 +356,17 @@ impl TenantRuntimeCache {
             .await
     }
 
+    /// 丢掉一个应用缓存的客户端策略，下次读回源。收到这个应用的策略变更通知（`flare.access` /
+    /// `flare.release`）时调用，不必等缓存过期。
+    pub async fn invalidate_client_policy(&self, tenant_id: &str) {
+        if let Some(inner) = self.inner.as_ref() {
+            inner
+                .client_policies
+                .invalidate(&normalize_tenant_id(tenant_id))
+                .await;
+        }
+    }
+
     /// 应用已发布的接入清单 serial；读不到为 0（客户端据此不刷新）。
     pub async fn access_serial(&self, tenant_id: &str) -> u64 {
         self.client_policy(tenant_id)
@@ -624,6 +635,35 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(cache.access_serial("t1").await, 8);
         assert_eq!(source.policy_loads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_invalidated_client_policy_is_read_again_inside_the_interval() {
+        let source = MemorySource::new();
+        source
+            .policies
+            .lock()
+            .unwrap()
+            .insert("t1".into(), policy("t1", 7));
+        let cache = cache(&source, Duration::from_secs(60), 1024);
+        assert_eq!(cache.access_serial("t1").await, 7);
+
+        source
+            .policies
+            .lock()
+            .unwrap()
+            .insert("t1".into(), policy("t1", 8));
+        cache.invalidate_client_policy("t1").await;
+        assert_eq!(cache.access_serial("t1").await, 8);
+        assert_eq!(source.policy_loads.load(Ordering::SeqCst), 2);
+
+        // 另一个应用的条目不受影响；未启用的缓存什么也不做
+        cache.invalidate_client_policy("t2").await;
+        assert_eq!(cache.access_serial("t1").await, 8);
+        assert_eq!(source.policy_loads.load(Ordering::SeqCst), 2);
+        TenantRuntimeCache::disabled()
+            .invalidate_client_policy("t1")
+            .await;
     }
 
     #[tokio::test]

@@ -802,6 +802,9 @@ pub struct AccessGatewayMetrics {
     /// 在线连接数，按（租户，平台，构建）分桶；每个（租户，平台）只列最新的
     /// [`MAX_REPORTED_BUILDS`] 个构建，其余记在 `app_build="other"` 下
     pub connections_by_build: IntGaugeVec,
+    /// 已在线、之后被抬高的下限（最低构建号或封禁区间）判为必须升级而断开的连接，按原因分桶
+    /// （取值同 `handshake_rejected_total` 的版本门禁原因）
+    pub connections_evicted_total: IntCounterVec,
     builds: Mutex<BuildState>,
 }
 
@@ -913,9 +916,19 @@ impl AccessGatewayMetrics {
         )
         .expect("Failed to create connections_by_build metric");
 
+        let connections_evicted_total = IntCounterVec::new(
+            Opts::new(
+                "connections_evicted_total",
+                "Online connections closed because a raised client build floor now requires an upgrade, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("Failed to create connections_evicted_total metric");
+
         let _ = REGISTRY.register(Box::new(connect_access_serial_total.clone()));
         let _ = REGISTRY.register(Box::new(handshake_rejected_total.clone()));
         let _ = REGISTRY.register(Box::new(connections_by_build.clone()));
+        let _ = REGISTRY.register(Box::new(connections_evicted_total.clone()));
 
         Self {
             connections_active,
@@ -930,6 +943,7 @@ impl AccessGatewayMetrics {
             connect_access_serial_total,
             handshake_rejected_total,
             connections_by_build,
+            connections_evicted_total,
             builds: Mutex::new(BuildState::default()),
         }
     }
@@ -938,6 +952,14 @@ impl AccessGatewayMetrics {
     /// 不能带客户端自报的内容。
     pub fn record_handshake_rejected(&self, reason: &str) {
         self.handshake_rejected_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// 记录一条因下限抬高被要求升级并断开的在线连接。`reason` 取版本门禁的固定集合
+    /// （`below_min_build`、`blocked_build`），与 CONNECT 被拒时同一套取值。
+    pub fn record_connection_evicted(&self, reason: &str) {
+        self.connections_evicted_total
             .with_label_values(&[reason])
             .inc();
     }
@@ -1261,6 +1283,23 @@ mod tests {
                 .with_label_values(&["below_min_build"])
                 .get(),
             1
+        );
+
+        metrics.record_connection_evicted("blocked_build");
+        metrics.record_connection_evicted("blocked_build");
+        assert_eq!(
+            metrics
+                .connections_evicted_total
+                .with_label_values(&["blocked_build"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .connections_evicted_total
+                .with_label_values(&["below_min_build"])
+                .get(),
+            0
         );
     }
 

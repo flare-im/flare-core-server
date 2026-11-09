@@ -91,6 +91,43 @@ pub fn stats_platform(device_platform: Option<&str>, distribution: Option<&str>)
     })
 }
 
+/// 一条已在线连接的门禁输入，取自它 CONNECT 时的设备信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveClientBuild {
+    pub connection_id: String,
+    /// CONNECT 设备平台（未归一）
+    pub device_platform: String,
+    /// CONNECT 元数据 `distribution`
+    pub distribution: Option<String>,
+    /// CONNECT 元数据 `app_build`，没报按 0
+    pub app_build: u64,
+}
+
+impl LiveClientBuild {
+    /// 按当前策略判这条连接：与 CONNECT 门禁同一套规则（平台映射、构建号缺省、生效时间）。
+    pub fn verdict(&self, policy: &TenantClientPolicy, now_ms: i64) -> Option<UpgradeRequired> {
+        let platform = gate_platform(&self.device_platform, self.distribution.as_deref())?;
+        upgrade_verdict(policy, platform, self.app_build, now_ms)
+    }
+}
+
+/// 下限抬高后必须断开的在线连接：在 CONNECT 时会被拒的那些，带上各自要升级到的构建号。
+/// 顺序与输入一致。
+pub fn connections_below_floor<'a>(
+    policy: &TenantClientPolicy,
+    connections: impl IntoIterator<Item = &'a LiveClientBuild>,
+    now_ms: i64,
+) -> Vec<(&'a LiveClientBuild, UpgradeRequired)> {
+    connections
+        .into_iter()
+        .filter_map(|connection| {
+            connection
+                .verdict(policy, now_ms)
+                .map(|verdict| (connection, verdict))
+        })
+        .collect()
+}
+
 /// CONNECT 上报的构建号：没报、不是十进制整数都按 0。
 pub fn reported_build(value: Option<&str>) -> u64 {
     value
@@ -296,6 +333,89 @@ mod tests {
         assert_eq!(stats_platform(Some("android"), Some("play")), "android");
         assert_eq!(stats_platform(Some("toaster"), None), "other");
         assert_eq!(stats_platform(None, None), "other");
+    }
+
+    fn live(id: &str, platform: &str, distribution: Option<&str>, build: u64) -> LiveClientBuild {
+        LiveClientBuild {
+            connection_id: id.to_string(),
+            device_platform: platform.to_string(),
+            distribution: distribution.map(str::to_string),
+            app_build: build,
+        }
+    }
+
+    #[test]
+    fn a_raised_floor_selects_exactly_the_connections_connect_would_refuse() {
+        let policy = TenantClientPolicy {
+            tenant_id: "t1".to_string(),
+            build_policies: BTreeMap::from([
+                (
+                    "android".to_string(),
+                    ClientBuildPolicy {
+                        min_build: 200,
+                        ..ClientBuildPolicy::default()
+                    },
+                ),
+                (
+                    "electron".to_string(),
+                    ClientBuildPolicy {
+                        min_build: 0,
+                        min_build_effective_from_ms: 0,
+                        blocked: vec![ClientBuildRange { from: 40, to: 41 }],
+                    },
+                ),
+                (
+                    "ios".to_string(),
+                    ClientBuildPolicy {
+                        min_build: 500,
+                        min_build_effective_from_ms: NOW + 1,
+                        ..ClientBuildPolicy::default()
+                    },
+                ),
+            ]),
+            ..TenantClientPolicy::default()
+        };
+        let connections = [
+            live("old-android", "android", None, 199),
+            live("new-android", "android", Some("play"), 200),
+            live("unreported-android", "android", None, 0),
+            live("blocked-electron", "pc", Some("electron"), 41),
+            live("fine-electron", "pc", Some("electron"), 42),
+            // 认不出外壳的桌面与鸿蒙没有门禁：CONNECT 放行，在线也不断
+            live("bare-desktop", "pc", None, 1),
+            live("harmony", "harmonyos", None, 1),
+            // 下限还没生效
+            live("old-ios", "iphone", None, 1),
+        ];
+        let selected: Vec<(&str, UpgradeRequired)> =
+            connections_below_floor(&policy, &connections, NOW)
+                .into_iter()
+                .map(|(connection, verdict)| (connection.connection_id.as_str(), verdict))
+                .collect();
+        assert_eq!(
+            selected,
+            vec![
+                ("old-android", below(200).unwrap()),
+                ("unreported-android", below(200).unwrap()),
+                ("blocked-electron", blocked(42).unwrap()),
+            ]
+        );
+
+        // 下限到点生效之后，同一批连接里 iOS 的也要断
+        let later = connections_below_floor(&policy, &connections, NOW + 1);
+        assert_eq!(later.len(), 4);
+        assert_eq!(later[3].0.connection_id, "old-ios");
+        assert_eq!(later[3].1, below(500).unwrap());
+    }
+
+    #[test]
+    fn a_lowered_floor_selects_nobody() {
+        let policy = policy("android", ClientBuildPolicy::default());
+        let connections = [live("a", "android", None, 0), live("b", "android", None, 7)];
+        assert!(connections_below_floor(&policy, &connections, NOW).is_empty());
+        assert!(
+            connections_below_floor(&TenantClientPolicy::default(), &connections, NOW).is_empty()
+        );
     }
 
     #[test]

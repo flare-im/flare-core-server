@@ -2,6 +2,7 @@
 
 pub mod bootstrap;
 pub mod builder;
+pub(crate) mod build_floor_evictor;
 pub mod display;
 pub(crate) mod connection_build_reporter;
 pub(crate) mod gateway_lease;

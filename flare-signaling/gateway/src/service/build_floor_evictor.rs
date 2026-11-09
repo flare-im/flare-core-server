@@ -631,7 +631,8 @@ mod tests {
         .await;
 
         let policies = Arc::new(Policies(std::sync::Mutex::new(HashMap::from([
-            ("app-a".to_string(), android_floor("app-a", 100)),
+            // No floor yet: an unreported build counts as 0, so any floor would select it.
+            ("app-a".to_string(), android_floor("app-a", 0)),
             ("app-b".to_string(), android_floor("app-b", 0)),
         ]))));
         let cache = TenantRuntimeCache::with_source(

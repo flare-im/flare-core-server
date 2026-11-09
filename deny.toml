@@ -63,4 +63,15 @@ ignore = [
     #
     # 撤销条件：utoipa 升到 5.x 之后。
     "RUSTSEC-2024-0370",
+
+    # RUSTSEC-2026-0441 pin-utils 停止维护（上游仓 2026-10-01 归档，无漏洞，无修复版本）。
+    # 同上，只有 cargo-deny 把 unmaintained 当 error。
+    #
+    # 本仓没有直接依赖它，全部是传递引入：pin-utils 0.1.0 ← futures-util 0.3.31、
+    # hyper 1.7.0、wasmtimer 0.4.3。它只提供 `pin_mut!` 这类局部 pin 宏，
+    # 等价于标准库的 `core::pin::pin!`，没有运行时状态，也没有攻击面。
+    # 本仓自己不能替换它：要等这三个上游发版去掉依赖。
+    #
+    # 撤销条件：`Cargo.lock` 里不再出现 pin-utils（三个依赖方都升到不再依赖它的版本）。
+    "RUSTSEC-2026-0441",
 ]

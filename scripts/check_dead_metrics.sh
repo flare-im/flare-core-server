@@ -22,9 +22,10 @@ if not mod.exists():
     print("找不到 metrics 模块，跳过"); raise SystemExit(0)
 
 text = mod.read_text()
-fields = sorted(set(re.findall(
-    r'^    pub ([a-z_]+): (?:HistogramVec|Histogram|IntCounterVec|IntCounter|IntGauge)',
-    text, re.M)))
+field_types = dict(re.findall(
+    r'^    pub ([a-z_]+): ((?:HistogramVec|Histogram|IntCounterVec|IntCounter|IntGaugeVec|IntGauge))\b',
+    text, re.M))
+fields = sorted(field_types)
 
 # 仓库里除 metrics 模块外的全部 rs 源码，一次读完，避免逐字段起 grep 进程
 others = []
@@ -37,6 +38,44 @@ for p in root.rglob("*.rs"):
     except OSError:
         pass
 blob = "\n".join(others)
+
+# 写入经辅助函数转一手的也算：`export_builds(&self.connections_by_build, ..)` 这种
+# 把字段按引用传进一个函数、由函数体对形参调 `.with_label_values` / `.set` / `.inc` 的写法。
+# 只认「形参类型与字段类型相同、函数体里真对形参写了」的函数，单纯被传来传去读一下不算。
+WRITE_CALL = r'(?:with_label_values|set|inc|inc_by|dec|dec_by|add|sub|observe)'
+FN_RE = re.compile(r'\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>]*>)?\s*\(([^)]*)\)[^{;]*\{', re.S)
+
+def writer_params(source):
+    """{(函数名, 类型): 是否写了该类型的形参} —— 只收会写指标形参的函数。"""
+    found = set()
+    for m in FN_RE.finditer(source):
+        name, params = m.group(1), m.group(2)
+        # 函数体：从左花括号起按括号配平截到对应的右花括号
+        depth, i = 0, m.end() - 1
+        while i < len(source):
+            c = source[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        body = source[m.end():i]
+        for pm in re.finditer(r'([a-z_][a-z0-9_]*)\s*:\s*&\s*([A-Za-z]+)\b', params):
+            param, ty = pm.group(1), pm.group(2)
+            if re.search(r'\b' + re.escape(param) + r'\s*\.\s*' + WRITE_CALL + r'\s*\(', body):
+                found.add((name, ty))
+    return found
+
+writers = writer_params(text) | writer_params(blob)
+
+def written_via_helper(field, source):
+    ty = field_types[field]
+    for m in re.finditer(r'\b([a-z_][a-z0-9_]*)\s*\(\s*([^;]*?)&\s*(?:self|[a-z_][a-z0-9_]*)\.' + re.escape(field) + r'\s*[,)]', source, re.S):
+        if (m.group(1), ty) in writers:
+            return True
+    return False
 
 dead, checked = [], 0
 for f in fields:
@@ -51,6 +90,8 @@ for f in fields:
     written_in_mod = bool(use_re.search(text))
     written_outside = bool(use_re.search(blob))
     if not written_in_mod and not written_outside:
+        if written_via_helper(f, text) or written_via_helper(f, blob):
+            continue
         dead.append(f)
 
 if dead:

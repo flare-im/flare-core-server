@@ -1086,13 +1086,14 @@ async fn download_options_preserve_application_authority_ttl_usage_and_inline_be
     );
     assert!(download.cdn_url.is_empty());
     assert!(download.expires_at <= Utc::now() + Duration::seconds(60));
-    let captured = objects.captured.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    assert_eq!(
-        captured[0].content_disposition.as_deref(),
-        Some("attachment; filename=\"attachment.txt\"; filename*=UTF-8''attachment.txt")
-    );
-    drop(captured);
+    {
+        let captured = objects.captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].content_disposition.as_deref(),
+            Some("attachment; filename=\"attachment.txt\"; filename*=UTF-8''attachment.txt")
+        );
+    }
     let egress = f
         .usage
         .live()

@@ -296,7 +296,13 @@ async fn clear_for_everyone_advances_only_the_target_conversation_cutoff() {
     ));
     let ctx = Context::root().with_tenant_id("a");
 
-    assert_eq!(domain.clear_history_for_everyone(&ctx, "group").await.unwrap(), 6);
+    assert_eq!(
+        domain
+            .clear_history_for_everyone(&ctx, "group")
+            .await
+            .unwrap(),
+        6
+    );
     seed_message(&pool, "a", "group", "after-clear", 7, 40).await;
 
     let floors: Vec<(String, i64)> = sqlx::query_as(

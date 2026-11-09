@@ -79,7 +79,8 @@ impl ConversationReadService for ConversationGrpcHandler {
             .await
             .into_grpc()?;
 
-        self.protect_member_previews(&ctx, &mut bootstrap.summaries).await;
+        self.protect_member_previews(&ctx, &mut bootstrap.summaries)
+            .await;
         let response = ConversationBootstrapResponse {
             conversations: bootstrap.summaries.into_iter().map(proto_summary).collect(),
             recent_messages: bootstrap.recent_messages,
@@ -165,7 +166,10 @@ impl ConversationReadService for ConversationGrpcHandler {
                 .handle_find_conversation_members(&ctx, query)
                 .await
                 .into_grpc()?;
-            if !self.can_disclose_roster(&ctx, req.conversation_id.trim()).await? {
+            if !self
+                .can_disclose_roster(&ctx, req.conversation_id.trim())
+                .await?
+            {
                 participants.clear();
             }
             return Ok(Response::new(ListConversationParticipantsResponse {
@@ -206,7 +210,10 @@ impl ConversationReadService for ConversationGrpcHandler {
             )
             .await
             .into_grpc()?;
-        if !self.can_disclose_roster(&ctx, &page.conversation_id).await? {
+        if !self
+            .can_disclose_roster(&ctx, &page.conversation_id)
+            .await?
+        {
             page.participants.clear();
             page.next_cursor = None;
             page.has_more = false;

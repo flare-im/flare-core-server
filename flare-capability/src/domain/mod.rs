@@ -11,5 +11,7 @@ pub mod repository;
 pub mod service;
 
 pub use model::*;
+// Both layers have a `tenant_notice` module; name the model one so the globs do not collide.
+pub use model::tenant_notice;
 pub use repository::*;
 pub use service::HookOrchestrationService;

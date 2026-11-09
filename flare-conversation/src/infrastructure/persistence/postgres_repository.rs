@@ -1316,7 +1316,11 @@ impl ConversationRepository for PostgresConversationRepository {
     ) -> Result<u64> {
         let tenant_id = required_tenant(ctx)?;
         let mut tx = self.pool.begin().await.map_err(|e| {
-            map_infra_error(e, ErrorCode::DatabaseError, "begin conversation history clear")
+            map_infra_error(
+                e,
+                ErrorCode::DatabaseError,
+                "begin conversation history clear",
+            )
         })?;
         let cutoff: Option<i64> = sqlx::query_scalar(
             r#"
@@ -1374,10 +1378,18 @@ impl ConversationRepository for PostgresConversationRepository {
         .execute(&mut *tx)
         .await
         .map_err(|e| {
-            map_infra_error(e, ErrorCode::DatabaseError, "recompute unread after history clear")
+            map_infra_error(
+                e,
+                ErrorCode::DatabaseError,
+                "recompute unread after history clear",
+            )
         })?;
         tx.commit().await.map_err(|e| {
-            map_infra_error(e, ErrorCode::DatabaseError, "commit conversation history clear")
+            map_infra_error(
+                e,
+                ErrorCode::DatabaseError,
+                "commit conversation history clear",
+            )
         })?;
         Ok(cutoff.max(0) as u64)
     }

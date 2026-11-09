@@ -45,7 +45,10 @@ pub fn valid_topic(topic: &str) -> bool {
         .next()
         .is_some_and(|first| segment(first) && first.as_bytes()[0].is_ascii_lowercase());
     let rest: Vec<&str> = parts.collect();
-    topic.len() <= MAX_TOPIC_BYTES && first_ok && !rest.is_empty() && rest.iter().all(|s| segment(s))
+    topic.len() <= MAX_TOPIC_BYTES
+        && first_ok
+        && !rest.is_empty()
+        && rest.iter().all(|s| segment(s))
 }
 
 /// How long clients spread their re-reads of one notice: one re-read per `per_second` of this
@@ -128,7 +131,8 @@ mod tests {
         );
         let wide = TenantNotice::new(ALL_TENANTS, "social.features", 7);
         assert!(wide.tenant_wide());
-        let Some(data_packet::Payload::TenantNotice(packet)) = wide.downlink(5_000).unwrap().payload
+        let Some(data_packet::Payload::TenantNotice(packet)) =
+            wide.downlink(5_000).unwrap().payload
         else {
             panic!("tenant notice packet");
         };
@@ -153,7 +157,17 @@ mod tests {
             assert!(valid_topic(topic), "{topic}");
         }
         let long = format!("a.{}", "b".repeat(MAX_TOPIC_BYTES));
-        for topic in ["", "social", "Social.features", "1a.b", "a..b", "a.", ".a", "a.b c", &long] {
+        for topic in [
+            "",
+            "social",
+            "Social.features",
+            "1a.b",
+            "a..b",
+            "a.",
+            ".a",
+            "a.b c",
+            &long,
+        ] {
             assert!(!valid_topic(topic), "{topic:?}");
         }
     }

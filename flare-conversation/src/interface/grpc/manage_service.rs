@@ -204,7 +204,8 @@ impl ConversationManageService for ConversationGrpcHandler {
     async fn clear_conversation_history(
         &self,
         request: Request<flare_grpc_proto::conversation::ClearConversationHistoryRequest>,
-    ) -> Result<Response<flare_grpc_proto::conversation::ClearConversationHistoryResponse>, Status> {
+    ) -> Result<Response<flare_grpc_proto::conversation::ClearConversationHistoryResponse>, Status>
+    {
         use flare_grpc_proto::conversation::ClearConversationHistoryResponse;
         let ctx = authorize_purge_history(request.metadata(), self.purge_verifier.as_ref())?;
         let cleared_through_seq = self
@@ -212,7 +213,9 @@ impl ConversationManageService for ConversationGrpcHandler {
             .handle_clear_history_for_everyone(&ctx, &request.into_inner().conversation_id)
             .await
             .into_grpc()?;
-        Ok(Response::new(ClearConversationHistoryResponse { cleared_through_seq }))
+        Ok(Response::new(ClearConversationHistoryResponse {
+            cleared_through_seq,
+        }))
     }
 
     async fn manage_participants(

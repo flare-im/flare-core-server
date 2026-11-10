@@ -3,8 +3,12 @@
 //! 为各个服务模块提供统一的 Prometheus 指标收集与导出能力。
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,8 +29,13 @@ use tokio::{net::TcpListener, sync::oneshot};
 
 use crate::config::ServiceMetricsSection;
 
+pub mod connection_builds;
 mod grpc;
 mod http;
+pub use connection_builds::{
+    BuildDistribution, ConnectionBuildCounts, MAX_REPORTED_BUILDS, OTHER_BUILDS_LABEL,
+    PlatformBuildDistribution,
+};
 pub use grpc::{GrpcMetricsLayer, GrpcMetricsService, TRANSPORT_ERROR_CODE, UNKNOWN_METHOD};
 pub use http::{HttpMetricsLayer, HttpMetricsService, UNMATCHED_ROUTE};
 
@@ -788,6 +797,26 @@ pub struct AccessGatewayMetrics {
     pub online_cache_miss_total: IntCounter,
     /// 通过认证的 CONNECT，按客户端上报的接入清单 serial 与服务端已知值的关系分桶
     pub connect_access_serial_total: IntCounterVec,
+    /// 被拒的 CONNECT，按原因分桶（含版本门禁）
+    pub handshake_rejected_total: IntCounterVec,
+    /// 在线连接数，按（租户，平台，构建）分桶；每个（租户，平台）只列最新的
+    /// [`MAX_REPORTED_BUILDS`] 个构建，其余记在 `app_build="other"` 下
+    pub connections_by_build: IntGaugeVec,
+    /// 已在线、之后被抬高的下限（最低构建号或封禁区间）判为必须升级而断开的连接，按原因分桶
+    /// （取值同 `handshake_rejected_total` 的版本门禁原因）
+    pub connections_evicted_total: IntCounterVec,
+    builds: Mutex<BuildState>,
+}
+
+/// 构建分布的计数与已导出的序列。
+#[derive(Default)]
+struct BuildState {
+    /// 按真实租户计，供查询接口读
+    by_tenant: ConnectionBuildCounts,
+    /// 关闭租户标签时按聚合标签计，供导出
+    by_label: ConnectionBuildCounts,
+    /// 每个（租户标签，平台）上次导出的 `app_build` 标签值，下次导出时删掉不再列出的
+    exported: HashMap<(String, String), Vec<String>>,
 }
 
 impl AccessGatewayMetrics {
@@ -869,7 +898,37 @@ impl AccessGatewayMetrics {
         let _ = REGISTRY.register(Box::new(push_latency_seconds.clone()));
         let _ = REGISTRY.register(Box::new(online_cache_hit_total.clone()));
         let _ = REGISTRY.register(Box::new(online_cache_miss_total.clone()));
+        let handshake_rejected_total = IntCounterVec::new(
+            Opts::new(
+                "handshake_rejected_total",
+                "Rejected CONNECTs by reason, including the client version gate",
+            ),
+            &["reason"],
+        )
+        .expect("Failed to create handshake_rejected_total metric");
+
+        let connections_by_build = IntGaugeVec::new(
+            Opts::new(
+                "connections_by_build",
+                "Online connections by tenant, release platform and app build (newest builds only)",
+            ),
+            &["tenant_id", "platform", "app_build"],
+        )
+        .expect("Failed to create connections_by_build metric");
+
+        let connections_evicted_total = IntCounterVec::new(
+            Opts::new(
+                "connections_evicted_total",
+                "Online connections closed because a raised client build floor now requires an upgrade, by reason",
+            ),
+            &["reason"],
+        )
+        .expect("Failed to create connections_evicted_total metric");
+
         let _ = REGISTRY.register(Box::new(connect_access_serial_total.clone()));
+        let _ = REGISTRY.register(Box::new(handshake_rejected_total.clone()));
+        let _ = REGISTRY.register(Box::new(connections_by_build.clone()));
+        let _ = REGISTRY.register(Box::new(connections_evicted_total.clone()));
 
         Self {
             connections_active,
@@ -882,7 +941,81 @@ impl AccessGatewayMetrics {
             online_cache_hit_total,
             online_cache_miss_total,
             connect_access_serial_total,
+            handshake_rejected_total,
+            connections_by_build,
+            connections_evicted_total,
+            builds: Mutex::new(BuildState::default()),
         }
+    }
+
+    /// 记录一次被拒的 CONNECT。`reason` 必须取自固定集合（如 `token_invalid`、`below_min_build`），
+    /// 不能带客户端自报的内容。
+    pub fn record_handshake_rejected(&self, reason: &str) {
+        self.handshake_rejected_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// 记录一条因下限抬高被要求升级并断开的在线连接。`reason` 取版本门禁的固定集合
+    /// （`below_min_build`、`blocked_build`），与 CONNECT 被拒时同一套取值。
+    pub fn record_connection_evicted(&self, reason: &str) {
+        self.connections_evicted_total
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    /// 一条连接上线：计入（租户，平台，构建）。`platform` 是发布清单平台段，`build` 没报时为 0。
+    pub fn connection_build_opened(&self, tenant_id: &str, platform: &str, build: u64) {
+        self.update_builds(tenant_id, platform, build, true);
+    }
+
+    /// 一条连接下线：与 [`Self::connection_build_opened`] 成对，参数相同。
+    pub fn connection_build_closed(&self, tenant_id: &str, platform: &str, build: u64) {
+        self.update_builds(tenant_id, platform, build, false);
+    }
+
+    /// 本网关上一个租户各平台的在线构建分布（只含本实例的连接）。
+    pub fn connection_build_distribution(&self, tenant_id: &str) -> Vec<PlatformBuildDistribution> {
+        self.builds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_tenant
+            .tenant(tenant_id)
+    }
+
+    /// 本网关全部租户的在线构建分布，供周期上报 Redis（见 `gateway::connection_builds`）。
+    pub fn connection_build_snapshot(&self) -> Vec<(String, Vec<PlatformBuildDistribution>)> {
+        self.builds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_tenant
+            .snapshot()
+    }
+
+    fn update_builds(&self, tenant_id: &str, platform: &str, build: u64, opened: bool) {
+        let mut guard = self.builds.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *guard;
+        let apply = |counts: &mut ConnectionBuildCounts, tenant: &str| {
+            if opened {
+                counts.opened(tenant, platform, build)
+            } else {
+                counts.closed(tenant, platform, build)
+            }
+        };
+        let by_tenant = apply(&mut state.by_tenant, tenant_id);
+        let label = tenant_label(tenant_id);
+        let exported = if label == tenant_id {
+            by_tenant
+        } else {
+            apply(&mut state.by_label, label)
+        };
+        export_builds(
+            &self.connections_by_build,
+            &mut state.exported,
+            label,
+            platform,
+            &exported,
+        );
     }
 
     /// 记录一次通过认证的 CONNECT 上报的接入清单 serial：`current` 与投影一致，`behind` 落后，
@@ -951,6 +1084,45 @@ impl AccessGatewayMetrics {
         self.client_ack_received_total
             .with_label_values(&[tenant_label(tenant_id)])
             .inc();
+    }
+}
+
+/// 把一个（租户标签，平台）的分布写进 `connections_by_build`，并删掉上次导出、这次不再列出的序列。
+fn export_builds(
+    gauge: &IntGaugeVec,
+    exported: &mut HashMap<(String, String), Vec<String>>,
+    tenant: &str,
+    platform: &str,
+    distribution: &BuildDistribution,
+) {
+    let mut labels: Vec<String> = distribution
+        .builds
+        .iter()
+        .map(|(build, _)| build.to_string())
+        .collect();
+    if distribution.other > 0 {
+        labels.push(OTHER_BUILDS_LABEL.to_string());
+    }
+    let key = (tenant.to_string(), platform.to_string());
+    if let Some(previous) = exported.get(&key) {
+        for stale in previous.iter().filter(|label| !labels.contains(label)) {
+            let _ = gauge.remove_label_values(&[tenant, platform, stale.as_str()]);
+        }
+    }
+    for (build, connections) in &distribution.builds {
+        gauge
+            .with_label_values(&[tenant, platform, build.to_string().as_str()])
+            .set(i64::try_from(*connections).unwrap_or(i64::MAX));
+    }
+    if distribution.other > 0 {
+        gauge
+            .with_label_values(&[tenant, platform, OTHER_BUILDS_LABEL])
+            .set(i64::try_from(distribution.other).unwrap_or(i64::MAX));
+    }
+    if labels.is_empty() {
+        exported.remove(&key);
+    } else {
+        exported.insert(key, labels);
     }
 }
 
@@ -1040,6 +1212,95 @@ mod tests {
             ..ServiceMetricsSection::default()
         };
         assert!(MetricsEndpointConfig::from_section("media", Some(&bad_address)).is_err());
+    }
+
+    #[test]
+    fn exported_build_series_drop_builds_that_fall_out_of_the_list() {
+        let gauge = IntGaugeVec::new(
+            Opts::new("test_connections_by_build", "test"),
+            &["tenant_id", "platform", "app_build"],
+        )
+        .unwrap();
+        let mut exported = HashMap::new();
+        let mut counts = ConnectionBuildCounts::default();
+        for build in 1..=MAX_REPORTED_BUILDS as u64 {
+            let snapshot = counts.opened("t1", "android", build);
+            export_builds(&gauge, &mut exported, "t1", "android", &snapshot);
+        }
+        assert_eq!(gauge.with_label_values(&["t1", "android", "1"]).get(), 1);
+
+        // 第 21 个构建上线：最旧的 1 从列表里掉出，计入 other
+        let snapshot = counts.opened("t1", "android", 21);
+        export_builds(&gauge, &mut exported, "t1", "android", &snapshot);
+        assert_eq!(gauge.with_label_values(&["t1", "android", "21"]).get(), 1);
+        assert_eq!(
+            gauge
+                .with_label_values(&["t1", "android", OTHER_BUILDS_LABEL])
+                .get(),
+            1
+        );
+        let families = prometheus::core::Collector::collect(&gauge);
+        let series = families[0].get_metric();
+        assert_eq!(series.len(), MAX_REPORTED_BUILDS + 1);
+        assert!(series.iter().all(|metric| {
+            metric
+                .get_label()
+                .iter()
+                .all(|label| label.name() != "app_build" || label.value() != "1")
+        }));
+
+        // 全部下线：序列全部删除
+        for build in 1..=21u64 {
+            let snapshot = counts.closed("t1", "android", build);
+            export_builds(&gauge, &mut exported, "t1", "android", &snapshot);
+        }
+        assert!(
+            prometheus::core::Collector::collect(&gauge)[0]
+                .get_metric()
+                .is_empty()
+        );
+        assert!(exported.is_empty());
+    }
+
+    #[test]
+    fn connection_builds_are_queryable_by_tenant() {
+        let metrics = AccessGatewayMetrics::new();
+        metrics.connection_build_opened("tenant-q", "ios", 300);
+        metrics.connection_build_opened("tenant-q", "ios", 300);
+        metrics.connection_build_opened("tenant-q", "tauri", 12);
+        metrics.connection_build_closed("tenant-q", "ios", 300);
+        let distribution = metrics.connection_build_distribution("tenant-q");
+        assert_eq!(distribution.len(), 2);
+        assert_eq!(distribution[0].platform, "ios");
+        assert_eq!(distribution[0].distribution.builds, vec![(300, 1)]);
+        assert_eq!(distribution[1].platform, "tauri");
+        assert!(metrics.connection_build_distribution("other").is_empty());
+
+        metrics.record_handshake_rejected("below_min_build");
+        assert_eq!(
+            metrics
+                .handshake_rejected_total
+                .with_label_values(&["below_min_build"])
+                .get(),
+            1
+        );
+
+        metrics.record_connection_evicted("blocked_build");
+        metrics.record_connection_evicted("blocked_build");
+        assert_eq!(
+            metrics
+                .connections_evicted_total
+                .with_label_values(&["blocked_build"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            metrics
+                .connections_evicted_total
+                .with_label_values(&["below_min_build"])
+                .get(),
+            0
+        );
     }
 
     #[test]

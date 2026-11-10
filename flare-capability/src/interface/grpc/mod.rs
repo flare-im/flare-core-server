@@ -2,6 +2,7 @@
 
 pub mod capability;
 pub mod capability_admin;
+pub mod client_build_stats;
 pub mod extensions;
 pub mod hooks;
 pub mod resource_bridge;
@@ -13,6 +14,7 @@ pub use capability::{
     CapabilityGrpcServer, CapabilityInvocationMetrics, CapabilityMetricsSnapshot,
 };
 pub use capability_admin::CapabilityAdminGrpcServer;
+pub use client_build_stats::ClientBuildStatsGrpcServer;
 pub use extensions::ExtensionPluginRouter;
 pub use flare_grpc_proto::capability::capability_service_server::CapabilityServiceServer;
 pub use hooks::HookServiceServer;

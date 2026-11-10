@@ -309,7 +309,10 @@ impl ConversationQueryHandler {
         _message_provider: Option<Arc<StorageReaderClient>>,
         domain_service: Arc<DefaultConversationDomainService>,
     ) -> Self {
-        Self { conversation_repo, domain_service }
+        Self {
+            conversation_repo,
+            domain_service,
+        }
     }
 
     pub(crate) async fn external_roster_channel(

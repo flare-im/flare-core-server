@@ -4,11 +4,14 @@
 //! mint credentials, and neither a user access JWT nor a cell-internal `x-flare-ctx` is
 //! accepted here.
 //!
-//! Exactly one assertion reaches Core gRPC services on this boundary: the control assertion
-//! the platform sends directly (`token_use=control`, audience [`CORE_PROJECTION_AUDIENCE`]),
-//! and only for the two platform service subjects: the projection worker
-//! ([`PROJECTION_WORKER_SUBJECT`], Capability `TenantProjection`) and the scheduler
-//! ([`SCHEDULER_SUBJECT`], Online `KickTenant`). Employees never reach Core with a platform
+//! Exactly one kind of assertion reaches Core gRPC services on this boundary: the control
+//! assertion the platform sends directly (`token_use=control`), and only for the two platform
+//! service subjects: the projection worker ([`PROJECTION_WORKER_SUBJECT`], Capability
+//! `TenantProjection`) and the scheduler ([`SCHEDULER_SUBJECT`], Online `KickTenant`). Its
+//! audience names what it may do: [`CORE_PROJECTION_AUDIENCE`] writes projections and kicks
+//! tenants; [`CORE_BUILD_STATS_AUDIENCE`] only reads the per-build connection counts
+//! (`ClientBuildStats`). Neither audience is accepted where the other is expected, so a read
+//! credential cannot write a projection and a projection credential cannot read the stats. Employees never reach Core with a platform
 //! assertion: they come as a Staff `x-flare-ctx` signed by the gateway admin partition (see
 //! [`crate::staff_context`]), so an employee subject on this boundary is `UNAUTHENTICATED`.
 
@@ -21,6 +24,8 @@ use tonic::{Request, Status};
 
 pub const PLATFORM_ISSUER: &str = "flare-platform";
 pub const CORE_PROJECTION_AUDIENCE: &str = "flare-core-projection";
+/// Audience of the read-only `ClientBuildStats.GetConnectionBuilds` assertion.
+pub const CORE_BUILD_STATS_AUDIENCE: &str = "flare-core-build-stats";
 pub const PROJECTION_WORKER_SUBJECT: &str = "flare-platform-worker";
 pub const SCHEDULER_SUBJECT: &str = "flare-platform-control-scheduler";
 /// The platform's Ed25519 public key (PEM or base64); only Capability and Online read it.
@@ -92,6 +97,15 @@ impl PlatformAssertionVerifier {
     /// audience [`CORE_PROJECTION_AUDIENCE`], `token_use=control`, lifetime at most 60 s, and
     /// one of the two platform service subjects. Any other subject is `UNAUTHENTICATED`.
     pub fn verify_token(&self, token: &str) -> Result<VerifiedPlatformActor, Status> {
+        self.verify_token_for(token, CORE_PROJECTION_AUDIENCE)
+    }
+
+    /// [`Self::verify_token`] for an explicit audience (exact match, nothing else accepted).
+    pub fn verify_token_for(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<VerifiedPlatformActor, Status> {
         if token.is_empty()
             || token.len() > MAX_TOKEN_BYTES
             || token.chars().any(char::is_whitespace)
@@ -100,7 +114,7 @@ impl PlatformAssertionVerifier {
         }
         let claims = self
             .0
-            .validate_ed25519_with_use(token, TOKEN_USE_CONTROL, CORE_PROJECTION_AUDIENCE)
+            .validate_ed25519_with_use(token, TOKEN_USE_CONTROL, audience)
             .map_err(|_| Status::unauthenticated("invalid control token"))?;
         if claims.exp - claims.iat > MAX_TOKEN_LIFETIME_SECONDS {
             return Err(Status::unauthenticated("invalid control token"));
@@ -127,6 +141,14 @@ impl PlatformAssertionVerifier {
 
     pub fn verify_grpc<T>(&self, request: &Request<T>) -> Result<VerifiedPlatformActor, Status> {
         self.verify_token(grpc_bearer(request)?)
+    }
+
+    pub fn verify_grpc_for<T>(
+        &self,
+        request: &Request<T>,
+        audience: &str,
+    ) -> Result<VerifiedPlatformActor, Status> {
+        self.verify_token_for(grpc_bearer(request)?, audience)
     }
 }
 
@@ -162,6 +184,18 @@ pub fn require_platform_assertion<T>(
     verifier
         .ok_or_else(|| Status::unauthenticated("platform public key not configured"))?
         .verify_grpc(request)
+}
+
+/// [`require_platform_assertion`] for an RPC with its own audience (e.g.
+/// [`CORE_BUILD_STATS_AUDIENCE`]).
+pub fn require_platform_assertion_for<T>(
+    request: &Request<T>,
+    verifier: Option<&PlatformAssertionVerifier>,
+    audience: &str,
+) -> Result<VerifiedPlatformActor, Status> {
+    verifier
+        .ok_or_else(|| Status::unauthenticated("platform public key not configured"))?
+        .verify_grpc_for(request, audience)
 }
 
 #[cfg(test)]
@@ -318,6 +352,58 @@ mod tests {
             )
             .unwrap();
         assert!(verifier.verify_token(&too_long).is_err());
+    }
+
+    #[test]
+    fn projection_and_build_stats_audiences_do_not_stand_in_for_each_other() {
+        let (signer, verifier) = token_pair(60);
+        let mint = |audience: &str| {
+            signer
+                .generate_with_ed25519(
+                    PROJECTION_WORKER_SUBJECT,
+                    Some("tenant-a"),
+                    "control",
+                    audience,
+                )
+                .unwrap()
+        };
+        let projection = mint(CORE_PROJECTION_AUDIENCE);
+        let stats = mint(CORE_BUILD_STATS_AUDIENCE);
+        assert!(verifier.verify_token(&projection).is_ok());
+        assert!(
+            verifier
+                .verify_token_for(&stats, CORE_BUILD_STATS_AUDIENCE)
+                .is_ok()
+        );
+        assert_eq!(
+            verifier.verify_token(&stats).unwrap_err().code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            verifier
+                .verify_token_for(&projection, CORE_BUILD_STATS_AUDIENCE)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert_eq!(
+            require_platform_assertion_for(
+                &bearer_request(&projection),
+                Some(&verifier),
+                CORE_BUILD_STATS_AUDIENCE
+            )
+            .unwrap_err()
+            .code(),
+            tonic::Code::Unauthenticated
+        );
+        assert!(
+            require_platform_assertion_for(
+                &bearer_request(&stats),
+                Some(&verifier),
+                CORE_BUILD_STATS_AUDIENCE
+            )
+            .is_ok()
+        );
     }
 
     #[test]

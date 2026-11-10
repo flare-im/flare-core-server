@@ -4,6 +4,7 @@
 //! 支持单地区/多地区自适应部署。
 
 mod config;
+pub mod connection_builds;
 pub mod lease;
 pub mod router;
 

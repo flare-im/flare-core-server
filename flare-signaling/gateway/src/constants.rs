@@ -12,6 +12,10 @@ pub const METADATA_KEY_USER_ID: &str = "user_id";
 pub const METADATA_KEY_TENANT_ID: &str = flare_core::server::auth::TENANT_ID_METADATA_KEY;
 /// 用户元数据 key：设备 ID
 pub const METADATA_KEY_DEVICE_ID: &str = "device_id";
+/// CONNECT 设备元数据 key：客户端构建号（十进制整数，版本门禁与构建分布用）
+pub const METADATA_KEY_APP_BUILD: &str = "app_build";
+/// CONNECT 设备元数据 key：分发渠道（桌面据此区分 Electron 与 Tauri 外壳）
+pub const METADATA_KEY_DISTRIBUTION: &str = "distribution";
 /// 默认租户 ID 的环境变量名
 pub const ENV_DEFAULT_TENANT_ID: &str = "ACCESS_GATEWAY_DEFAULT_TENANT_ID";
 /// 默认租户 ID（未配置时的回退值）

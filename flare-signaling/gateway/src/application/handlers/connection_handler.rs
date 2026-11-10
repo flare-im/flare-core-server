@@ -15,7 +15,10 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::{debug, instrument, warn};
 
+use crate::constants::{METADATA_KEY_APP_BUILD, METADATA_KEY_DISTRIBUTION};
+use crate::domain::model::ConnectionInfo;
 use crate::domain::service::ConnectionDomainService;
+use crate::domain::service::client_build_gate::{reported_build, stats_platform};
 
 #[derive(Clone)]
 struct OnlineSession {
@@ -23,6 +26,25 @@ struct OnlineSession {
     tenant_id: String,
     conversation_id: String,
     authenticated_ctx: Ctx,
+    /// 计入构建分布时的（平台，构建），下线时按同一对减回去
+    build: (&'static str, u64),
+}
+
+/// 连接在构建分布里的（平台，构建）：平台是发布清单平台段，构建号没报按 0。
+fn connection_build(info: &ConnectionInfo) -> (&'static str, u64) {
+    let metadata = |key: &str| {
+        info.metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(key))
+            .map(String::as_str)
+    };
+    (
+        stats_platform(
+            info.platform.as_deref(),
+            metadata(METADATA_KEY_DISTRIBUTION),
+        ),
+        reported_build(metadata(METADATA_KEY_APP_BUILD)),
+    )
 }
 
 /// 连接管理处理器：仅编排会话领域服务与指标，连接查询由 QueryHandler / PushDomainService 使用 ConnectionQuery 独立完成。
@@ -280,6 +302,7 @@ impl ConnectionHandler {
             let connecting = self.connecting.lock().await;
             let closed_while_registering = connecting.get(connection_id).copied().unwrap_or(false);
             if still_connected && !closed_while_registering {
+                let build = connection_build(&connection_info);
                 let replaced = self.online_sessions.write().await.insert(
                     connection_id.to_string(),
                     OnlineSession {
@@ -287,14 +310,22 @@ impl ConnectionHandler {
                         tenant_id: connection_info.tenant_id.clone(),
                         conversation_id: conversation_id.clone(),
                         authenticated_ctx: authenticated_ctx.clone(),
+                        build,
                     },
                 );
                 // 并发的第二次登记会覆盖同一连接的会话：被覆盖的那条不会再被断开处理取出，
                 // 在这里与它登记时的 `connection_opened` 配对，连接数不会只增不减。
                 if let Some(replaced) = replaced {
                     self.usage.connection_closed(&replaced.tenant_id);
+                    self.metrics.connection_build_closed(
+                        &replaced.tenant_id,
+                        replaced.build.0,
+                        replaced.build.1,
+                    );
                 }
                 self.usage.connection_opened(&connection_info.tenant_id);
+                self.metrics
+                    .connection_build_opened(&connection_info.tenant_id, build.0, build.1);
                 self.usage.user_active(&connection_info.tenant_id, &user_id);
                 true
             } else {
@@ -414,6 +445,8 @@ impl ConnectionHandler {
         let authenticated_ctx = session.authenticated_ctx;
         // 与登记时的 `connection_opened` 成对：会话只会从 `online_sessions` 取出一次。
         self.usage.connection_closed(&tenant_id);
+        self.metrics
+            .connection_build_closed(&tenant_id, session.build.0, session.build.1);
 
         // 底层连接可能已先被移除，断开清理必须以 Online 会话缓存为准。
         let user_connections = self
@@ -663,12 +696,25 @@ mod disconnect_tests {
                         .with_tenant_id("tenant-a")
                         .with_user_id("u1"),
                 ),
+                build: ("android", 7),
             },
         );
+
+        // 登记时计入的构建分布（这里直接按会话里的那一对计入）
+        handler
+            .metrics
+            .connection_build_opened("tenant-a", "android", 7);
 
         handler.handle_disconnect("conn-1").await.expect("first");
         handler.handle_disconnect("conn-1").await.expect("second");
         assert_eq!(port.logouts.load(Ordering::SeqCst), 1);
+        // 下线减回一次，第二次清理不再减
+        assert!(
+            handler
+                .metrics
+                .connection_build_distribution("tenant-a")
+                .is_empty()
+        );
     }
 
     /// 连接表里有一条已认证连接、Online 登录要等测试放行的端口：用来在 `register_connection`
@@ -910,6 +956,7 @@ mod disconnect_tests {
                         .with_tenant_id("tenant-a")
                         .with_user_id("u1"),
                 ),
+                build: ("android", 7),
             },
         );
         port.release_login.notify_one();

@@ -41,6 +41,7 @@ pub async fn start_services(
     let usage = context.usage;
     let zone = context.zone.clone();
     let lease = context.lease.clone();
+    let build_reporter = context.build_reporter.clone();
 
     // 就绪探针挂在指标端口（`/readyz`）：注册完成才就绪；停机一开始转 503，指标端口一直开到
     // 长连接服务器关完连接（`drained`），负载均衡在排空期间探测到的是 503 而不是连接被拒。
@@ -164,6 +165,15 @@ pub async fn start_services(
                 lease.run(shutdown_rx, drained)
             })
         }
+        None => runtime,
+    };
+
+    // 构建分布上报；停机时删掉本网关写的数据
+    let runtime = match build_reporter {
+        Some(reporter) => runtime
+            .add_spawn_with_shutdown("gateway-connection-builds", move |shutdown_rx| {
+                reporter.run(shutdown_rx)
+            }),
         None => runtime,
     };
 

@@ -1,7 +1,9 @@
 //! 服务模块 - 包含服务启动、注册和管理相关功能
 
 pub mod bootstrap;
+pub(crate) mod build_floor_evictor;
 pub mod builder;
+pub(crate) mod connection_build_reporter;
 pub mod display;
 pub(crate) mod gateway_lease;
 pub(crate) mod notice_subscriber;

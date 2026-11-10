@@ -1555,12 +1555,13 @@ async fn member_rows_carry_personal_settings_only_for_their_owner() {
     );
 
     // The list summary's member preview, in Alice's conversation list.
-    let bootstrap = ConversationDomainService::<_, _, crate::infrastructure::rpc::StorageReaderClient>::new(
-        repo.clone(),
-        Arc::new(EmptyPresence),
-        None,
-        ConversationDomainConfig::default(),
-    );
+    let bootstrap =
+        ConversationDomainService::<_, _, crate::infrastructure::rpc::StorageReaderClient>::new(
+            repo.clone(),
+            Arc::new(EmptyPresence),
+            None,
+            ConversationDomainConfig::default(),
+        );
     let mut preview: Vec<Row> = bootstrap
         .bootstrap_conversation(&user("alice"), Default::default(), false, None, 0, 0)
         .await
@@ -1571,7 +1572,14 @@ async fn member_rows_carry_personal_settings_only_for_their_owner() {
         .expect("listed")
         .member_preview
         .into_iter()
-        .map(|member| (member.user_id, member.muted, member.pinned, member.mention_only))
+        .map(|member| {
+            (
+                member.user_id,
+                member.muted,
+                member.pinned,
+                member.mention_only,
+            )
+        })
         .collect();
     preview.sort();
     assert_eq!(
@@ -1792,24 +1800,43 @@ async fn personal_history_cutoff_is_monotonic_and_isolated_from_other_members() 
         draft: None,
         base_settings_version: 0,
     };
-    let result = repo.update_user_settings(&user("alice"), &clear(u64::MAX)).await.unwrap();
+    let result = repo
+        .update_user_settings(&user("alice"), &clear(u64::MAX))
+        .await
+        .unwrap();
     assert_eq!(result.history_cleared_through_seq, 2);
-    let alice = repo.load_bootstrap(&user("alice"), &Default::default(), 0).await.unwrap();
-    let bob = repo.load_bootstrap(&user("bob"), &Default::default(), 0).await.unwrap();
+    let alice = repo
+        .load_bootstrap(&user("alice"), &Default::default(), 0)
+        .await
+        .unwrap();
+    let bob = repo
+        .load_bootstrap(&user("bob"), &Default::default(), 0)
+        .await
+        .unwrap();
     assert_eq!(alice.summaries[0].visible_after_seq, 2);
     assert!(alice.summaries[0].last_message_id.is_none());
     assert_eq!(bob.summaries[0].visible_after_seq, 0);
     assert_eq!(bob.summaries[0].last_message_id.as_deref(), Some("old"));
     message(&pool, &group, "new", 3, "bob", 1).await;
-    let result = repo.update_user_settings(&user("alice"), &clear(1)).await.unwrap();
+    let result = repo
+        .update_user_settings(&user("alice"), &clear(1))
+        .await
+        .unwrap();
     assert_eq!(result.history_cleared_through_seq, 2);
-    assert!(repo.update_user_settings(&user("former"), &clear(3)).await.is_err());
+    assert!(
+        repo.update_user_settings(&user("former"), &clear(3))
+            .await
+            .is_err()
+    );
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT user_id, history_cleared_through_seq FROM conversation_participants ORDER BY user_id",
     )
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(rows, vec![("alice".into(), 2), ("bob".into(), 0), ("former".into(), 0)]);
+    assert_eq!(
+        rows,
+        vec![("alice".into(), 2), ("bob".into(), 0), ("former".into(), 0)]
+    );
     drop_schema(admin, pool, &schema).await;
 }

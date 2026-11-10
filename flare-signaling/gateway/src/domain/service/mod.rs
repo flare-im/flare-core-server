@@ -1,3 +1,4 @@
+pub mod client_build_gate;
 pub mod connection_domain_service;
 pub mod connection_quality_service;
 pub mod conversation_subscription;

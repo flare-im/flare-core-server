@@ -54,6 +54,26 @@ TenantNotice { topic, version, spread_ms, tenant_wide }
 - `tenant_wide` is set for a `*` notice, which the gateway sends to every tenant's connections.
 - A client never sends `tenant_notice` upstream; the gateway rejects it.
 
+### Build floor eviction
+
+The version gate runs at CONNECT. When an application's `client_policy` raises a floor later
+(a higher `min_build`, a `min_build` that reaches its effective time, or a new blocked range),
+the gateway also closes the online connections that CONNECT would now refuse:
+
+- On a `flare.access` or `flare.release` notice of the application, the gateway drops its cached
+  policy and sweeps that application's connections on the node. A periodic sweep of every
+  application (`FLARE_BUILD_FLOOR_SWEEP_SECS`, default 60, `0` turns it off) covers floors that
+  become effective by time and policy changes that move no watermark.
+- Each selected connection first receives the same typed refusal CONNECT sends,
+  `ERROR(UPGRADE_REQUIRED)` with `min_build`, then is closed. Its reconnect is refused at CONNECT
+  with the same frame, so a client that does not act on the first one still ends in the forced
+  update.
+- The closes of one sweep are spread over `FLARE_BUILD_FLOOR_EVICTION_WINDOW_SECS` (default 30)
+  and kept at or below `FLARE_BUILD_FLOOR_EVICTION_RPS_PER_NODE` per node (default 200), so a
+  raised floor does not send every old client back to CONNECT at once. Each connection is judged
+  again right before its close; a floor lowered inside the window spares it.
+- `connections_evicted_total{reason}` counts the closes (`below_min_build`, `blocked_build`).
+
 ## Client SDK
 
 The core SDK merges notices per topic within the spread window: each client waits a random
@@ -75,4 +95,5 @@ only shortens the time an online client shows stale configuration.
 | --- | --- |
 | flare-capability | `FLARE_TENANT_NOTICE_PUBLISHERS` (empty: no external publisher) |
 | flare-signaling-gateway | `FLARE_NOTICE_REFRESH_RPS_PER_NODE` (optional, default 500) |
+| flare-signaling-gateway | `FLARE_BUILD_FLOOR_SWEEP_SECS` (default 60), `FLARE_BUILD_FLOOR_EVICTION_WINDOW_SECS` (default 30), `FLARE_BUILD_FLOOR_EVICTION_RPS_PER_NODE` (default 200) |
 | publisher | resolves `flare-capability` (Consul, or an explicit gRPC address) |

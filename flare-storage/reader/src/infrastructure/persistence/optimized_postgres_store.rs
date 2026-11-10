@@ -2464,7 +2464,6 @@ mod tests {
                         text: "edited body".into(),
                         ..Default::default()
                     })),
-                    ..Default::default()
                 }),
                 ..Default::default()
             })),
@@ -2492,9 +2491,18 @@ mod tests {
         assert_eq!(events[0].conversation_seq, 21);
         assert_eq!(events[0].r#type, EventType::EventMessageEdit as i32);
         assert!(events[0].payload.is_none());
-        assert!(matches!(events[1].payload, Some(ProtoEventPayload::Edit(_))));
-        assert!(matches!(events[2].payload, Some(ProtoEventPayload::Delete(_))));
-        assert!(matches!(events[3].payload, Some(ProtoEventPayload::Reaction(_))));
+        assert!(matches!(
+            events[1].payload,
+            Some(ProtoEventPayload::Edit(_))
+        ));
+        assert!(matches!(
+            events[2].payload,
+            Some(ProtoEventPayload::Delete(_))
+        ));
+        assert!(matches!(
+            events[3].payload,
+            Some(ProtoEventPayload::Reaction(_))
+        ));
     }
 
     fn storage() -> OptimizedPostgresMessageStorageImpl {

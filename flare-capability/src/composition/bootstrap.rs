@@ -81,6 +81,7 @@ impl ApplicationBootstrap {
         let extension_verifier = context.extension_verifier;
         let plugin_resource_bridge = context.plugin_resource_bridge;
         let tenant_projection = context.tenant_projection;
+        let client_build_stats = context.client_build_stats;
         let tenant_notice = context.tenant_notice;
         let capability_admin = context.capability_admin;
         let hook_retention_background = context.hook_retention_background;
@@ -201,8 +202,17 @@ impl ApplicationBootstrap {
                     )
                 });
 
+                let client_build_stats_service = client_build_stats.map(|server| {
+                    ContextLayer::new().allow_missing().layer(
+                        flare_grpc_proto::control::client_build_stats_server::ClientBuildStatsServer::new(
+                            server,
+                        ),
+                    )
+                });
+
                 info!(
                     tenant_projection = tenant_projection_service.is_some(),
+                    client_build_stats = client_build_stats_service.is_some(),
                     "ExtensionPlugin (router) + CapabilityService registered"
                 );
                 let server = Server::builder()
@@ -214,6 +224,7 @@ impl ApplicationBootstrap {
                     .add_optional_service(plugin_resource_bridge.map(|bridge| flare_grpc_proto::capability::plugin_host_bridge_server::PluginHostBridgeServer::new(bridge)
                         .max_decoding_message_size(16384).max_encoding_message_size(66560)))
                     .add_optional_service(tenant_projection_service)
+                    .add_optional_service(client_build_stats_service)
                     .add_service(
                         flare_grpc_proto::capability::tenant_notice_service_server::TenantNoticeServiceServer::new(
                             tenant_notice,

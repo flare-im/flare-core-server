@@ -25,6 +25,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 use crate::domain::ports::IPushPort;
+use crate::service::build_floor_evictor::BuildFloorEvictor;
 
 /// Notices forwarded at the same time; the subscription loop waits for a slot past it.
 const MAX_CONCURRENT_NOTICES: usize = 8;
@@ -51,12 +52,14 @@ pub fn spawn_notice_subscriber(
     connection_manager: Arc<dyn ConnectionManagerTrait>,
     push_port: Arc<dyn IPushPort>,
     refresh_rps_per_node: u32,
+    evictor: Option<Arc<BuildFloorEvictor>>,
 ) {
     let channel = notice_channel(&namespace);
     let forwarder = Arc::new(NoticeForwarder {
         connection_manager,
         push_port,
         refresh_rps_per_node,
+        evictor,
     });
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_NOTICES));
     tokio::spawn(async move {
@@ -119,6 +122,9 @@ struct NoticeForwarder {
     connection_manager: Arc<dyn ConnectionManagerTrait>,
     push_port: Arc<dyn IPushPort>,
     refresh_rps_per_node: u32,
+    /// `flare.access` / `flare.release` mean the app's `client_policy` changed: its connections
+    /// below a raised build floor are closed (see `build_floor_evictor`).
+    evictor: Option<Arc<BuildFloorEvictor>>,
 }
 
 impl NoticeForwarder {
@@ -134,7 +140,10 @@ impl NoticeForwarder {
                 continue;
             };
             if info.authenticated && (tenant_id == ALL_TENANTS || tenant == tenant_id) {
-                targets.entry(tenant.clone()).or_default().push(connection_id);
+                targets
+                    .entry(tenant.clone())
+                    .or_default()
+                    .push(connection_id);
             }
         }
         targets
@@ -142,6 +151,9 @@ impl NoticeForwarder {
 
     /// Write `notice` to its connections on this node; returns how many took it.
     async fn forward(&self, notice: &TenantNotice) -> usize {
+        if let Some(evictor) = &self.evictor {
+            evictor.on_notice(&notice.tenant_id, &notice.topic);
+        }
         let targets = self.connections(&notice.tenant_id).await;
         let connections: usize = targets.values().map(Vec::len).sum();
         if connections == 0 {
@@ -196,9 +208,9 @@ impl NoticeForwarder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flare_proto::common::{DataPacket, data_packet};
     use flare_core::transport::connection::Connection;
     use flare_im_contracts::Ctx;
+    use flare_proto::common::{DataPacket, data_packet};
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -363,6 +375,7 @@ mod tests {
             connection_manager: manager.clone() as Arc<dyn ConnectionManagerTrait>,
             push_port: recorder.clone(),
             refresh_rps_per_node: DEFAULT_REFRESH_RPS_PER_NODE,
+            evictor: None,
         }
     }
 
@@ -399,7 +412,12 @@ mod tests {
         );
         let sent = sent_notice(payload);
         assert_eq!(
-            (sent.topic.as_str(), sent.version, sent.spread_ms, sent.tenant_wide),
+            (
+                sent.topic.as_str(),
+                sent.version,
+                sent.spread_ms,
+                sent.tenant_wide
+            ),
             ("social.features", 7, 3_000, false)
         );
 
@@ -445,8 +463,8 @@ mod tests {
         connect(&manager, "b-anonymous", "app-b", false).await;
         let recorder = Arc::new(Recorder::default());
         let forwarder = forwarder(&manager, &recorder);
-        let notice = parse_notice(r#"{"tenantId":"*","topic":"social.features","version":"3"}"#)
-            .unwrap();
+        let notice =
+            parse_notice(r#"{"tenantId":"*","topic":"social.features","version":"3"}"#).unwrap();
         assert_eq!(forwarder.forward(&notice).await, 2);
         let mut calls = recorder.0.lock().unwrap().clone();
         calls.sort();

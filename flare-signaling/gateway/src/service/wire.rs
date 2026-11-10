@@ -44,6 +44,9 @@ pub struct ApplicationContext {
     pub zone: Option<String>,
     /// 网关租约续期器（没配 Online 会话 Redis 时为 `None`）；startup 把续租循环挂进运行时。
     pub lease: Option<Arc<crate::service::gateway_lease::GatewayLeaseWriter>>,
+    /// 构建分布上报（没配 token_store Redis 时为 `None`）；startup 把上报循环挂进运行时。
+    pub build_reporter:
+        Option<Arc<crate::service::connection_build_reporter::ConnectionBuildReporter>>,
     /// 指标端点配置。带进上下文是为了让 startup 能真正起 serve_prometheus_metrics
     /// —— 网关此前只注册指标、从不暴露。
     pub metrics_config: flare_im_service_kit::metrics::MetricsEndpointConfig,
@@ -114,6 +117,29 @@ pub async fn initialize(
         None => {
             tracing::warn!(
                 "Online session redis not configured; gateway lease disabled (dead-gateway sessions expire with the session TTL)"
+            );
+            None
+        }
+    };
+
+    // 4a'. 构建分布上报：写进 token_store Redis（capability 从同一个 Redis 汇总），没配时不上报。
+    let build_reporter = match access_config.token_store_redis_url.as_deref() {
+        Some(url) => {
+            match crate::service::connection_build_reporter::ConnectionBuildReporter::open(
+                url,
+                gateway_id.clone(),
+                metrics.clone(),
+            ) {
+                Ok(reporter) => Some(Arc::new(reporter)),
+                Err(error) => {
+                    tracing::warn!(%error, "invalid token store redis url; connection build report disabled");
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::warn!(
+                "token store redis not configured; connection build distribution is not reported"
             );
             None
         }
@@ -210,20 +236,6 @@ pub async fn initialize(
     let push_port: Arc<dyn crate::domain::ports::IPushPort> =
         Arc::new(PushRepository::new(push_handle_slot.clone()));
 
-    // 7b. 租户配置通知：与 kick 同一个 token_store Redis，`{namespace}:notice` 上的通知转给本节点该租户（`*` 为全部租户）的连接。
-    if let Some(redis_url) = access_config.token_store_redis_url.clone() {
-        crate::service::notice_subscriber::spawn_notice_subscriber(
-            redis_url,
-            access_config
-                .token_store_namespace
-                .clone()
-                .unwrap_or_else(|| "flare".to_string()),
-            connection_manager.clone() as Arc<dyn ConnectionManagerTrait>,
-            push_port.clone(),
-            crate::service::notice_subscriber::refresh_rps_per_node_from_env(),
-        );
-    }
-
     // 8. gRPC 连接池
     let route_grpc_pool = Arc::new(SignalingRouteGrpcPool::new());
     let storage_sync_pool = Arc::new(StorageSyncGrpcPool::new());
@@ -281,6 +293,36 @@ pub async fn initialize(
         policy = access_config.tenant_policy.as_str(),
         "tenant runtime cache ready"
     );
+
+    // 8.7 下限抬高即断：版本门禁只在 CONNECT 判；应用的 client_policy 之后抬高下限时，
+    // 已在线、CONNECT 会被拒的连接收到同一个 UPGRADE_REQUIRED 后断开（按通知即时扫 + 周期扫，限速分摊）。
+    let build_floor_evictor =
+        Arc::new(crate::service::build_floor_evictor::BuildFloorEvictor::new(
+            connection_manager.clone() as Arc<dyn ConnectionManagerTrait>,
+            tenant_runtime.clone(),
+            metrics.clone(),
+            crate::service::build_floor_evictor::EvictionPacing::from_env(),
+        ));
+    build_floor_evictor
+        .spawn_periodic(crate::service::build_floor_evictor::sweep_interval_from_env());
+
+    // 8.8 租户配置通知：与 kick 同一个 token_store Redis，`{namespace}:notice` 上的通知转给本节点该租户（`*` 为全部租户）的连接。
+    // 放在租户运行时缓存之后：`flare.access` / `flare.release` 通知同时触发下限抬高即断。
+    if let Some(redis_url) = access_config.token_store_redis_url.clone() {
+        crate::service::notice_subscriber::spawn_notice_subscriber(
+            redis_url,
+            access_config
+                .token_store_namespace
+                .clone()
+                .unwrap_or_else(|| "flare".to_string()),
+            connection_manager.clone() as Arc<dyn ConnectionManagerTrait>,
+            push_port.clone(),
+            crate::service::notice_subscriber::refresh_rps_per_node_from_env(),
+            tenant_runtime
+                .is_enabled()
+                .then(|| build_floor_evictor.clone()),
+        );
+    }
 
     // 9. 长连接处理器
     let connection_handler = build_long_connection_handler(
@@ -377,5 +419,6 @@ pub async fn initialize(
         region,
         zone,
         lease,
+        build_reporter,
     })
 }

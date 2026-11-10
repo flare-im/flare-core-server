@@ -26,12 +26,6 @@ impl ExtensionRouting {
                     .contains(&message.message_type))
     }
 
-    pub fn allows_hook_for_message_type(&self, ctx: &Ctx, message_type: i32) -> bool {
-        self.allows_tenant(ctx)
-            && (self.hook_message_type_allowlist.is_empty()
-                || self.hook_message_type_allowlist.contains(&message_type))
-    }
-
     /// 租户白名单。上下文缺租户时放行到 Hook 执行，由 `HookExecutionService` 以「缺租户」拒绝发送：
     /// 既不按租户 "0" 查白名单，也不能因此跳过必需的 Hook（W12-T）。
     fn allows_tenant(&self, ctx: &Ctx) -> bool {
@@ -74,7 +68,6 @@ mod tests {
             ..Default::default()
         };
         assert!(routing.allows_hook_for_message(&ctx, &msg));
-        assert!(routing.allows_hook_for_message_type(&ctx, 100));
     }
 
     #[test]
@@ -86,7 +79,6 @@ mod tests {
             ..Default::default()
         };
         assert!(!routing.allows_hook_for_message(&ctx, &msg));
-        assert!(!routing.allows_hook_for_message_type(&ctx, 100));
     }
 
     /// 缺租户不按租户 "0" 查白名单：白名单里有 "0" 也不因此放行，白名单里没有也不因此跳过
@@ -108,7 +100,6 @@ mod tests {
         assert!(!other_only.allows_hook_for_message(&test_ctx("0"), &msg));
         for ctx in [&no_tenant, &blank_tenant] {
             assert!(other_only.allows_hook_for_message(ctx, &msg));
-            assert!(other_only.allows_hook_for_message_type(ctx, 100));
         }
     }
 

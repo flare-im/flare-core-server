@@ -282,13 +282,8 @@ Gateway 访问下游 gRPC 时必须透传：
 | API | 方法 | 用途 | 下游 |
 |-----|------|------|------|
 | `/capabilities` | GET | 能力列表 | `CapabilityService.ListCapabilities` |
-| `/capabilities/users/{user_id}` | GET | 用户能力 | `CapabilityService.ListUserCapabilities` |
-| `/capabilities/users/{user_id}/grant` | POST | 授权能力 | `CapabilityService.GrantUserCapability` |
-| `/capabilities/users/{user_id}/revoke` | POST | 撤销能力 | `CapabilityService.RevokeUserCapability` |
 | `/capabilities/tenants/{tenant_id}/switch` | PATCH | 租户能力开关 | `CapabilityService.SetTenantCapabilitySwitch` |
 | `/plugins` | GET | 插件列表 | `CapabilityService.ListRegisteredPlugins` |
-| `/plugins` | POST | 注册插件 endpoint | `CapabilityService.RegisterPluginEndpoint` |
-| `/plugins/{plugin_id}` | DELETE | 注销插件 endpoint | `CapabilityService.DeregisterPluginEndpoint` |
 | `/hooks` | GET/POST/PATCH/DELETE | Hook 配置管理 | `CapabilityService.Administer` |
 
 Capability 管理不应该写死某个插件类型，SFU、机器人、风控、审核都通过 capability/plugin 合同扩展。

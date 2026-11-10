@@ -43,6 +43,10 @@ local function gateway_member(tenant, field)
   return 'v1:' .. string.len(tenant) .. ':' .. tenant .. ':' .. string.len(ARGV[7]) .. ':' .. ARGV[7] .. ':' .. field
 end
 local new = cjson.decode(ARGV[2])
+if type(new.identity_session_id) == 'string' and new.identity_session_id ~= ''
+    and redis.call('SISMEMBER', KEYS[4], new.identity_session_id) == 1 then
+  return redis.error_reply('TOKEN_REVOKED')
+end
 local current = redis.call('HGETALL', KEYS[1])
 local records = {}
 local devices = {}
@@ -147,6 +151,8 @@ struct RedisConnectionRecord {
     device_priority: i32,
     token_version: i64,
     tenant_id: String,
+    #[serde(default)]
+    identity_session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -239,6 +245,17 @@ impl RedisConversationRepository {
         format!("{}:{}:{}", CONNECTION_KEY_PREFIX, tenant_id, user_id)
     }
 
+    fn identity_revocations_key(tenant: &str, user: &str) -> String {
+        // Length framing avoids tenant/user delimiter aliasing.
+        format!(
+            "identity:revoked:{}:{}:{}:{}",
+            tenant.len(),
+            tenant,
+            user.len(),
+            user
+        )
+    }
+
     fn tenant_sessions_key(tenant_id: &str) -> String {
         format!("{}:{}", TENANT_SESSIONS_KEY_PREFIX, tenant_id)
     }
@@ -281,6 +298,7 @@ impl RedisConversationRepository {
     fn record_from_connection(session: &Connection) -> RedisConnectionRecord {
         RedisConnectionRecord {
             tenant_id: session.tenant_id().to_string(),
+            identity_session_id: session.identity_session_id().map(str::to_owned),
             conversation_id: session.id().as_str().to_string(),
             gateway_id: session.gateway_id().to_string(),
             server_id: session.server_id().to_string(),
@@ -319,6 +337,7 @@ impl RedisConversationRepository {
             flare_server_core::error::FlareError::system("invalid last_seen timestamp".to_string())
         })?;
 
+        let identity_session_id = record.identity_session_id;
         Ok(Connection::reconstitute(
             conversation_id,
             user_id.clone(),
@@ -334,7 +353,8 @@ impl RedisConversationRepository {
                 .single()
                 .unwrap_or(last_seen),
             last_seen,
-        ))
+        )
+        .with_identity_session_id(identity_session_id))
     }
 
     async fn load_user_records(
@@ -431,7 +451,11 @@ impl ConversationRepository for RedisConversationRepository {
                     session.user_id().as_str(),
                 ))
                 .key(Self::tenant_sessions_key(session.tenant_id()))
-                .key(gateway_conns_key(&record.gateway_id));
+                .key(gateway_conns_key(&record.gateway_id))
+                .key(Self::identity_revocations_key(
+                    session.tenant_id(),
+                    session.user_id().as_str(),
+                ));
             for gateway in &other_gateways {
                 invocation.key(gateway_conns_key(gateway));
             }
@@ -580,6 +604,76 @@ impl ConversationRepository for RedisConversationRepository {
             })
     }
 
+    async fn revoke_identity_sessions(
+        &self,
+        tenant: &str,
+        user: &UserId,
+        session_ids: &[String],
+        cutoff_ms: i64,
+        request_id: &str,
+        signing_key_id: &str,
+    ) -> Result<u32> {
+        let mut conn = self.connection().await?;
+        // Session IDs are immutable UUIDs. Extending this set's retention never
+        // affects later sessions, unlike a moving user/time revocation boundary.
+        if !session_ids.is_empty() {
+            let _: () = redis::pipe()
+                .atomic()
+                .sadd(
+                    Self::identity_revocations_key(tenant, user.as_str()),
+                    session_ids,
+                )
+                .ignore()
+                .expire(
+                    Self::identity_revocations_key(tenant, user.as_str()),
+                    2_592_000,
+                )
+                .ignore()
+                .query_async(&mut conn)
+                .await
+                .map_err(|error| {
+                    flare_server_core::error::FlareError::system(format!(
+                        "identity revocation persistence failed: {error}"
+                    ))
+                })?;
+        }
+        let records = self
+            .load_user_records(&mut conn, tenant, user.as_str())
+            .await?;
+        let mut kicked = 0u32;
+        for record in records {
+            let revoked = match record.identity_session_id.as_deref() {
+                Some(sid) => session_ids.iter().any(|old| old == sid),
+                // Compatibility for a connection that predates authoritative sid propagation.
+                // Do not refresh the cutoff on a retry or infer a sid from device metadata.
+                None => record.created_at <= cutoff_ms,
+            };
+            if revoked {
+                // Security delivery requires the exact gateway receiver ACK, even
+                // without a Staff task scope. A PUBLISH count is never completion.
+                let evidence = serde_json::json!({
+                    "event":flare_im_service_kit::audit_effects::EFFECT_EVENT,
+                    "request_id":request_id,"at_ms":chrono::Utc::now().timestamp_millis(),
+                    "scope":tenant,"source":"signaling-online","actor_id":"flare-social-bridge",
+                    "actor_type":"service","credential_id":format!("internal-key:{signing_key_id}"),"permission":null,"aggregate":"online_connection",
+                    "aggregate_id":record.connection_id,"action":"retire","outcome":"committed",
+                })
+                .to_string();
+                let command = self
+                    .prepare_command(tenant, user.as_str(), &record, "TOKEN_REVOKED", &evidence)
+                    .await?;
+                if !self.advance_command(&command).await? {
+                    return Err(flare_server_core::flare_err!(
+                        flare_server_core::error::ErrorCode::ServiceUnavailable,
+                        "identity connection retirement pending receiver confirmation"
+                    ));
+                }
+                kicked += 1;
+            }
+        }
+        Ok(kicked)
+    }
+
     async fn touch_connection(
         &self,
         tenant_id: &str,
@@ -587,44 +681,44 @@ impl ConversationRepository for RedisConversationRepository {
         user_id: &UserId,
     ) -> Result<()> {
         let mut conn = self.connection().await?;
-        let key = Self::connection_key(tenant_id, user_id.as_str());
-        let payload = conn
-            .hget::<_, _, Option<String>>(&key, conversation_id.as_str())
-            .await
-            .map_err(|e| {
-                flare_server_core::error::FlareError::system(format!("operation failed: {}", e))
-            })?
-            .ok_or_else(|| {
-                flare_server_core::error::FlareError::system("connection not found".to_string())
-            })?;
-        let mut record = Self::parse_record(&payload)?;
-        if record.tenant_id != tenant_id {
+        // Read/modify/write atomically: an in-flight heartbeat cannot reinsert a
+        // retired record after its physical gateway has acknowledged the kick.
+        let touched: i32 = redis::Script::new(
+            r#"
+local raw = redis.call('HGET',KEYS[1],ARGV[1])
+if not raw then return 0 end
+local rec = cjson.decode(raw)
+if rec.tenant_id ~= ARGV[2] then return redis.error_reply('session tenant mismatch') end
+if type(rec.identity_session_id) == 'string' and rec.identity_session_id ~= ''
+    and redis.call('SISMEMBER',KEYS[3],rec.identity_session_id) == 1 then
+  return redis.error_reply('TOKEN_REVOKED')
+end
+rec.last_seen = tonumber(ARGV[3])
+redis.call('HSET',KEYS[1],ARGV[1],cjson.encode(rec))
+redis.call('EXPIRE',KEYS[1],ARGV[4])
+redis.call('EXPIRE',KEYS[2],ARGV[4])
+return 1
+"#,
+        )
+        .key(Self::connection_key(tenant_id, user_id.as_str()))
+        .key(Self::tenant_sessions_key(tenant_id))
+        .key(Self::identity_revocations_key(tenant_id, user_id.as_str()))
+        .arg(conversation_id.as_str())
+        .arg(tenant_id)
+        .arg(Utc::now().timestamp())
+        .arg(self.ttl())
+        .invoke_async(&mut conn)
+        .await
+        .map_err(|_| {
+            flare_server_core::error::FlareError::system(
+                "connection heartbeat unavailable or revoked",
+            )
+        })?;
+        if touched != 1 {
             return Err(flare_server_core::error::FlareError::system(
-                "session tenant mismatch",
+                "connection not found",
             ));
         }
-        record.last_seen = Utc::now().timestamp();
-        let value = serde_json::to_string(&record).map_err(|e| {
-            flare_server_core::error::FlareError::system(format!(
-                "serialize session payload: {}",
-                e
-            ))
-        })?;
-        let ttl = self.ttl();
-        // 心跳同时给租户索引续期，否则索引会先于活跃会话过期。
-        let _: () = redis::pipe()
-            .atomic()
-            .hset(&key, conversation_id.as_str(), value)
-            .ignore()
-            .expire(&key, ttl)
-            .ignore()
-            .expire(Self::tenant_sessions_key(&record.tenant_id), ttl)
-            .ignore()
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| {
-                flare_server_core::error::FlareError::system(format!("operation failed: {}", e))
-            })?;
         Ok(())
     }
 
@@ -961,7 +1055,7 @@ mod admission_tests {
             .unwrap();
     }
 
-    fn record(
+    pub(super) fn record(
         tenant: &str,
         device: &str,
         physical: &str,
@@ -994,6 +1088,7 @@ mod admission_tests {
             device_priority: 2,
             token_version: 0,
             tenant_id: tenant.into(),
+            identity_session_id: None,
         }
     }
 
@@ -1006,7 +1101,7 @@ mod admission_tests {
         admit_with(conn, key, index, item, DeviceConflictStrategy::Coexist, 1).await
     }
 
-    async fn admit_with(
+    pub(super) async fn admit_with(
         conn: &mut ConnectionManager,
         key: &str,
         index: &str,
@@ -1018,6 +1113,10 @@ mod admission_tests {
             .key(key)
             .key(index)
             .key(gateway_conns_key(&item.gateway_id))
+            .key(RedisConversationRepository::identity_revocations_key(
+                &item.tenant_id,
+                "shared-user",
+            ))
             .arg(&item.conversation_id)
             .arg(serde_json::to_string(item).unwrap())
             .arg(60)
@@ -1432,6 +1531,7 @@ impl crate::domain::repository::PresencePublisher for RedisPresencePublisher {
 
 #[cfg(test)]
 mod tests {
+    use super::admission_tests::{admit_with, record};
     use super::*;
     use crate::domain::repository::parse_tenant_session_member;
 
@@ -1475,5 +1575,91 @@ mod tests {
             Some(("u:a:", "d:1"))
         );
         assert_eq!(parse_tenant_session_member("u1:d1"), None);
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated FLARE_TEST_REDIS_URL"]
+    async fn identity_tombstone_fences_pending_admission_without_rejecting_new_sid_or_other_tenant()
+    {
+        let client = redis::Client::open(std::env::var("FLARE_TEST_REDIS_URL").unwrap()).unwrap();
+        let mut conn = ConnectionManager::new(client).await.unwrap();
+        let tenant = format!("identity-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("identity-{}", uuid::Uuid::new_v4().simple());
+        let tombstone =
+            RedisConversationRepository::identity_revocations_key(&tenant, "shared-user");
+        let old_sid = uuid::Uuid::new_v4().to_string();
+        let _: () = conn.sadd(&tombstone, &old_sid).await.unwrap();
+        let key = RedisConversationRepository::connection_key(&tenant, "shared-user");
+        let index = RedisConversationRepository::tenant_sessions_key(&tenant);
+        let mut old = record(&tenant, "old-device", "pending-old", 1);
+        old.identity_session_id = Some(old_sid.clone());
+        let denied: redis::RedisResult<String> = redis::Script::new(ADMIT_CONNECTION_SCRIPT)
+            .key(&key)
+            .key(&index)
+            .key(gateway_conns_key(&old.gateway_id))
+            .key(&tombstone)
+            .arg(&old.conversation_id)
+            .arg(serde_json::to_string(&old).unwrap())
+            .arg(60)
+            .arg(DeviceConflictStrategy::Coexist as i32)
+            .arg(10)
+            .arg(tenant_session_member_prefix("shared-user"))
+            .arg("shared-user")
+            .arg(flare_im_service_kit::gateway::lease::CONNS_KEY_PREFIX)
+            .invoke_async(&mut conn)
+            .await;
+        assert!(denied.unwrap_err().to_string().contains("TOKEN_REVOKED"));
+        let count: usize = conn.hlen(&key).await.unwrap();
+        assert_eq!(
+            count, 0,
+            "revocation must precede all admission/index side effects"
+        );
+        let mut new = record(&tenant, "new-device", "new-connection", 2);
+        new.identity_session_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(
+            admit_with(
+                &mut conn,
+                &key,
+                &index,
+                &new,
+                DeviceConflictStrategy::Coexist,
+                10
+            )
+            .await
+            .is_empty()
+        );
+        let other_key = RedisConversationRepository::connection_key(&other, "shared-user");
+        let other_index = RedisConversationRepository::tenant_sessions_key(&other);
+        let mut independent = record(&other, "old-device", "other-connection", 1);
+        independent.identity_session_id = Some(old_sid);
+        assert!(
+            admit_with(
+                &mut conn,
+                &other_key,
+                &other_index,
+                &independent,
+                DeviceConflictStrategy::Coexist,
+                10
+            )
+            .await
+            .is_empty()
+        );
+        let _: () = redis::pipe()
+            .del(&key)
+            .ignore()
+            .del(&index)
+            .ignore()
+            .del(&other_key)
+            .ignore()
+            .del(&other_index)
+            .ignore()
+            .del(&tombstone)
+            .ignore()
+            .del(gateway_conns_key(&new.gateway_id))
+            .ignore()
+            .del(gateway_conns_key(&independent.gateway_id))
+            .ignore()
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }

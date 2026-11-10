@@ -74,7 +74,7 @@ pub(crate) mod tests {
             .unwrap();
         let end = start
             + source[start..]
-                .find("CREATE TABLE capability_plugin_endpoints (")
+                .find("-- FLARE_EXTRACT:END_HOOK_CAPABILITY")
                 .unwrap();
         sqlx::raw_sql(&source[start..end])
             .execute(pool.as_ref())

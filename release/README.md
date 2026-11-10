@@ -420,8 +420,7 @@ capability）直接设成上表地址，preflight 核对它们。
 `flare-social-hook` 的独立 Hook 配置文件，并把路径传给
 `MESSAGE_INGEST_HOOKS_CONFIG`。`flare-deploy/templates/compose/single/hooks.social.static.toml`
 是保持原有 fail-closed 策略、仅将传输端点改为私网 `social:50210` 的候选；
-需只读挂载并显式设置 `MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO=0`。不要通过禁用
-Hook 来让健康检查变绿。
+需只读挂载。不要通过禁用 Hook 来让健康检查变绿。
 这只是 fail-fast/端口候选，尚无跨 Core/Social 的 Hook、Presence/Kick、
 消息与 QUIC 端到端验收，也不能据此替换现有生产启动流程。
 

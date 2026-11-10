@@ -78,9 +78,8 @@ Flare IM 采用**开放核心（Open Core）**模式：**通信开源，身份�
 - `HttpHookTokenValidator` —— 把 token POST 到你自己的接口。**接入自有用户体系
   的入口。**
 
-业务规则同理，`flare-core-server/crates/flare-im-hooks` 提供 9 个扩展点
-（PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction /
-ConversationLifecycle / ConversationMember / GetConversationParticipants）。
+业务规则同理，`flare-core-server/crates/flare-im-hooks` 运行 `message.pre_send` Hook，
+在消息落库之前放行、拒绝或改写。
 
 所以要上生产，你需要自行实现用户体系并按上述契约接入。这与 Sendbird /
 Twilio Conversations 的「自带身份」模型一致，区别是 Flare 可自托管、

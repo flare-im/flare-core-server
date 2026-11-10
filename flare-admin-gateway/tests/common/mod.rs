@@ -32,21 +32,18 @@ use flare_grpc_proto::capability::capability_service_server::{
 };
 use flare_grpc_proto::capability::{
     CapabilityDescriptor, CreateHookConfigRequest, CreateHookConfigResponse,
-    DeleteHookConfigRequest, DeleteHookConfigResponse, DeregisterPluginEndpointRequest,
-    DeregisterPluginEndpointResponse, DispatchCapabilityRequest, DispatchCapabilityResponse,
-    GenericRequest, GenericResponse, GetHookConfigRequest, GetHookConfigResponse,
-    GetHookStatisticsRequest, GetHookStatisticsResponse, GetTenantRuntimeRequest,
-    GetTenantRuntimeResponse, GrantUserCapabilityRequest, GrantUserCapabilityResponse, HookConfig,
-    HookExecution, HookPoint, HookStatistics, HookTransport, ListCapabilitiesRequest,
-    ListCapabilitiesResponse, ListHookConfigsRequest, ListHookConfigsResponse,
-    ListRegisteredPluginsRequest, ListRegisteredPluginsResponse,
+    DeleteHookConfigRequest, DeleteHookConfigResponse, DeploymentHook, DispatchCapabilityRequest,
+    DispatchCapabilityResponse, GenericRequest, GenericResponse, GetHookConfigRequest,
+    GetHookConfigResponse, GetHookStatisticsRequest, GetHookStatisticsResponse,
+    GetTenantRuntimeRequest, GetTenantRuntimeResponse, HookConfig, HookExecution, HookPointEntry,
+    HookProfile, HookStatistics, HookTransport, ListCapabilitiesRequest, ListCapabilitiesResponse,
+    ListHookConfigsRequest, ListHookConfigsResponse, ListHookPointsResponse,
+    ListHookProfilesResponse, ListRegisteredPluginsRequest, ListRegisteredPluginsResponse,
     ListTenantCapabilitySwitchesRequest, ListTenantCapabilitySwitchesResponse,
-    ListUserCapabilitiesRequest, ListUserCapabilitiesResponse, QueryHookExecutionsRequest,
-    QueryHookExecutionsResponse, RegisterPluginEndpointRequest, RegisterPluginEndpointResponse,
-    RegisteredPluginInstance, RevokeUserCapabilityRequest, RevokeUserCapabilityResponse,
+    QueryHookExecutionsRequest, QueryHookExecutionsResponse, RegisteredPluginInstance,
     SetHookStatusRequest, SetHookStatusResponse, SetTenantCapabilitySwitchRequest,
-    SetTenantCapabilitySwitchResponse, TenantCapabilitySwitch, UpdateHookConfigRequest,
-    UpdateHookConfigResponse,
+    SetTenantCapabilitySwitchResponse, TenantCapabilitySwitch, TestHookConfigRequest,
+    TestHookConfigResponse, UpdateHookConfigRequest, UpdateHookConfigResponse,
 };
 use flare_grpc_proto::control::{CoreQuota, TenantQuota, TenantStatus};
 use flare_grpc_proto::conversation::conversation_admin_service_server::{
@@ -78,8 +75,8 @@ use flare_proto::common::{
 };
 use flare_server_core::auth::core_admin;
 use flare_server_core::auth::core_admin::permission::{
-    CAPABILITIES_READ, CAPABILITIES_WRITE, CONVERSATIONS_READ, HOOKS_READ, HOOKS_WRITE,
-    PLUGINS_READ, PLUGINS_WRITE, TENANT_KICK, TENANT_READ, USERS_KICK, USERS_READ,
+    CAPABILITIES_READ, CAPABILITIES_WRITE, CONVERSATIONS_READ, HOOKS_PLATFORM_WRITE, HOOKS_READ,
+    HOOKS_WRITE, PLUGINS_READ, PLUGINS_WRITE, TENANT_KICK, TENANT_READ, USERS_KICK, USERS_READ,
 };
 use flare_server_core::auth::kid;
 use flare_server_core::{
@@ -545,21 +542,23 @@ fn hook_config(hook_id: &str, name: &str, enabled: bool) -> HookConfig {
         name: name.to_string(),
         hook_type: "message_pre_send".to_string(),
         tenant_id: TENANT.to_string(),
-        priority: 10,
+        order: 10,
+        required: true,
         enabled,
         transport: Some(HookTransport {
             r#type: "webhook".to_string(),
             endpoint: "https://hooks.example/dlp".to_string(),
             secret: "webhook-secret-id-secret-1".to_string(),
             timeout_ms: 5000,
+            metadata: std::collections::HashMap::from([(
+                "signing_secret_configured".to_string(),
+                "true".to_string(),
+            )]),
             ..Default::default()
         }),
         selector: None,
-        retry_policy: None,
         created_at: Some(at(1_700_000_000)),
         updated_at: Some(at(1_700_000_001)),
-        hook_points: vec![HookPoint::MessagePreSend as i32],
-        config_extensions: None,
     }
 }
 
@@ -610,28 +609,10 @@ impl CapabilityService for Fakes {
                 .collect(),
         }))
     }
-    async fn list_user_capabilities(
-        &self,
-        _: GrpcRequest<ListUserCapabilitiesRequest>,
-    ) -> Result<GrpcResponse<ListUserCapabilitiesResponse>, Status> {
-        unimplemented()
-    }
     async fn dispatch(
         &self,
         _: GrpcRequest<DispatchCapabilityRequest>,
     ) -> Result<GrpcResponse<DispatchCapabilityResponse>, Status> {
-        unimplemented()
-    }
-    async fn grant_user_capability(
-        &self,
-        _: GrpcRequest<GrantUserCapabilityRequest>,
-    ) -> Result<GrpcResponse<GrantUserCapabilityResponse>, Status> {
-        unimplemented()
-    }
-    async fn revoke_user_capability(
-        &self,
-        _: GrpcRequest<RevokeUserCapabilityRequest>,
-    ) -> Result<GrpcResponse<RevokeUserCapabilityResponse>, Status> {
         unimplemented()
     }
     async fn set_tenant_capability_switch(
@@ -651,47 +632,6 @@ impl CapabilityService for Fakes {
         }
         Ok(GrpcResponse::new(SetTenantCapabilitySwitchResponse {
             message: "tenant capability switch updated".to_string(),
-        }))
-    }
-    async fn register_plugin_endpoint(
-        &self,
-        request: GrpcRequest<RegisterPluginEndpointRequest>,
-    ) -> Result<GrpcResponse<RegisterPluginEndpointResponse>, Status> {
-        let r = request.get_ref().clone();
-        let summary = format!(
-            "tenant_id={} plugin_id={} capability_id={} grpc_authority={} request_id={} declared={}",
-            r.tenant_id,
-            r.plugin_id,
-            r.capability_id,
-            r.grpc_authority,
-            r.request_id,
-            r.declared_operations.join("+")
-        );
-        self.recorder
-            .record("RegisterPluginEndpoint", &request, summary);
-        self.gate_plugins(&request, PLUGINS_WRITE, &r.tenant_id)?;
-        if let Some(status) = downstream_failure(&r.plugin_id) {
-            return Err(status);
-        }
-        Ok(GrpcResponse::new(RegisterPluginEndpointResponse {
-            accepted: true,
-            message: "registered".to_string(),
-        }))
-    }
-    async fn deregister_plugin_endpoint(
-        &self,
-        request: GrpcRequest<DeregisterPluginEndpointRequest>,
-    ) -> Result<GrpcResponse<DeregisterPluginEndpointResponse>, Status> {
-        let r = request.get_ref().clone();
-        let summary = format!(
-            "tenant_id={} plugin_id={} request_id={}",
-            r.tenant_id, r.plugin_id, r.request_id
-        );
-        self.recorder
-            .record("DeregisterPluginEndpoint", &request, summary);
-        self.gate_plugins(&request, PLUGINS_WRITE, &r.tenant_id)?;
-        Ok(GrpcResponse::new(DeregisterPluginEndpointResponse {
-            accepted: r.plugin_id != "plugin-unknown",
         }))
     }
 
@@ -735,12 +675,14 @@ impl CapabilityService for Fakes {
         let outer = request.get_ref().clone();
         // Capability decides the code from the operation before it dispatches anything; an
         // unknown operation is gated with the read code and then refused.
-        let code = if HOOK_WRITE_OPERATIONS.contains(&outer.operation.as_str()) {
-            HOOKS_WRITE
+        let codes: &[&str] = if outer.operation == "flare.extension.v1.hook_config.test" {
+            &[HOOKS_PLATFORM_WRITE]
+        } else if HOOK_WRITE_OPERATIONS.contains(&outer.operation.as_str()) {
+            &[HOOKS_WRITE, HOOKS_PLATFORM_WRITE]
         } else {
-            HOOKS_READ
+            &[HOOKS_READ]
         };
-        if let Err(status) = self.gate(&request, &[code]) {
+        if let Err(status) = self.gate(&request, codes) {
             self.recorder.record(
                 "Administer",
                 &request,
@@ -785,17 +727,73 @@ impl CapabilityService for Fakes {
                 let r: CreateHookConfigRequest = decode(&outer)?;
                 (
                     format!(
-                        "create tenant_id={} name={} hook_type={} priority={} secret_set={}",
+                        "create tenant_id={} name={} hook_type={} order={} required={} secret_set={}",
                         r.tenant_id,
                         r.name,
                         r.hook_type,
-                        r.priority,
+                        r.order,
+                        r.required,
                         r.transport.as_ref().is_some_and(|t| !t.secret.is_empty())
                     ),
                     pack(
                         "CreateHookConfigResponse",
                         &CreateHookConfigResponse {
                             config: Some(hook_config("9", &r.name, true)),
+                        },
+                    ),
+                )
+            }
+            "flare.extension.v1.hook_point.list" => (
+                "point_list".to_string(),
+                pack(
+                    "ListHookPointsResponse",
+                    &ListHookPointsResponse {
+                        points: vec![HookPointEntry {
+                            id: "message.pre_send".to_string(),
+                            hook_type: "pre_send".to_string(),
+                            summary: "before persistence".to_string(),
+                        }],
+                    },
+                ),
+            ),
+            "flare.extension.v1.hook_profile.list" => (
+                "profile_list".to_string(),
+                pack(
+                    "ListHookProfilesResponse",
+                    &ListHookProfilesResponse {
+                        profiles: vec![HookProfile {
+                            service: "message-ingest".to_string(),
+                            source: "config/hooks.toml".to_string(),
+                            instance_id: "ingest-1".to_string(),
+                            loaded_at: Some(at(1_700_000_000)),
+                            hooks: vec![DeploymentHook {
+                                name: "social".to_string(),
+                                hook_type: "pre_send".to_string(),
+                                enabled: true,
+                                required: true,
+                                timeout_ms: 500,
+                                target_type: "grpc".to_string(),
+                                target_endpoint: "http://social:50210".to_string(),
+                                ..Default::default()
+                            }],
+                        }],
+                    },
+                ),
+            ),
+            "flare.extension.v1.hook_config.test" => {
+                let r: TestHookConfigRequest = decode(&outer)?;
+                (
+                    format!(
+                        "test hook_id={} endpoint={}",
+                        r.hook_id,
+                        r.transport.map(|t| t.endpoint).unwrap_or_default()
+                    ),
+                    pack(
+                        "TestHookConfigResponse",
+                        &TestHookConfigResponse {
+                            outcome: "allowed".to_string(),
+                            latency_ms: 12,
+                            code: String::new(),
                         },
                     ),
                 )
@@ -822,8 +820,8 @@ impl CapabilityService for Fakes {
                 }
                 (
                     format!(
-                        "update hook_id={} name={} priority={}",
-                        r.hook_id, r.name, r.priority
+                        "update hook_id={} name={} order={:?} required={:?}",
+                        r.hook_id, r.name, r.order, r.required
                     ),
                     pack(
                         "UpdateHookConfigResponse",
@@ -1181,29 +1179,12 @@ pub fn capability_routes() -> Vec<(&'static str, &'static str, Option<&'static s
             "/api/v1/admin/capabilities/tenant/example.poll",
             Some(r#"{"enabled":false}"#),
         ),
-        (
-            "POST",
-            "/api/v1/admin/plugins/register",
-            Some(
-                r#"{"plugin_id":"plugin-c","capability_id":"example.poll","grpc_authority":"http://plugin:9","declared_operations":["example.poll"],"plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
-            ),
-        ),
-        (
-            "POST",
-            "/api/v1/admin/plugins/deregister",
-            Some(r#"{"plugin_id":"plugin-c"}"#),
-        ),
         ("GET", "/api/v1/admin/hooks", None),
-        (
-            "POST",
-            "/api/v1/admin/hooks",
-            Some(r#"{"name":"dlp","hook_type":"message_pre_send","priority":10}"#),
-        ),
         ("GET", "/api/v1/admin/hooks/7", None),
         (
             "PUT",
             "/api/v1/admin/hooks/7",
-            Some(r#"{"name":"dlp-2","priority":20}"#),
+            Some(r#"{"name":"dlp-2","order":20}"#),
         ),
         ("DELETE", "/api/v1/admin/hooks/7", None),
         (
@@ -1213,6 +1194,33 @@ pub fn capability_routes() -> Vec<(&'static str, &'static str, Option<&'static s
         ),
         ("GET", "/api/v1/admin/hooks/7/statistics", None),
         ("GET", "/api/v1/admin/hooks/7/executions", None),
+        ("GET", "/api/v1/admin/platform/hooks", None),
+        (
+            "POST",
+            "/api/v1/admin/platform/hooks",
+            Some(r#"{"name":"dlp","hook_type":"pre_send","order":10}"#),
+        ),
+        ("GET", "/api/v1/admin/platform/hooks/points", None),
+        ("GET", "/api/v1/admin/platform/hooks/profiles", None),
+        (
+            "POST",
+            "/api/v1/admin/platform/hooks/test",
+            Some(r#"{"hook_id":"7"}"#),
+        ),
+        ("GET", "/api/v1/admin/platform/hooks/7", None),
+        (
+            "PUT",
+            "/api/v1/admin/platform/hooks/7",
+            Some(r#"{"name":"dlp-2","order":20}"#),
+        ),
+        ("DELETE", "/api/v1/admin/platform/hooks/7", None),
+        (
+            "PUT",
+            "/api/v1/admin/platform/hooks/7/status",
+            Some(r#"{"enabled":false}"#),
+        ),
+        ("GET", "/api/v1/admin/platform/hooks/7/statistics", None),
+        ("GET", "/api/v1/admin/platform/hooks/7/executions", None),
     ]
 }
 

@@ -1,6 +1,25 @@
 use super::*;
 use flare_server_core::context::ActorType;
 
+pub(super) fn staff_actor(ctx: &Context, permission: &str) -> Result<String> {
+    flare_server_core::require_staff_permission(ctx, permission).map_err(|_| {
+        flare_server_core::flare_err!(
+            ErrorCode::PermissionDenied,
+            "media Staff permission required"
+        )
+    })?;
+    let actor = ctx
+        .actor()
+        .filter(|actor| actor.actor_type == ActorType::Staff)
+        .ok_or_else(|| {
+            flare_server_core::flare_err!(
+                ErrorCode::PermissionDenied,
+                "authenticated Staff required"
+            )
+        })?;
+    Ok(actor.actor_id.to_string())
+}
+
 pub(crate) fn require_tenant(ctx: &Context) -> Result<&str> {
     let tenant = ctx.tenant_id().ok_or_else(|| {
         flare_server_core::flare_err!(
@@ -44,7 +63,9 @@ pub(crate) fn require_owner(ctx: &Context) -> Result<&str> {
 impl MediaService {
     pub(super) fn authorize_file_write(ctx: &Context, metadata: &MediaFileMetadata) -> Result<()> {
         require_tenant(ctx)?;
-        if metadata.owner_id.as_deref() != Some(require_owner(ctx)?) {
+        if metadata.owner_kind != MediaOwnerKind::User
+            || metadata.owner_id.as_deref() != Some(require_owner(ctx)?)
+        {
             return Err(flare_server_core::flare_err!(
                 ErrorCode::PermissionDenied,
                 "media mutation requires the authenticated owner"
@@ -53,9 +74,16 @@ impl MediaService {
         Ok(())
     }
     pub(super) fn authorize_upload_session(ctx: &Context, session: &UploadSession) -> Result<()> {
+        let actor = match session.actor_kind {
+            UploadActorKind::User => require_owner(ctx)?.to_owned(),
+            UploadActorKind::Staff => staff_actor(
+                ctx,
+                flare_server_core::auth::core_admin::permission::MEDIAS_WRITE,
+            )?,
+        };
         if session.tenant_id.is_empty()
             || session.tenant_id != require_tenant(ctx)?
-            || session.user_id != require_owner(ctx)?
+            || session.actor_id != actor
         {
             return Err(flare_server_core::flare_err!(
                 ErrorCode::MessageNotFound,
@@ -70,7 +98,25 @@ impl MediaService {
         ctx: &Context,
         metadata: &MediaFileMetadata,
     ) -> Result<()> {
-        require_tenant(ctx)?;
+        let tenant = require_tenant(ctx)?;
+        if metadata.owner_kind == MediaOwnerKind::Application {
+            if metadata.owner_id.as_deref() == Some(tenant)
+                && metadata.purpose.is_application_image()
+                && metadata.status == MediaAssetStatus::Active
+                && ((metadata.purpose == MediaPurpose::Avatar && authenticated_user(ctx).is_some())
+                    || staff_actor(
+                        ctx,
+                        flare_server_core::auth::core_admin::permission::MEDIAS_READ,
+                    )
+                    .is_ok())
+            {
+                return Ok(());
+            }
+            return Err(flare_server_core::flare_err!(
+                ErrorCode::PermissionDenied,
+                "application media read denied"
+            ));
+        }
         if matches!(metadata.access_type, FileAccessType::Public)
             || metadata
                 .owner_id

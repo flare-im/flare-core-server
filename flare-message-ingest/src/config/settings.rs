@@ -1,4 +1,3 @@
-use std::sync::Once;
 use std::{collections::HashMap, env};
 
 use flare_im_contracts::constants::groups::MESSAGE_INGEST_MAIN_GROUP_DEFAULT;
@@ -12,12 +11,6 @@ use flare_server_core::mq::nats::{
 };
 
 use crate::domain::model::{ConversationType, MessageDefaults};
-
-/// `flare-capability` HookPlugin gRPC 默认地址（无注册中心或未配置地址时使用）。
-/// 与 `MessageIngestConfig::resolve_capability_grpc_uri` 配套。
-pub const DEFAULT_CAPABILITY_GRPC_URI: &str = "http://127.0.0.1:50110";
-
-static WARN_EMPTY_CAPABILITY_GRPC_URI: Once = Once::new();
 
 /// 会话生成模式：同步 gRPC 创建 vs 事件异步创建
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,26 +76,8 @@ pub struct MessageIngestConfig {
     /// 业务系统标识符（SVID），用于服务发现时的过滤
     /// 例如："svid.im"、"svid.customer" 等
     pub svid: Option<String>,
-    /// 是否在加载 `hooks.toml` 后 **自动追加** 指向独立进程 `flare-capability` 的
-    /// `HookPlugin.Call`（PreSend/PostSend）gRPC Hook。关闭时仅使用配置文件中的 Hook。
-    /// 环境变量：`MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO=1|true`。
-    pub capability_hooks_auto: bool,
-    /// Explicit JSON array of direct PreSend hook names delegated to Capability.
-    /// No endpoint/product-name inference. Validated before infrastructure starts.
-    pub capability_delegated_pre_send: Option<String>,
-    /// `flare-capability` HookPlugin gRPC 地址，例如 `http://flare-capability:50051`。
-    /// 环境变量：`MESSAGE_INGEST_CAPABILITY_GRPC_URI`（未设且开启 auto 时使用本机默认端口，见 wire 常量）。
-    pub capability_grpc_uri: Option<String>,
-    /// PostSend Hook 扩展失败是否 fail-open（默认 false：保持现有 fail-closed 语义）。
-    pub extension_post_send_fail_open: bool,
-    /// PreSend Hook 扩展单次执行超时（毫秒）。
+    /// 一次发送的 PreSend Hook 总时限（毫秒）：每一步取单条超时和总时限剩余的较小值。
     pub extension_pre_send_timeout_ms: u64,
-    /// PreSend Hook 扩展失败重试次数。
-    pub extension_pre_send_retry: u32,
-    /// PostSend Hook 扩展单次执行超时（毫秒）。
-    pub extension_post_send_timeout_ms: u64,
-    /// PostSend Hook 扩展失败重试次数。
-    pub extension_post_send_retry: u32,
     /// 扩展执行租户白名单（逗号分隔，空表示全量）。
     pub extension_tenant_allowlist: Vec<String>,
     /// Hook 扩展允许的消息类型（逗号分隔 i32，空表示全量）。
@@ -466,52 +441,11 @@ impl MessageIngestConfig {
         let svid =
             env_or_fallback("MESSAGE_INGEST_SVID", "SVID").or_else(|| Some("svid.im".to_string())); // 默认为 svid.im
 
-        let capability_hooks_auto = env::var("MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO")
-            .ok()
-            .map(|v| {
-                let t = v.trim();
-                matches!(t, "1" | "true" | "on" | "yes")
-                    || t.eq_ignore_ascii_case("true")
-                    || t.eq_ignore_ascii_case("yes")
-                    || t.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false);
-
-        let capability_grpc_uri = env_or_fallback(
-            "MESSAGE_INGEST_CAPABILITY_GRPC_URI",
-            "FLARE_CAPABILITY_GRPC_URI",
-        );
-
-        let extension_post_send_fail_open =
-            env::var("MESSAGE_INGEST_EXTENSION_POST_SEND_FAIL_OPEN")
-                .ok()
-                .map(|v| {
-                    let t = v.trim();
-                    matches!(t, "1" | "true" | "on" | "yes")
-                        || t.eq_ignore_ascii_case("true")
-                        || t.eq_ignore_ascii_case("yes")
-                        || t.eq_ignore_ascii_case("on")
-                })
-                .unwrap_or(false);
-
         let extension_pre_send_timeout_ms =
             env::var("MESSAGE_INGEST_EXTENSION_PRE_SEND_TIMEOUT_MS")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1500);
-        let extension_pre_send_retry = env::var("MESSAGE_INGEST_EXTENSION_PRE_SEND_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
-        let extension_post_send_timeout_ms =
-            env::var("MESSAGE_INGEST_EXTENSION_POST_SEND_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1200);
-        let extension_post_send_retry = env::var("MESSAGE_INGEST_EXTENSION_POST_SEND_RETRY")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(0);
         let extension_tenant_allowlist =
             parse_csv_strings(env::var("MESSAGE_INGEST_EXTENSION_TENANT_ALLOWLIST").ok());
         let extension_hook_message_type_allowlist =
@@ -666,20 +600,7 @@ impl MessageIngestConfig {
             conversation_ensure_cache_ttl_seconds,
             server_id,
             svid,
-            capability_hooks_auto,
-            capability_delegated_pre_send: match env::var(
-                "MESSAGE_INGEST_CAPABILITY_DELEGATED_PRE_SEND",
-            ) {
-                Ok(value) => Some(value),
-                Err(env::VarError::NotPresent) => None,
-                Err(_) => Some(String::new()), // invalid Unicode must fail the same closed parser
-            },
-            capability_grpc_uri,
-            extension_post_send_fail_open,
             extension_pre_send_timeout_ms,
-            extension_pre_send_retry,
-            extension_post_send_timeout_ms,
-            extension_post_send_retry,
             extension_tenant_allowlist,
             extension_hook_message_type_allowlist,
             metrics,
@@ -692,23 +613,6 @@ impl MessageIngestConfig {
             send_publish_timeout_ms,
             tenant_runtime_postgres_url,
         }
-    }
-
-    /// Hook `capability_hooks_auto` 使用的能力服务 gRPC 地址（环境变量未设或为空时打一次 warn 并使用 [`DEFAULT_CAPABILITY_GRPC_URI`]）。
-    pub fn resolve_capability_grpc_uri(&self) -> String {
-        if let Some(ref u) = self.capability_grpc_uri {
-            let t = u.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
-        WARN_EMPTY_CAPABILITY_GRPC_URI.call_once(|| {
-            tracing::warn!(
-                fallback = %DEFAULT_CAPABILITY_GRPC_URI,
-                "MESSAGE_INGEST_CAPABILITY_GRPC_URI unset or empty; using default for flare-capability hooks"
-            );
-        });
-        DEFAULT_CAPABILITY_GRPC_URI.to_string()
     }
 
     /// 从应用配置加载（新方式，推荐）

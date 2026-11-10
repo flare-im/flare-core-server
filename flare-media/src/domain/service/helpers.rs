@@ -152,7 +152,7 @@ impl MediaService {
             file_size,
             payload: &empty,
             file_category: scope_file_category,
-            user_id: session.user_id.as_str(),
+            user_id: session.actor_id.as_str(),
             trace_id: session.trace_id.as_deref(),
             namespace: session.namespace.as_deref(),
             business_tag: session.business_tag.as_deref(),
@@ -168,10 +168,14 @@ impl MediaService {
                 .as_ref()
                 .and_then(|repo| repo.cdn_base_url())
         });
-        let url = direct_base
+        let mut url = direct_base
             .map(|base| Self::build_full_url(&base, object_key))
             .unwrap_or_else(|| object_key.to_string());
-        let cdn_url = Self::client_cdn_url(cdn_base, object_key);
+        let mut cdn_url = Self::client_cdn_url(cdn_base, object_key);
+        if session.actor_kind == UploadActorKind::Staff {
+            url.clear();
+            cdn_url.clear();
+        }
 
         let (reference_count, status, grace_expires_at) = Self::initial_lifecycle_state(
             message_managed,
@@ -180,7 +184,17 @@ impl MediaService {
         );
 
         let mut metadata = MediaFileMetadata {
-            owner_id: Some(tenant::require_owner(ctx)?.to_string()),
+            owner_id: Some(if session.actor_kind == UploadActorKind::Staff {
+                require_tenant(ctx)?.to_owned()
+            } else {
+                tenant::require_owner(ctx)?.to_owned()
+            }),
+            owner_kind: if session.actor_kind == UploadActorKind::Staff {
+                MediaOwnerKind::Application
+            } else {
+                MediaOwnerKind::User
+            },
+            purpose: session.purpose,
             file_id: file_id.to_string(),
             file_name: session.file_name.clone(),
             mime_type: session.mime_type.clone(),

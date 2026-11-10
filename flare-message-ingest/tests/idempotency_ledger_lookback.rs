@@ -20,9 +20,7 @@ use flare_im_seq::SequenceAllocator;
 use flare_im_service_kit::metrics::MessageOrchestratorMetrics;
 use flare_message_ingest::application::MessageIngestHandler;
 use flare_message_ingest::application::commands::SendMessageCommand;
-use flare_message_ingest::application::extension::{
-    ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting,
-};
+use flare_message_ingest::application::extension::{ExtensionOrchestrator, ExtensionRouting};
 use flare_message_ingest::config::SessionCreationMode;
 use flare_message_ingest::domain::model::{
     ConversationType, LedgerLookbackPolicy, MessageDefaults,
@@ -323,7 +321,6 @@ async fn harness() -> Harness {
             Arc::new(HookDispatcher::new(HookRegistry::new())),
             None,
         )),
-        ExtensionPolicy::new(true),
         ExtensionRouting::new(Vec::new(), Vec::new()),
     ));
     let store = Arc::new(MemoryIdempotency::default());

@@ -1076,10 +1076,7 @@ environment_bindings = { SDK_SIGNING_KEY = "CELL_KEY" }
             ),
             ("FLARE_API_GATEWAY_CTX_PRIVATE_KEY", vec!["api-gateway"]),
             ("PUSH_WORKER_MOBILE_SNAPSHOT_FILE", vec!["push-worker"]),
-            (
-                "MESSAGE_INGEST_CAPABILITY_DELEGATED_PRE_SEND",
-                vec!["message-ingest"],
-            ),
+            ("FLARE_HOOK_EXECUTIONS_ENABLED", vec!["message-ingest"]),
             ("FLARE_OPS_READ_TOKEN", vec!["admin-gateway"]),
             (
                 "FLARE_AUDIT_NATS_URL",
@@ -1140,6 +1137,8 @@ environment_bindings = { SDK_SIGNING_KEY = "CELL_KEY" }
             "FLARE_PLUGIN_CALL_KEY_ID",
             "FLARE_PLUGIN_CALL_SIGNING_KEY",
             "FLARE_PLUGIN_CALL_PUBLIC_KEYS",
+            "FLARE_PLUGIN_PUBLISHER_KEYS",
+            "FLARE_PLUGIN_CONFIG_KEY",
             "FLARE_PLUGIN_RUNTIME_PUBLIC_KEYS",
         ] {
             assert_eq!(holders(variable), ["capability"], "{variable}");

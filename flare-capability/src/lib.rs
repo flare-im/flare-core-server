@@ -2,23 +2,23 @@
 //!
 //! ## 分层（DDD + CQRS）
 //!
-//! - **Domain**（`domain`）：Hook 编排模型、Hook 集成策略、能力扩展端口（Guard / Resolver）。
-//! - **Application**（`application`）：仅 **`commands` / `handler` / `queries`** — 物化、编排、读目录；**Dispatch / Hook 执行规则在 [`domain`](crate::domain)**。
-//! - **Infrastructure**（`infrastructure`）：配置仓储、适配器工厂、能力扩展（注册 / 路由 等）、**插件路由登记簿**
+//! - **Domain**（`domain`）：Hook 配置模型与写入校验、能力扩展端口（Resolver）。
+//! - **Application**（`application`）：仅 **`commands` / `handler` / `queries`** — 编排、读目录；**Dispatch 规则在 [`domain`](crate::domain)**。
+//! - **Infrastructure**（`infrastructure`）：配置仓储、适配器、能力扩展（注册 / 路由 等）、**插件路由登记簿**
 //!   [`PluginRouteBook`](crate::infrastructure::capability::PluginRouteBook)。
 //! - **Interface**（`interface::grpc`）：gRPC 按子包组织（`capability` / `hooks` / `extensions` / `shared`）。
 //!   - [`CapabilityGrpcServer`](crate::interface::grpc::CapabilityGrpcServer) — `CapabilityService`：
 //!     目录/授权/Dispatch、**Register/Deregister/List 插件 endpoint**、**`Administer`**（Hook 治理，
 //!     `flare.extension.v1.hook_config.*`）。
-//!   - [`ImHookPluginServer`](crate::interface::grpc::ImHookPluginServer) — `HookPlugin.Call`（IM 生命周期）。
 //!   - [`ExtensionPluginRouter`](crate::interface::grpc::ExtensionPluginRouter) — `ExtensionPlugin.Call`
 //!     通用路由器：按 `operation` 前缀分发给插件注册的
 //!     [`ExtensionOperationHandler`](crate::domain::capability::ExtensionOperationHandler)；
 //!     核心不认识任何具体后端。
-//! - **Composition**（`composition`）：进程组合根 — `process_config` / `runtime_context` / **`wiring`**（`initialize` 总装）/ `bootstrap` / `hook_registry`；[`ApplicationBootstrap`](crate::composition::ApplicationBootstrap)、[`init_capability_extension_stack`](crate::composition::init_capability_extension_stack)。
+//! - **Composition**（`composition`）：进程组合根 — `process_config` / `runtime_context` / **`wiring`**（`initialize` 总装）/ `bootstrap`；[`ApplicationBootstrap`](crate::composition::ApplicationBootstrap)、[`init_capability_extension_stack`](crate::composition::init_capability_extension_stack)。
 //!
 //!
-//! 编排器经 `flare_im_hooks::hooks` 的 gRPC 客户端调用本进程 **`HookPlugin`**；Hook 配置 CRUD 经 **`CapabilityService.Administer`**。
+//! Hook 只有一个运行时，在 Message Ingest 里（`flare_im_hooks`）。这里是 Hook 的控制面：配置 CRUD、
+//! 统计、执行记录查询经 **`CapabilityService.Administer`**，保留期清理在后台。
 
 pub mod application;
 /// 进程组合根：依赖图与启动（原 `service` 模块）。
@@ -29,20 +29,11 @@ pub mod interface;
 
 pub use flare_im_capability_core as capability_core;
 
-// Re-export Hook 引擎常用类型（稳定 crate 根路径）
-pub use application::commands::materialize_hook_execution_plan;
 pub use application::queries::{HookIntegrationChannelDoc, list_hook_integration_channels};
 pub use composition::{
     ApplicationBootstrap, ApplicationContext, CapabilityServiceConfig,
     init_capability_extension_stack,
 };
 pub use domain::hook_integration::{HookTransportSurface, classify_transport};
-pub use domain::model::{
-    ExecutionMode, HookConfig, HookExecutionOutcome, HookExecutionPlan, HookExecutionRecord,
-    HookExecutionStatistics,
-};
+pub use domain::model::HookExecutionStatistics;
 pub use infrastructure::capability::{CapabilityExtensionRegistry, PluginRouteBook};
-pub use infrastructure::config::{ConfigLoader, ConfigWatcher};
-
-#[cfg(test)]
-pub(crate) mod test_logs;

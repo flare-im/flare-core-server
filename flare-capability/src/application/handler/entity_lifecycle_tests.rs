@@ -1,11 +1,11 @@
 use super::*;
 use crate::application::handler::plugin_state::tests::{
-    MemoryBindings, POLL_MANIFEST, poll_snapshot,
+    MemoryBindings, POLL_MANIFEST, poll_snapshot, with_manifest,
 };
 use crate::application::handler::plugin_test_server::PluginServer;
 use flare_im_capability_core::plugin::PluginManifest;
 use flare_im_capability_core::plugin::invocation::PluginCallVerifier;
-use flare_im_capability_core::plugin::runtime::{PluginRuntimeSnapshot, digest_bytes};
+use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
 use serde_json::Value;
 use std::sync::Mutex;
 
@@ -17,13 +17,14 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
         Ok(self
             .0
             .lock()
             .unwrap()
             .clone()
-            .filter(|s| s.tenant_id == tenant))
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
 
@@ -40,13 +41,9 @@ fn lifecycle_snapshot(authority: String) -> PluginRuntimeSnapshot {
         serde_json::json!({"unbound": "example.poll.unbound"});
     let raw = serde_json::to_string(&raw).unwrap();
     let manifest = PluginManifest::from_json(raw.as_bytes()).unwrap();
-    let digest = digest_bytes(raw.as_bytes());
     let mut snapshot = poll_snapshot(authority);
-    let projected = &mut snapshot.plugins[0];
-    projected.manifest_json = raw;
-    projected.grant.manifest_digest = digest.clone();
-    projected.deployment.manifest_digest = digest;
-    projected.grant.approved_operations = manifest.operation_ids();
+    snapshot.plugins[0].grant.approved_operations = manifest.operation_ids();
+    snapshot.plugins[0] = with_manifest(&snapshot.plugins[0], &raw);
     snapshot
 }
 

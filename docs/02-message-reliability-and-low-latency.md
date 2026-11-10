@@ -55,7 +55,7 @@ flowchart TD
 - conversation_id 作为 MQ partition key/subject key，保证同会话顺序并减少跨会话互相阻塞。
 - 存储 writer 负责批量、幂等和热缓存投影，避免发送请求同步等待。
 - 主链业务 Hook 推荐使用 gRPC transport，并按 priority 和 error policy 控制影响；旁路审计类 Hook 使用短超时和 ignore/retry。
-- metrics 记录 `validate`、`pre_send_hook`、`prepare_allocate_seq`、`conversation_ensure`、`decorate`、`wal_write`、`mq_publish`、`wal_cleanup`、`post_send_hook` 等阶段延迟。
+- metrics 记录 `validate`、`pre_send_hook`、`prepare_allocate_seq`、`conversation_ensure`、`decorate`、`wal_write`、`mq_publish`、`wal_cleanup` 等阶段延迟。
 
 ## 如何保证持久消息不丢
 

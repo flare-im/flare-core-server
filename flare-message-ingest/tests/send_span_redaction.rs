@@ -25,9 +25,7 @@ use flare_im_seq::SequenceAllocator;
 use flare_im_service_kit::metrics::MessageOrchestratorMetrics;
 use flare_message_ingest::application::MessageIngestHandler;
 use flare_message_ingest::application::commands::{SendMessageCommand, SendSystemMessageCommand};
-use flare_message_ingest::application::extension::{
-    ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting,
-};
+use flare_message_ingest::application::extension::{ExtensionOrchestrator, ExtensionRouting};
 use flare_message_ingest::config::SessionCreationMode;
 use flare_message_ingest::domain::model::{ConversationType, MessageDefaults};
 use flare_message_ingest::domain::repository::{RecipientRepository, WalRepositoryItem};
@@ -192,7 +190,6 @@ async fn handler() -> MessageIngestHandler {
     let hooks = Arc::new(HookDispatcher::new(HookRegistry::new()));
     let extension_orchestrator = Arc::new(ExtensionOrchestrator::new(
         Arc::new(HookExecutionService::new(hooks, None)),
-        ExtensionPolicy::new(true),
         ExtensionRouting::new(Vec::new(), Vec::new()),
     ));
     MessageIngestHandler::new(

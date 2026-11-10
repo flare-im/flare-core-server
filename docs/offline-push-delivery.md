@@ -60,14 +60,8 @@ The file remains private and read-only to Core; any trusted producer can impleme
 contract. There is **no dependency on Platform, staff roles, organizations or its SQL/API**.
 
 Core's default service Hook profiles likewise remain empty/business-neutral. Product
-deployments must supply their own policy profile explicitly. Capability auto-routing no
-longer guesses policy ownership from endpoint substrings: an optional
-`MESSAGE_INGEST_CAPABILITY_DELEGATED_PRE_SEND` JSON array names exact, enabled direct
-hooks to remove only when `MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO` is enabled. Invalid,
-unknown, duplicate and disabled names reject startup; an absent declaration removes
-nothing. This declaration is an operator's execution plan, **not proof** the replacement
-policy exists. End-to-end product acceptance must verify the policy is installed and
-actually denies unauthorized sends. Static route validation still runs before delegation.
+deployments must supply their own policy profile explicitly. End-to-end product acceptance
+must verify the policy is installed and actually denies unauthorized sends.
 
 The conditional lifecycle is now implemented in Rust and generated bindings; see
 `../../flare-core-sdk-engine/docs/native-push-lifecycle.md`. Token/permission callbacks and

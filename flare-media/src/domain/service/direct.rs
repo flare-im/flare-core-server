@@ -18,9 +18,35 @@ impl MediaService {
         head_tail_sha256: Option<String>,
         full_sha256: Option<String>,
     ) -> Result<DirectUploadSessionState> {
+        let actor_id = tenant::require_owner(ctx)?.to_owned();
+        self.initiate_direct_upload_as(
+            ctx,
+            metadata,
+            desired_part_size,
+            file_fingerprint,
+            head_tail_sha256,
+            full_sha256,
+            actor_id,
+            UploadActorKind::User,
+            MediaPurpose::General,
+        )
+        .await
+    }
+
+    pub(super) async fn initiate_direct_upload_as(
+        &self,
+        ctx: &Context,
+        metadata: &flare_grpc_proto::media::UploadFileMetadata,
+        desired_part_size: i64,
+        file_fingerprint: Option<String>,
+        head_tail_sha256: Option<String>,
+        full_sha256: Option<String>,
+        actor_id: String,
+        actor_kind: UploadActorKind,
+        purpose: MediaPurpose,
+    ) -> Result<DirectUploadSessionState> {
         ctx.ensure_not_cancelled().map_err(map_context_error)?;
         let tenant_id = require_tenant(ctx)?;
-        let owner_id = tenant::require_owner(ctx)?;
 
         let Some(store) = &self.upload_conversation_store else {
             return Err(flare_server_core::flare_err!(
@@ -44,12 +70,15 @@ impl MediaService {
         let bucket = object_repo
             .bucket_name()
             .unwrap_or_else(|| "media".to_string());
-        let object_key = object_repo.build_object_key_for(
+        let mut object_key = object_repo.build_object_key_for(
             tenant_id,
             &file_id,
             &metadata.file_name,
             &file_category,
         );
+        if actor_kind == UploadActorKind::Staff {
+            object_key = format!("staging/{object_key}");
+        }
 
         let now = Utc::now();
         let expires_at = now + Duration::seconds(self.config.chunk_ttl_seconds.max(300));
@@ -129,7 +158,9 @@ impl MediaService {
             head_tail_sha256,
             full_sha256,
             total_parts: Some(total_parts),
-            user_id: owner_id.to_string(),
+            actor_id,
+            actor_kind,
+            purpose,
             namespace: if metadata.namespace.is_empty() {
                 None
             } else {
@@ -394,6 +425,7 @@ impl MediaService {
         if let Some(metadata_store) = &self.metadata_store
             && let Some(registered) = metadata_store.load_metadata(ctx, &file_id).await?
         {
+            Self::validate_registered_upload(&session, &registered)?;
             Self::finish_direct_session(store.as_ref(), &mut session).await;
             return Ok(registered);
         }
@@ -446,6 +478,7 @@ impl MediaService {
                 if let Some(metadata_store) = &self.metadata_store
                     && let Some(registered) = metadata_store.load_metadata(ctx, &file_id).await?
                 {
+                    Self::validate_registered_upload(&session, &registered)?;
                     return Ok(registered);
                 }
                 return Err(err);
@@ -459,15 +492,18 @@ impl MediaService {
                 self.merge_direct_parts(store.as_ref(), &mut session, &object_key, file_size)
                     .await?;
             }
-            self.persist_direct_upload_metadata(
-                ctx,
-                &session,
-                &bucket,
-                &object_key,
-                &file_id,
-                file_size,
-            )
-            .await
+            let final_key = self.seal_admin_image_object(&session, &object_key).await?;
+            let persisted = self
+                .persist_direct_upload_metadata(
+                    ctx, &session, &bucket, &final_key, &file_id, file_size,
+                )
+                .await;
+            if session.actor_kind == UploadActorKind::Staff && persisted.is_ok() {
+                if let Err(err) = object_repo.delete_object(&object_key).await {
+                    tracing::warn!(error = %err, "failed to remove administrative upload temporary object");
+                }
+            }
+            persisted
         };
         let outcome = self
             .hold_direct_completion(store.as_ref(), &claim, work)
@@ -501,6 +537,31 @@ impl MediaService {
         if let Some(mut session) = store.get_session(upload_id).await? {
             Self::authorize_upload_session(ctx, &session)?;
             self.ensure_direct_session(&session)?;
+            if session.actor_kind == UploadActorKind::Staff {
+                let claimed = store
+                    .update_session(upload_id, &|current| {
+                        Self::authorize_upload_session(ctx, current)?;
+                        if current
+                            .completion
+                            .as_ref()
+                            .is_some_and(|claim| claim.lease_until > Utc::now())
+                        {
+                            return Err(flare_server_core::flare_err!(
+                                ErrorCode::ServiceUnavailable,
+                                "upload completion is in progress; retry abort later"
+                            ));
+                        }
+                        current.status = UploadSessionStatus::Aborted;
+                        current.updated_at = Utc::now();
+                        Ok(true)
+                    })
+                    .await?;
+                if let Some(claimed) = claimed {
+                    self.release_upload_resources(&claimed).await?;
+                    store.delete_session(upload_id).await?;
+                }
+                return Ok(());
+            }
             // 中止也要释放存储侧资源：分片上传 abort，单次 PUT 已写入的对象删除。
             // 释放失败不挡中止，会话记录随后删除，残留由存储侧生命周期规则兜底。
             if let Err(err) = self.release_upload_resources(&session).await {
@@ -557,6 +618,23 @@ impl DirectCompletionClaim {
 }
 
 impl MediaService {
+    fn validate_registered_upload(
+        session: &UploadSession,
+        metadata: &MediaFileMetadata,
+    ) -> Result<()> {
+        if session.actor_kind == UploadActorKind::Staff
+            && (metadata.owner_kind != MediaOwnerKind::Application
+                || metadata.owner_id.as_deref() != Some(session.tenant_id.as_str())
+                || metadata.purpose != session.purpose)
+        {
+            return Err(flare_server_core::flare_err!(
+                ErrorCode::PermissionDenied,
+                "registered upload ownership differs"
+            ));
+        }
+        Ok(())
+    }
+
     fn session_not_found(upload_id: &str) -> flare_server_core::error::FlareError {
         flare_server_core::flare_err_details!(
             ErrorCode::MessageNotFound,

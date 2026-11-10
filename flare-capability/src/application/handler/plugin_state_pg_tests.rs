@@ -6,7 +6,7 @@
 //!
 //! Needs `FLARE_PLUGIN_STATE_TEST_DATABASE_URL`: a disposable database whose name starts with
 //! `flare_c2_`, initialized with `deploy/init.sql`. Ignored by default (`cargo test -- --ignored`).
-use super::plugin_state::tests::poll_snapshot;
+use super::plugin_state::tests::{POLL_MANIFEST, poll_snapshot};
 use super::plugin_state::{PluginStateMetrics, PluginStatePublisher, PublishScope, PublishSource};
 use crate::domain::repository::plugin_state::PluginStateEventSink;
 use crate::infrastructure::adapters::plugin_state_events::{
@@ -14,6 +14,9 @@ use crate::infrastructure::adapters::plugin_state_events::{
 };
 use crate::infrastructure::persistence::postgres_plugin_entity_bindings::PostgresPluginEntityBindings;
 use flare_im_capability_core::plugin::resource::EntityStatePublishOutcome;
+use flare_im_capability_core::plugin::runtime::{
+    PluginProjection, PluginRuntimeSnapshot, ProjectedLifecycle, ProjectedPlugin,
+};
 use flare_im_capability_core::plugin::state::SharedState;
 use flare_im_contracts::Ctx;
 use flare_im_message_pipeline::{ConversationType, PushRepository, RecipientRepository};
@@ -224,6 +227,45 @@ fn card() -> StoredMessage {
 /// Both tests reset and use the same tenant: they run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// The control plane's part: `snapshot`'s manifest in the registry and its wire form stored.
+async fn store_projection(pool: &sqlx::PgPool, snapshot: &PluginRuntimeSnapshot) {
+    let plugin = &snapshot.plugins[0];
+    sqlx::query(
+        "INSERT INTO plugin_versions (plugin_id, plugin_version, manifest_digest, manifest_json, \
+         display_name, publisher_id, key_id, signature, kind) \
+         VALUES ($1, $2, $3, $4, 'test', 'test', 'test', 'test', 'im') ON CONFLICT DO NOTHING",
+    )
+    .bind(&plugin.grant.plugin_id)
+    .bind(&plugin.grant.plugin_version)
+    .bind(&plugin.grant.manifest_digest)
+    .bind(POLL_MANIFEST)
+    .execute(pool)
+    .await
+    .unwrap();
+    let projection = PluginProjection {
+        tenant_id: snapshot.tenant_id.clone(),
+        organization_id: snapshot.organization_id.clone(),
+        version: snapshot.version,
+        issued_at_ms: snapshot.issued_at_ms,
+        valid_until_ms: snapshot.valid_until_ms,
+        plugins: vec![ProjectedPlugin {
+            grant: plugin.grant.clone(),
+            lifecycle: ProjectedLifecycle::Installed,
+            export_until_ms: None,
+            features: plugin.features.clone(),
+        }],
+        bindings: Vec::new(),
+    };
+    sqlx::query("INSERT INTO plugin_authorization_snapshots(app_id, version, snapshot, valid_until_ms) VALUES ($1, $2, $3, $4)")
+        .bind(TENANT)
+        .bind(projection.version as i64)
+        .bind(serde_json::to_value(&projection).unwrap())
+        .bind(projection.valid_until_ms)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn reset(pool: &sqlx::PgPool) {
     for table in [
         "DELETE FROM plugin_entity_lifecycle_outbox WHERE tenant_id = $1",
@@ -264,14 +306,7 @@ async fn two_voters_publish_a_third_member_receives_and_offline_sync_converges()
 
     // The tenant enabled the example poll (control plane projection).
     let snapshot = poll_snapshot("http://127.0.0.1:1".into());
-    sqlx::query("INSERT INTO plugin_authorization_snapshots(app_id, version, snapshot, valid_until_ms) VALUES ($1, $2, $3, $4)")
-        .bind(TENANT)
-        .bind(snapshot.version as i64)
-        .bind(serde_json::to_value(&snapshot).unwrap())
-        .bind(snapshot.valid_until_ms)
-        .execute(&pool)
-        .await
-        .unwrap();
+    store_projection(&pool, &snapshot).await;
 
     // Storage Writer stores Alice's card and binds its entity.
     let messages = Arc::new(PostgresMessageStore::from_pool(pool.clone()));
@@ -659,14 +694,7 @@ async fn the_lifecycle_outbox_and_platform_bindings_hold_on_postgres() {
         .await
         .unwrap();
     let snapshot = poll_snapshot("http://127.0.0.1:1".into());
-    sqlx::query("INSERT INTO plugin_authorization_snapshots(app_id, version, snapshot, valid_until_ms) VALUES ($1, $2, $3, $4)")
-        .bind(TENANT)
-        .bind(snapshot.version as i64)
-        .bind(serde_json::to_value(&snapshot).unwrap())
-        .bind(snapshot.valid_until_ms)
-        .execute(pool.as_ref())
-        .await
-        .unwrap();
+    store_projection(pool.as_ref(), &snapshot).await;
     let messages = PostgresMessageStore::from_pool(pool.as_ref().clone());
     messages.store_archive(&ctx(), &card()).await.unwrap();
     assert_eq!(

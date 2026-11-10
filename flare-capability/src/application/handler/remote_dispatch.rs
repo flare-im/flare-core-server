@@ -71,7 +71,9 @@ enum Invoked {
 struct InvokedCall {
     result: CapabilityDispatchResult,
     tenant: String,
-    manifest: flare_im_capability_core::plugin::PluginManifest,
+    /// The snapshot the call was authorized against, and the plugin's place in it.
+    snapshot: Arc<flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot>,
+    plugin: usize,
     declares_publish: bool,
 }
 
@@ -88,6 +90,12 @@ pub(crate) fn restricted_operations(
     restricted.extend(manifest.service_operation_ids());
     restricted.extend(
         manifest
+            .event_subscriptions
+            .iter()
+            .map(|s| s.operation.clone()),
+    );
+    restricted.extend(
+        manifest
             .client_extensions
             .contributions
             .iter()
@@ -96,52 +104,47 @@ pub(crate) fn restricted_operations(
     restricted
 }
 
-/// The projected plugin a user may invoke `operation` of, and its manifest (plugin platform v2
-/// §2): the plugin is enabled for the tenant (in the projection, not revoked, inside its lease),
+/// Where in `snapshot.plugins` the plugin is that a user may invoke `operation` of (plugin platform
+/// v2 §2): the plugin is enabled for the tenant (in the projection, not revoked, inside its lease),
 /// the operation is one of its user operations (neither an admin nor a lifecycle operation) and
-/// approved by the installation, and no emergency switch stops it. The caller is the tenant's
-/// authenticated user (the verified dispatch origin). Every user of the tenant holds the
+/// approved by the installation, no emergency switch stops it, and no feature the application
+/// closed or left unpublished gates it. The caller is the tenant's authenticated user (the verified dispatch origin). Every user of the tenant holds the
 /// permissions the installation approved: who may do what inside the plugin (members, roles) is
 /// the plugin's own rule, checked through the resource bridge. No per-user grant is read.
-async fn authorize_user_operation<'s>(
-    snapshot: &'s flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot,
+async fn authorize_user_operation(
+    snapshot: &flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot,
     tenant: &str,
     user: &str,
     operation: &str,
     policy: &Arc<dyn CapabilityPolicyBackend>,
     now: i64,
-) -> Result<(
-    &'s flare_im_capability_core::plugin::runtime::ProjectedPlugin,
-    flare_im_capability_core::plugin::PluginManifest,
-)> {
+) -> Result<usize> {
     use flare_im_service_kit::plugin_platform::{
-        PLUGIN_DISABLED, PLUGIN_NOT_INSTALLED, PLUGIN_PERMISSION_DENIED,
+        PLUGIN_DISABLED, PLUGIN_FEATURE_DISABLED, PLUGIN_NOT_INSTALLED, PLUGIN_PERMISSION_DENIED,
     };
     let mut denial = (
         PLUGIN_NOT_INSTALLED,
         "plugin is not installed for this application",
     );
     let mut found = None;
-    for projected in &snapshot.plugins {
-        let Ok(manifest) = projected.manifest() else {
-            continue;
-        };
-        if manifest.operation(operation).is_none() {
+    for (index, projected) in snapshot.plugins.iter().enumerate() {
+        if projected.manifest().operation(operation).is_none() {
             continue;
         }
         let grant = &projected.grant;
         if grant.revoked {
             continue;
         }
-        if !grant.enabled || now < grant.valid_from_ms || now >= grant.valid_until_ms {
+        if !grant.enabled || grant.suspended || !grant.in_effect(now) {
             denial = (PLUGIN_DISABLED, "plugin is disabled for this application");
             continue;
         }
-        found = Some((projected, manifest));
+        found = Some(index);
         break;
     }
-    let (projected, manifest) = found.ok_or_else(|| plugin_denied(denial.0, denial.1))?;
-    if restricted_operations(&manifest).contains(operation) {
+    let index = found.ok_or_else(|| plugin_denied(denial.0, denial.1))?;
+    let projected = &snapshot.plugins[index];
+    if restricted_operations(projected.manifest()).contains(operation) {
         return Err(plugin_denied(
             PLUGIN_PERMISSION_DENIED,
             "operation is not a user operation of this plugin",
@@ -171,7 +174,13 @@ async fn authorize_user_operation<'s>(
                 "operation is not approved for this application",
             )
         })?;
-    Ok((projected, manifest))
+    if projected.closed().operations.contains(operation) {
+        return Err(plugin_denied(
+            PLUGIN_FEATURE_DISABLED,
+            "feature is not open for this application",
+        ));
+    }
+    Ok(index)
 }
 
 async fn invoke_authorized(
@@ -223,14 +232,16 @@ async fn invoke_authorized(
             "the plugin projection of this application lapsed",
         )
     })?;
-    let (projected, manifest) =
+    let plugin =
         authorize_user_operation(&snapshot, &tenant, user, &req.capability_id, policy, now).await?;
+    let projected = &snapshot.plugins[plugin];
+    let manifest = projected.manifest();
     let operation = manifest
         .operation(&req.capability_id)
         .ok_or_else(|| denied(()))?;
     let timeout = timeout.min(Duration::from_millis(u64::from(operation.timeout_ms)));
     let input = req.payload.as_ref().unwrap_or(&Value::Null);
-    card_binding_guard(routes, &tenant, &manifest, req, input).await?;
+    card_binding_guard(routes, &tenant, manifest, req, input).await?;
     let claims = PluginCallClaims {
         tenant_id: tenant.clone(),
         plugin_id: projected.grant.plugin_id.clone(),
@@ -279,7 +290,8 @@ async fn invoke_authorized(
     Ok(Invoked::Plugin(Box::new(InvokedCall {
         result,
         tenant,
-        manifest,
+        snapshot,
+        plugin,
         declares_publish,
     })))
 }
@@ -294,12 +306,14 @@ async fn complete_call(
     let InvokedCall {
         mut result,
         tenant,
-        manifest,
+        snapshot,
+        plugin,
         declares_publish,
     } = call;
     if !result.success {
         return Ok(result);
     }
+    let manifest = snapshot.plugins[plugin].manifest();
     if result.data.get("message").is_some() {
         let unconfigured;
         let poster = match &routes.card_poster {
@@ -322,7 +336,7 @@ async fn complete_call(
                     conversation_id: req.conversation_id.as_deref(),
                     request_id: req.request_id.as_deref().unwrap_or_default(),
                     input: req.payload.as_ref().unwrap_or(&Value::Null),
-                    manifest: &manifest,
+                    manifest,
                 },
                 data,
             )
@@ -799,9 +813,10 @@ fn plugin_status_outcome(call: &PluginCall<'_>, status: Status) -> Result<Plugin
 ///
 /// Every authenticated user of the tenant sees the same catalog: each enabled plugin with the user
 /// operations its installation approved (admin and lifecycle operations never reach clients) that
-/// no emergency switch stops, and the client contributions those operations keep. Plugins the
+/// no emergency switch stops and no closed feature gates, and the client contributions those
+/// operations keep, less the contributions a closed feature names. Plugins the
 /// tenant has but the viewer cannot use are listed in `unavailable` with the reason (disabled,
-/// not installed after a revocation, an unreadable manifest, nothing offered), so a card of one
+/// not installed after a revocation, nothing offered), so a card of one
 /// says why it is inert. One plugin's problem never fails the catalog.
 async fn client_ui_catalog(
     tenant: &str,
@@ -828,6 +843,10 @@ async fn client_ui_catalog(
         plugins: vec![],
         unavailable: vec![],
     };
+    let mut authorized_queries: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<String>,
+    > = Default::default();
     let mut unavailable: std::collections::BTreeMap<String, UiUnavailableReason> =
         Default::default();
     let mut note = |plugin_id: &str, reason: UiUnavailableReason| {
@@ -849,19 +868,16 @@ async fn client_ui_catalog(
                 note(&grant.plugin_id, UiUnavailableReason::NotInstalled);
                 continue;
             }
-            if !grant.enabled || now < grant.valid_from_ms || now >= grant.valid_until_ms {
+            if !grant.enabled || grant.suspended || !grant.in_effect(now) {
                 note(&grant.plugin_id, UiUnavailableReason::Disabled);
                 continue;
             }
-            let Ok(manifest) = projected.manifest() else {
-                tracing::warn!(tenant, plugin_id = %grant.plugin_id, "projected plugin manifest unreadable; left out of the catalog");
-                note(&grant.plugin_id, UiUnavailableReason::IncompatibleVersion);
-                continue;
-            };
-            let restricted = restricted_operations(&manifest);
+            let manifest = projected.manifest();
+            let restricted = restricted_operations(manifest);
+            let closed = projected.closed();
             let mut operations = std::collections::BTreeSet::new();
             let mut permissions = std::collections::BTreeSet::new();
-            let mut stopped = false;
+            let mut stopped = !closed.contributions.is_empty();
             for operation in manifest.operation_ids() {
                 if restricted.contains(&operation)
                     || !grant.approved_operations.contains(&operation)
@@ -873,10 +889,11 @@ async fn client_ui_catalog(
                 {
                     continue;
                 }
-                if policy
-                    .ensure_not_suspended(tenant, &operation)
-                    .await
-                    .is_err()
+                if closed.operations.contains(&operation)
+                    || policy
+                        .ensure_not_suspended(tenant, &operation)
+                        .await
+                        .is_err()
                 {
                     stopped = true;
                     continue;
@@ -886,15 +903,30 @@ async fn client_ui_catalog(
                 }
                 operations.insert(operation);
             }
-            let configuration = client_configuration(&manifest, projected);
-            let mut extensions = manifest.client_extensions;
+            let query_operations = operations
+                .iter()
+                .filter(|operation| {
+                    manifest.operation(operation).is_some_and(|op| {
+                        op.mode == flare_im_capability_core::plugin::manifest::OperationMode::Query
+                    })
+                })
+                .cloned()
+                .collect();
+            authorized_queries.insert(manifest.plugin_id.clone(), query_operations);
+            let configuration = client_configuration(manifest, projected);
+            let mut extensions = manifest.client_extensions.clone();
+            // Marketplace samples are not part of the running client surface.
+            for contribution in &mut extensions.contributions {
+                contribution.preview = None;
+            }
             let declared_client_surfaces = !extensions.contributions.is_empty();
             // Every reference to an action the viewer may not invoke goes with it (choices,
             // rows, translations, a detail whose operation is not offered).
             extensions.contributions.retain(|c| {
-                c.required_permissions
-                    .iter()
-                    .all(|p| permissions.contains(p))
+                !closed.contributions.contains(&c.id)
+                    && c.required_permissions
+                        .iter()
+                        .all(|p| permissions.contains(p))
             });
             if extensions.contributions.is_empty() {
                 if declared_client_surfaces {
@@ -911,12 +943,13 @@ async fn client_ui_catalog(
             }
             result.valid_until_ms = result.valid_until_ms.min(grant.valid_until_ms);
             result.plugins.push(ClientPlugin {
-                plugin_id: manifest.plugin_id,
-                version: manifest.version,
+                plugin_id: manifest.plugin_id.clone(),
+                version: manifest.version.clone(),
                 manifest_digest: grant.manifest_digest.clone(),
                 grant_revision: grant.revision,
                 extensions,
                 operations,
+                query_operations: Default::default(),
                 configuration,
             });
         }
@@ -949,6 +982,20 @@ async fn client_ui_catalog(
                 UiActionTarget::Native { .. } => true,
             });
         }
+        // Older catalog readers reject unknown fields. Only a plugin actually
+        // offering the new read-only recovery mode needs this authority; all
+        // existing plugins retain the previous serialized catalog shape.
+        if plugin.extensions.contributions.iter().any(|contribution| {
+            contribution.schema.actions.iter().any(|action| {
+                action.command.as_ref().is_some_and(|command| {
+                    command.mode == flare_im_capability_core::plugin::ui::UiPageCommandMode::Observe
+                })
+            })
+        }) {
+            plugin.query_operations = authorized_queries
+                .remove(&plugin.plugin_id)
+                .unwrap_or_default();
+        }
     }
     let available: std::collections::BTreeSet<&str> = result
         .plugins
@@ -975,7 +1022,7 @@ async fn client_ui_catalog(
 /// subset outside those bounds is dropped (logged), never sent partially.
 fn client_configuration(
     manifest: &flare_im_capability_core::plugin::PluginManifest,
-    projected: &flare_im_capability_core::plugin::runtime::ProjectedPlugin,
+    projected: &flare_im_capability_core::plugin::runtime::ResolvedPlugin,
 ) -> serde_json::Map<String, Value> {
     if projected.client_configuration.is_empty() {
         return Default::default();

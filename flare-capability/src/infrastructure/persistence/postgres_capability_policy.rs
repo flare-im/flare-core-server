@@ -6,36 +6,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use flare_im_contracts::utils::normalize_tenant_id;
 use flare_server_core::error::AnyhowContext as _;
-use sqlx::{FromRow, PgPool};
+use sqlx::PgPool;
 
 use crate::domain::capability::{
-    CapabilityError, CapabilityPolicyBackend, Result, TenantCapabilitySwitch, UserCapabilityGrant,
+    CapabilityError, CapabilityPolicyBackend, Result, TenantCapabilitySwitch,
 };
-
-#[derive(Debug, Clone, FromRow)]
-struct GrantRow {
-    tenant_id: String,
-    user_id: String,
-    capability_id: String,
-    granted_at: DateTime<Utc>,
-    expires_at: Option<DateTime<Utc>>,
-    plan_code: Option<String>,
-    source: Option<String>,
-}
-
-impl From<GrantRow> for UserCapabilityGrant {
-    fn from(r: GrantRow) -> Self {
-        UserCapabilityGrant {
-            tenant_id: r.tenant_id,
-            user_id: r.user_id,
-            capability_id: r.capability_id,
-            granted_at: r.granted_at,
-            expires_at: r.expires_at,
-            plan_code: r.plan_code,
-            source: r.source,
-        }
-    }
-}
 
 /// 基于 PostgreSQL 的 [`CapabilityPolicyBackend`]
 #[derive(Debug, Clone)]
@@ -90,24 +65,6 @@ impl PostgresCapabilityPolicy {
         )))
     }
 
-    /// 表结构已存在但无任何授权行时告警，避免首包 Dispatch 才看到 `user capability grant missing or expired`。
-    pub async fn warn_if_user_grants_empty(pool: &PgPool) -> flare_server_core::error::Result<()> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*)::bigint FROM public.capability_user_grants")
-                .fetch_one(pool)
-                .await
-                .context("count public.capability_user_grants")?;
-
-        if row.0 == 0 {
-            tracing::warn!(
-                target = "flare_capability::db",
-                "public.capability_user_grants is empty: Dispatch will fail with \"user capability grant missing or expired\" until seeded. \
-                 Grant the capabilities on **this** database (host/db must match DATABASE_URL / startup log postgres_after_at)."
-            );
-        }
-        Ok(())
-    }
-
     async fn load_global_enabled(&self) -> Result<bool> {
         let row: Option<(bool,)> = sqlx::query_as(
             r#"SELECT global_enabled FROM public.capability_service_settings WHERE id = 1"#,
@@ -143,26 +100,6 @@ impl PostgresCapabilityPolicy {
         Ok(row.map(|(enabled,)| enabled))
     }
 
-    async fn tenant_capability_disabled(
-        &self,
-        tenant_id: &str,
-        capability_id: &str,
-    ) -> Result<bool> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        let row: Option<(bool,)> = sqlx::query_as(
-            r#"
-            SELECT enabled FROM public.capability_tenant_switches
-            WHERE tenant_id = $1 AND capability_id = $2
-            "#,
-        )
-        .bind(&tenant_id)
-        .bind(capability_id)
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .map_err(|e| CapabilityError::System(format!("capability tenant switch: {e}")))?;
-        Ok(matches!(row, Some((false,))))
-    }
-
     /// Whether a tenant switch that is off covers `capability_id`: its own, or a `<prefix>.*`
     /// switch whose prefix (with the dot) starts it (see
     /// `CapabilityPolicyBackend::ensure_not_suspended`).
@@ -191,32 +128,6 @@ impl PostgresCapabilityPolicy {
         Ok(row.is_some())
     }
 
-    async fn has_active_grant(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        capability_id: &str,
-    ) -> Result<bool> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        // user_id = '*' 表示该租户下任意用户（与 init_v2 开发种子对齐；生产可改为按用户灌库并删除通配行）
-        let row: Option<(i64,)> = sqlx::query_as(
-            r#"
-            SELECT 1::bigint FROM public.capability_user_grants
-            WHERE tenant_id = $1
-              AND (user_id = $2 OR user_id = '*')
-              AND (capability_id = $3 OR capability_id = (split_part($3, '.', 1) || '.*'))
-              AND (expires_at IS NULL OR expires_at > NOW())
-            LIMIT 1
-            "#,
-        )
-        .bind(&tenant_id)
-        .bind(user_id)
-        .bind(capability_id)
-        .fetch_optional(self.pool.as_ref())
-        .await
-        .map_err(|e| CapabilityError::System(format!("capability_user_grants: {e}")))?;
-        Ok(row.is_some())
-    }
 }
 
 #[async_trait]
@@ -261,147 +172,6 @@ impl CapabilityPolicyBackend for PostgresCapabilityPolicy {
                 "capability {capability_id} disabled for tenant {tenant_id}"
             )));
         }
-        Ok(())
-    }
-
-    async fn ensure_dispatch_allowed(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        capability_id: &str,
-    ) -> Result<()> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        if !self.load_global_enabled().await? {
-            return Err(CapabilityError::PolicyDenied(
-                "global capability switch is disabled".into(),
-            ));
-        }
-        if self
-            .tenant_capability_disabled(&tenant_id, capability_id)
-            .await?
-        {
-            return Err(CapabilityError::PolicyDenied(format!(
-                "capability {capability_id} disabled for tenant {tenant_id}"
-            )));
-        }
-        if !self
-            .has_active_grant(&tenant_id, user_id, capability_id)
-            .await?
-        {
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                capability_id = %capability_id,
-                user_id_len = user_id.len(),
-                "capability_user_grants: no matching row (need a matching `<prefix>.*` or exact capability, for the user or user_id='*')"
-            );
-            return Err(CapabilityError::PolicyDenied(
-                "user capability grant missing or expired".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn list_user_grants(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-    ) -> Result<Vec<UserCapabilityGrant>> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        let rows = sqlx::query_as::<_, GrantRow>(
-            r#"
-            SELECT tenant_id, user_id, capability_id, granted_at, expires_at, plan_code, source
-            FROM public.capability_user_grants
-            WHERE tenant_id = $1 AND user_id = $2
-              AND (expires_at IS NULL OR expires_at > NOW())
-            ORDER BY capability_id
-            "#,
-        )
-        .bind(&tenant_id)
-        .bind(user_id)
-        .fetch_all(self.pool.as_ref())
-        .await
-        .map_err(|e| CapabilityError::System(format!("list_user_grants: {e}")))?;
-        Ok(rows.into_iter().map(UserCapabilityGrant::from).collect())
-    }
-
-    async fn grant_user_capability(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        capability_id: &str,
-        expires_at: Option<DateTime<Utc>>,
-        plan_code: Option<String>,
-        source: Option<String>,
-    ) -> Result<()> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        let mut tx = self.pool.begin().await.map_err(write_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO public.capability_user_grants (
-                tenant_id, user_id, capability_id, granted_at, expires_at, plan_code, source
-            )
-            VALUES ($1, $2, $3, NOW(), $4, $5, $6)
-            ON CONFLICT (tenant_id, user_id, capability_id) DO UPDATE SET
-                granted_at = NOW(),
-                expires_at = EXCLUDED.expires_at,
-                plan_code = EXCLUDED.plan_code,
-                source = EXCLUDED.source
-            "#,
-        )
-        .bind(&tenant_id)
-        .bind(user_id)
-        .bind(capability_id)
-        .bind(expires_at)
-        .bind(plan_code.as_deref())
-        .bind(source.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(write_error)?;
-        flare_im_service_kit::audit_effects::durable::record(
-            &mut tx,
-            &tenant_id,
-            "capability_grant",
-            &format!("{user_id}:{capability_id}"),
-            "grant",
-        )
-        .await
-        .map_err(write_error)?;
-        tx.commit().await.map_err(write_error)?;
-        Ok(())
-    }
-
-    async fn revoke_user_capability(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        capability_id: &str,
-    ) -> Result<()> {
-        let tenant_id = normalize_tenant_id(tenant_id);
-        let mut tx = self.pool.begin().await.map_err(write_error)?;
-        let deleted = sqlx::query(
-            r#"
-            DELETE FROM public.capability_user_grants
-            WHERE tenant_id = $1 AND user_id = $2 AND capability_id = $3
-            "#,
-        )
-        .bind(&tenant_id)
-        .bind(user_id)
-        .bind(capability_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(write_error)?;
-        if deleted.rows_affected() > 0 {
-            flare_im_service_kit::audit_effects::durable::record(
-                &mut tx,
-                &tenant_id,
-                "capability_grant",
-                &format!("{user_id}:{capability_id}"),
-                "revoke",
-            )
-            .await
-            .map_err(write_error)?;
-        }
-        tx.commit().await.map_err(write_error)?;
         Ok(())
     }
 

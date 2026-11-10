@@ -1,7 +1,5 @@
-use chrono::{Duration, Utc};
 use flare_im_capability_core::{
     CapabilityDispatchResult, CapabilityInvokeMeta, ConversationKind, ResolveTrigger,
-    UserCapabilityGrant,
 };
 use serde_json::json;
 
@@ -23,27 +21,6 @@ fn dispatch_result_keeps_success_and_failure_shapes_stable() {
     let fail = CapabilityDispatchResult::fail("req-2", "plugin-1", "example.poll.vote", "denied");
     assert!(!fail.success);
     assert_eq!(fail.error.as_deref(), Some("denied"));
-}
-
-#[test]
-fn grant_activity_uses_expiry_boundary_only() {
-    let now = Utc::now();
-    let active = UserCapabilityGrant {
-        tenant_id: "tenant-1".into(),
-        user_id: "user-1".into(),
-        capability_id: "example.poll.vote".into(),
-        granted_at: now,
-        expires_at: Some(now + Duration::seconds(1)),
-        plan_code: None,
-        source: None,
-    };
-    let expired = UserCapabilityGrant {
-        expires_at: Some(now - Duration::seconds(1)),
-        ..active.clone()
-    };
-
-    assert!(active.is_active(now));
-    assert!(!expired.is_active(now));
 }
 
 #[test]

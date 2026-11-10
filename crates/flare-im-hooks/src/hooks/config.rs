@@ -4,27 +4,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use flare_server_core::error::{ErrorBuilder, ErrorCode, Result};
 
 use super::adapters::is_reserved_webhook_header;
-use super::registry::HookRegistry;
+use super::points::PRE_SEND_HOOK_TYPE;
+use super::registry::{HookRegistry, PreSendPlan};
 use super::selector::{HookSelector, MatchRule};
-use super::types::{
-    DeliveryHook, HookErrorPolicy, HookKind, HookMetadata, PostSendHook, PreSendHook, RecallHook,
-};
+use super::types::{HookMetadata, HookSource, PreSendHook};
 
+/// 部署文件：`[[pre_send]]` 是唯一的表，其他表是配置错误。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookConfig {
     pub pre_send: Vec<HookDefinition>,
-    pub post_send: Vec<HookDefinition>,
-    pub delivery: Vec<HookDefinition>,
-    pub recall: Vec<HookDefinition>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+/// 选择器的唯一定义：部署文件、`hook_configs.selector_config` 和管理面都用它，字段都是运行时实际判断的
+/// （见 [`HookDefinition::selector`]），空表示全部。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookSelectorConfig {
     pub tenants: Vec<String>,
@@ -32,7 +31,8 @@ pub struct HookSelectorConfig {
     pub message_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` 手写：Webhook 的签名密钥与头的值、gRPC metadata 的值不进日志。
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HookTransportConfig {
     Grpc {
@@ -52,17 +52,42 @@ pub enum HookTransportConfig {
     },
 }
 
+impl std::fmt::Debug for HookTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Grpc { endpoint, metadata } => f
+                .debug_struct("Grpc")
+                .field("endpoint", endpoint)
+                .field("metadata_keys", &metadata.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Webhook {
+                endpoint,
+                secret,
+                headers,
+            } => f
+                .debug_struct("Webhook")
+                .field("endpoint", endpoint)
+                .field(
+                    "secret",
+                    &secret.as_ref().map(|_| "<redacted>").unwrap_or("<none>"),
+                )
+                .field("header_names", &headers.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Local { target } => f.debug_struct("Local").field("target", target).finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HookDefinition {
     pub name: String,
-    pub version: Option<String>,
     pub description: Option<String>,
     pub enabled: bool,
-    pub priority: i32,
+    /// 同一来源内的先后，小的先执行。
+    pub order: i32,
     pub timeout_ms: u64,
-    pub max_retries: u32,
-    pub error_policy: HookErrorPolicy,
+    /// 必需：目标不可用时回可重试的 503；否则跳过。
     pub require_success: bool,
     pub selector: HookSelectorConfig,
     pub transport: HookTransportConfig,
@@ -74,13 +99,10 @@ impl Default for HookDefinition {
     fn default() -> Self {
         Self {
             name: String::new(),
-            version: None,
             description: None,
             enabled: true,
-            priority: 0,
+            order: 0,
             timeout_ms: 3_000,
-            max_retries: 0,
-            error_policy: HookErrorPolicy::FailFast,
             require_success: true,
             selector: HookSelectorConfig::default(),
             transport: HookTransportConfig::Local {
@@ -112,17 +134,155 @@ impl HookDefinition {
         }
     }
 
-    pub fn metadata(&self, kind: HookKind) -> HookMetadata {
+    pub fn metadata(&self, source: HookSource) -> HookMetadata {
         HookMetadata::default()
-            .with_kind(kind)
+            .with_source(source)
             .with_name(self.name.clone())
-            .with_version(self.version.clone())
             .with_description(self.description.clone())
-            .with_priority(self.priority)
+            .with_order(self.order)
             .with_timeout(Duration::from_millis(self.timeout_ms))
-            .with_error_policy(self.error_policy)
             .with_require_success(self.require_success)
     }
+
+    /// 配置加载时就该拒绝的：Webhook 写了空密钥，或自定义头占用保留名（签名头或 Content-Type，不区分
+    /// 大小写）。错误里有 Hook 名与头名，没有任何取值。
+    pub fn validate(&self) -> Result<()> {
+        self.validate_from(None)
+    }
+
+    fn validate_from(&self, path: Option<&Path>) -> Result<()> {
+        if let HookTransportConfig::Webhook {
+            secret: Some(secret),
+            ..
+        } = &self.transport
+            && secret.is_empty()
+        {
+            return Err(ErrorBuilder::new(
+                ErrorCode::ConfigurationError,
+                "webhook signing secret is empty: omit `secret` to send unsigned, or set a non-empty value",
+            )
+            .details(format!("hook={}", self.name))
+            .build_error());
+        }
+        if let HookTransportConfig::Webhook { headers, .. } = &self.transport
+            && let Some(header) = headers
+                .keys()
+                .find(|header| is_reserved_webhook_header(header))
+        {
+            return Err(ErrorBuilder::new(
+                ErrorCode::ConfigurationError,
+                "webhook header name is reserved: custom headers cannot set a signature header or Content-Type",
+            )
+            .details(match path {
+                Some(path) => format!(
+                    "path={}, hook={}, header={header}",
+                    path.display(),
+                    self.name
+                ),
+                None => format!("hook={}, header={header}", self.name),
+            })
+            .build_error());
+        }
+        Ok(())
+    }
+
+    /// `FLARE_REGISTRY_MODE=static` 没有注册中心：gRPC 目标必须是明确的 http(s) 地址。
+    pub fn validate_static_route(&self) -> Result<()> {
+        if let HookTransportConfig::Grpc { endpoint, .. } = &self.transport {
+            let explicit_http = endpoint.starts_with("http://") || endpoint.starts_with("https://");
+            if !explicit_http || tonic::transport::Endpoint::from_shared(endpoint.clone()).is_err()
+            {
+                return Err(ErrorBuilder::new(
+                    ErrorCode::ConfigurationError,
+                    format!(
+                        "pre_send hook {} requires an explicit private http(s) gRPC URI in FLARE_REGISTRY_MODE=static; discovery:// routes cannot resolve",
+                        self.name
+                    ),
+                )
+                .build_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// 物化成调用链上的一条。
+    pub fn plan(&self, source: HookSource, factory: &dyn HookFactory) -> Result<PreSendPlan> {
+        let selector = self.selector();
+        let handler = factory.build_pre_send(self, &selector)?;
+        Ok(PreSendPlan::new(self.metadata(source), selector, handler))
+    }
+
+    /// 部署摘要里的一条：不带密钥、头和 metadata 的取值。
+    fn summary(&self) -> DeploymentHookSummary {
+        let target = match &self.transport {
+            HookTransportConfig::Grpc { endpoint, .. } => HookTargetSummary {
+                kind: "grpc",
+                endpoint: without_query(endpoint),
+            },
+            HookTransportConfig::Webhook { endpoint, .. } => HookTargetSummary {
+                kind: "webhook",
+                endpoint: without_query(endpoint),
+            },
+            HookTransportConfig::Local { target } => HookTargetSummary {
+                kind: "local",
+                endpoint: target.clone(),
+            },
+        };
+        DeploymentHookSummary {
+            name: self.name.clone(),
+            hook_type: PRE_SEND_HOOK_TYPE,
+            description: self.description.clone(),
+            enabled: self.enabled,
+            order: self.order,
+            required: self.require_success,
+            timeout_ms: self.timeout_ms,
+            target,
+            selector: DeploymentSelectorSummary {
+                tenants: self.selector.tenants.clone(),
+                conversation_types: self.selector.conversation_types.clone(),
+                message_types: self.selector.message_types.clone(),
+            },
+        }
+    }
+}
+
+/// URL 的查询串可能带凭据，摘要里去掉。
+fn without_query(endpoint: &str) -> String {
+    endpoint
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `hook_deployment_summary.hooks` 里的一条（控制面只读展示）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeploymentHookSummary {
+    pub name: String,
+    pub hook_type: &'static str,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub order: i32,
+    pub required: bool,
+    pub timeout_ms: u64,
+    pub target: HookTargetSummary,
+    pub selector: DeploymentSelectorSummary,
+}
+
+/// 目标：类型与地址。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HookTargetSummary {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub endpoint: String,
+}
+
+/// 选择器（空表示全部）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeploymentSelectorSummary {
+    pub tenants: Vec<String>,
+    pub conversation_types: Vec<String>,
+    pub message_types: Vec<String>,
 }
 
 pub trait HookFactory: Send + Sync {
@@ -130,25 +290,7 @@ pub trait HookFactory: Send + Sync {
         &self,
         def: &HookDefinition,
         selector: &HookSelector,
-    ) -> Result<Option<Arc<dyn PreSendHook>>>;
-
-    fn build_post_send(
-        &self,
-        def: &HookDefinition,
-        selector: &HookSelector,
-    ) -> Result<Option<Arc<dyn PostSendHook>>>;
-
-    fn build_delivery(
-        &self,
-        def: &HookDefinition,
-        selector: &HookSelector,
-    ) -> Result<Option<Arc<dyn DeliveryHook>>>;
-
-    fn build_recall(
-        &self,
-        def: &HookDefinition,
-        selector: &HookSelector,
-    ) -> Result<Option<Arc<dyn RecallHook>>>;
+    ) -> Result<Arc<dyn PreSendHook>>;
 }
 
 pub struct HookConfigLoader {
@@ -214,14 +356,8 @@ impl HookConfigLoader {
             source,
             profile,
             pre_send = config.pre_send.len(),
-            post_send = config.post_send.len(),
-            delivery = config.delivery.len(),
-            recall = config.recall.len(),
             "hooks loaded: {} (profile={})",
-            config.pre_send.len()
-                + config.post_send.len()
-                + config.delivery.len()
-                + config.recall.len(),
+            config.pre_send.len(),
             profile
         );
     }
@@ -297,109 +433,43 @@ impl HookConfigLoader {
 
 impl HookConfig {
     /// Rejects, when the configuration is loaded, what would otherwise only fail on every
-    /// delivery: a webhook custom header named like a reserved header (the signature headers
-    /// or Content-Type, case-insensitively). The error names the hook and the header, never a
-    /// header value.
+    /// delivery (see [`HookDefinition::validate`]).
     pub fn validate(&self) -> Result<()> {
         self.validate_from(None)
     }
 
     /// [`Self::validate`]; `path` (the profile the configuration came from) goes into the error.
     fn validate_from(&self, path: Option<&Path>) -> Result<()> {
-        for def in self
-            .pre_send
+        self.pre_send
             .iter()
-            .chain(&self.post_send)
-            .chain(&self.delivery)
-            .chain(&self.recall)
-        {
-            if let HookTransportConfig::Webhook { headers, .. } = &def.transport
-                && let Some(header) = headers
-                    .keys()
-                    .find(|header| is_reserved_webhook_header(header))
-            {
-                return Err(ErrorBuilder::new(
-                    ErrorCode::ConfigurationError,
-                    "webhook header name is reserved: custom headers cannot set a signature header or Content-Type",
-                )
-                .details(match path {
-                    Some(path) => format!(
-                        "path={}, hook={}, header={header}",
-                        path.display(),
-                        def.name
-                    ),
-                    None => format!("hook={}, header={header}", def.name),
-                })
-                .build_error());
-            }
-        }
-        Ok(())
+            .try_for_each(|def| def.validate_from(path))
     }
 
     fn merge(&mut self, other: HookConfig) {
         self.pre_send.extend(other.pre_send);
-        self.post_send.extend(other.post_send);
-        self.delivery.extend(other.delivery);
-        self.recall.extend(other.recall);
     }
 
-    pub async fn install(
-        &self,
-        registry: Arc<HookRegistry>,
-        factory: &dyn HookFactory,
-    ) -> Result<()> {
+    /// 启用的条数（停用的定义不算门禁，不能出现在安装日志里）。
+    pub fn enabled_count(&self) -> usize {
+        self.pre_send.iter().filter(|def| def.enabled).count()
+    }
+
+    /// 部署摘要。
+    pub fn summary(&self) -> Vec<DeploymentHookSummary> {
+        self.pre_send.iter().map(HookDefinition::summary).collect()
+    }
+
+    /// 把启用的定义装进注册表的部署段。
+    pub fn install(&self, registry: &HookRegistry, factory: &dyn HookFactory) -> Result<()> {
         for def in &self.pre_send {
             if !def.enabled {
                 tracing::trace!(hook = %def.name, "pre-send hook disabled, skip");
                 continue;
             }
             let selector = def.selector();
-            if let Some(handler) = factory.build_pre_send(def, &selector)? {
-                registry
-                    .register_pre_send(def.metadata(HookKind::PreSend), selector, handler)
-                    .await;
-            }
+            let handler = factory.build_pre_send(def, &selector)?;
+            registry.register_pre_send(def.metadata(HookSource::Deployment), selector, handler);
         }
-
-        for def in &self.post_send {
-            if !def.enabled {
-                tracing::trace!(hook = %def.name, "post-send hook disabled, skip");
-                continue;
-            }
-            let selector = def.selector();
-            if let Some(handler) = factory.build_post_send(def, &selector)? {
-                registry
-                    .register_post_send(def.metadata(HookKind::PostSend), selector, handler)
-                    .await;
-            }
-        }
-
-        for def in &self.delivery {
-            if !def.enabled {
-                tracing::trace!(hook = %def.name, "delivery hook disabled, skip");
-                continue;
-            }
-            let selector = def.selector();
-            if let Some(handler) = factory.build_delivery(def, &selector)? {
-                registry
-                    .register_delivery(def.metadata(HookKind::Delivery), selector, handler)
-                    .await;
-            }
-        }
-
-        for def in &self.recall {
-            if !def.enabled {
-                tracing::trace!(hook = %def.name, "recall hook disabled, skip");
-                continue;
-            }
-            let selector = def.selector();
-            if let Some(handler) = factory.build_recall(def, &selector)? {
-                registry
-                    .register_recall(def.metadata(HookKind::Recall), selector, handler)
-                    .await;
-            }
-        }
-
         Ok(())
     }
 }
@@ -487,42 +557,72 @@ mod load_time_validation_tests {
         format!("[[pre_send]]\nname = \"h\"\n[pre_send.transport]\n{transport}\n")
     }
 
-    /// `error_policy` ignores case and underscores, so profiles written for either engine load
-    /// in Message Ingest (before, only `FailFast`, `Retry` and `Ignore` did); an unknown value
-    /// is still a load error.
+    /// 删掉的字段不再被接受：`priority` 换成 `order`，`error_policy`、`max_retries`、`version` 没有了。
     #[test]
-    fn error_policy_spellings_are_equivalent_and_unknown_values_are_rejected() {
-        let cases = [
-            ("FailFast", HookErrorPolicy::FailFast),
-            ("fail_fast", HookErrorPolicy::FailFast),
-            ("failfast", HookErrorPolicy::FailFast),
-            ("FAIL_FAST", HookErrorPolicy::FailFast),
-            ("Retry", HookErrorPolicy::Retry),
-            ("retry", HookErrorPolicy::Retry),
-            ("RETRY", HookErrorPolicy::Retry),
-            ("Ignore", HookErrorPolicy::Ignore),
-            ("ignore", HookErrorPolicy::Ignore),
-            ("_IGNORE_", HookErrorPolicy::Ignore),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(HookErrorPolicy::parse(value), Some(expected), "{value}");
-            let config: HookConfig = toml::from_str(&format!(
-                "{}error_policy = \"{value}\"\n",
-                "[[pre_send]]\nname = \"h\"\n"
-            ))
-            .unwrap_or_else(|error| panic!("{value}: {error}"));
-            assert_eq!(config.pre_send[0].error_policy, expected, "{value}");
-        }
-        for value in ["", "abort", "fail-fast", "fail fast", "ignored", "retries"] {
-            assert_eq!(HookErrorPolicy::parse(value), None, "{value:?}");
+    fn removed_fields_are_configuration_errors() {
+        for field in [
+            "priority = 100",
+            "error_policy = \"FailFast\"",
+            "max_retries = 1",
+            "version = \"1\"",
+        ] {
             assert!(
-                toml::from_str::<HookConfig>(&format!(
-                    "[[pre_send]]\nname = \"h\"\nerror_policy = \"{value}\"\n"
-                ))
-                .is_err(),
-                "{value:?}"
+                toml::from_str::<HookConfig>(&format!("[[pre_send]]\nname = \"h\"\n{field}\n"))
+                    .is_err(),
+                "{field}"
             );
         }
+        for table in ["post_send", "delivery", "recall"] {
+            assert!(
+                toml::from_str::<HookConfig>(&format!("[[{table}]]\nname = \"h\"\n")).is_err(),
+                "{table}"
+            );
+        }
+    }
+
+    /// 摘要不带密钥、头的取值和 URL 查询串。
+    #[test]
+    fn the_deployment_summary_carries_no_credentials() {
+        let config: HookConfig = toml::from_str(
+            r#"
+[[pre_send]]
+name = "audit"
+order = 7
+[pre_send.transport]
+type = "webhook"
+endpoint = "https://audit.example.com/hook?token=query-value"
+secret = "signing-value"
+[pre_send.transport.headers]
+Authorization = "Bearer header-value"
+"#,
+        )
+        .unwrap();
+        let summary = config.summary();
+        assert_eq!(summary[0].order, 7);
+        assert_eq!(summary[0].target.kind, "webhook");
+        assert_eq!(summary[0].target.endpoint, "https://audit.example.com/hook");
+        let printed = serde_json::to_string(&summary).unwrap();
+        for value in ["query-value", "signing-value", "header-value"] {
+            assert!(!printed.contains(value), "{printed}");
+        }
+    }
+
+    #[test]
+    fn transport_debug_never_prints_secrets_or_values() {
+        let webhook = HookTransportConfig::Webhook {
+            endpoint: "http://127.0.0.1:9/hook".into(),
+            secret: Some("debug-secret".into()),
+            headers: HashMap::from([("Authorization".into(), "Bearer debug-header".into())]),
+        };
+        let grpc = HookTransportConfig::Grpc {
+            endpoint: "http://127.0.0.1:9".into(),
+            metadata: HashMap::from([("x-api-key".into(), "debug-metadata".into())]),
+        };
+        let printed = format!("{webhook:?} {grpc:?}");
+        for secret in ["debug-secret", "debug-header", "debug-metadata"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(printed.contains("Authorization") && printed.contains("x-api-key"));
     }
 
     /// A reserved webhook header fails when the profile is loaded, case-insensitively, instead

@@ -26,7 +26,7 @@ use flare_server_core::error::{FlareError, Result};
 struct Projection(Option<()>);
 #[async_trait::async_trait]
 impl PluginAuthorizationReader for Projection {
-    async fn plugin_snapshot(&self, _: &str) -> Result<Option<PluginRuntimeSnapshot>> {
+    async fn plugin_snapshot(&self, _: &str) -> Result<Option<Arc<PluginRuntimeSnapshot>>> {
         match self.0 {
             None => Ok(None),
             Some(()) => Err(FlareError::system("projection store down")),

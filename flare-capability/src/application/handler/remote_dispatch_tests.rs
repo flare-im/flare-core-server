@@ -1,14 +1,16 @@
 use super::*;
+use crate::application::handler::plugin_state::tests::{with_features, with_manifest};
 use crate::domain::repository::PluginAuthorizationReader;
 use crate::infrastructure::capability::InMemoryCapabilityGrants;
 use ed25519_dalek::{
-    SigningKey,
     pkcs8::{EncodePrivateKey, EncodePublicKey},
+    SigningKey,
 };
 use flare_im_capability_core::plugin::{
     authorization::TenantPluginGrant,
-    invocation::{PLUGIN_CALL_HEADER, PluginCallSigner, PluginCallVerifier},
+    invocation::{PluginCallSigner, PluginCallVerifier, PLUGIN_CALL_HEADER},
     runtime::*,
+    PluginManifest,
 };
 use flare_server_core::{SignedContextIdentity, SignedContextSigner};
 use std::sync::Mutex;
@@ -19,17 +21,21 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
         Ok(self
             .0
             .lock()
             .unwrap()
             .clone()
-            .filter(|s| s.tenant_id == tenant))
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
+fn echo_manifest() -> String {
+    serde_json::to_string(&serde_json::json!({"manifestVersion":1,"pluginId":"example.echo","version":"1.0.0","apiVersion":"1.0","displayName":"Echo","publisher":{"publisherId":"test","displayName":"Test"},"runtime":{"kind":"grpc","service":"example.echo.v1.PluginService","protocol":"flare.capability.v1"},"capabilities":[{"id":"example.echo","operations":[{"id":"run","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"permissionIds":["example.echo.run"],"idempotent":true,"timeoutMs":1000}]}],"permissions":[{"id":"example.echo.run","description":"Run","dataScopes":[],"riskLevel":"low"}],"features":[{"id":"run","label":{"en-US":"Run"},"gates":{"operations":["example.echo.run"]}}],"artifact":{"digest":format!("sha256:{}","a".repeat(64)),"signatureRef":"test"}})).unwrap()
+}
 fn snapshot(authority: String) -> PluginRuntimeSnapshot {
-    let raw=serde_json::to_string(&serde_json::json!({"manifestVersion":1,"pluginId":"example.echo","version":"1.0.0","apiVersion":"1.0","displayName":"Echo","publisher":{"publisherId":"test","displayName":"Test"},"runtime":{"kind":"grpc","service":"example.echo.v1.PluginService","protocol":"flare.capability.v1"},"capabilities":[{"id":"example.echo","operations":[{"id":"run","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"permissionIds":["example.echo.run"],"idempotent":true,"timeoutMs":1000}]}],"permissions":[{"id":"example.echo.run","description":"Run","dataScopes":[],"riskLevel":"low"}],"artifact":{"digest":format!("sha256:{}","a".repeat(64)),"signatureRef":"test"}})).unwrap();
+    let raw = echo_manifest();
     let digest = digest_bytes(raw.as_bytes());
     let now = chrono::Utc::now().timestamp_millis();
     PluginRuntimeSnapshot {
@@ -38,8 +44,8 @@ fn snapshot(authority: String) -> PluginRuntimeSnapshot {
         version: 10,
         issued_at_ms: now,
         valid_until_ms: now + 300000,
-        plugins: vec![ProjectedPlugin {
-            grant: TenantPluginGrant {
+        plugins: vec![ResolvedPlugin::new(
+            TenantPluginGrant {
                 grant_id: "g1".into(),
                 revision: 2,
                 tenant_id: "app-a".into(),
@@ -51,11 +57,12 @@ fn snapshot(authority: String) -> PluginRuntimeSnapshot {
                 approved_data_scopes: Default::default(),
                 enabled: true,
                 revoked: false,
+                suspended: false,
                 valid_from_ms: now,
                 valid_until_ms: now + 300000,
             },
-            manifest_json: raw,
-            deployment: PluginDeployment {
+            Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap()),
+            PluginDeployment {
                 deployment_id: "echo-1".into(),
                 plugin_id: "example.echo".into(),
                 plugin_version: "1.0.0".into(),
@@ -63,9 +70,11 @@ fn snapshot(authority: String) -> PluginRuntimeSnapshot {
                 artifact_digest: format!("sha256:{}", "a".repeat(64)),
                 grpc_authority: authority,
             },
-            configuration_digest: configuration_digest(&serde_json::json!({})).unwrap(),
-            client_configuration: Default::default(),
-        }],
+            configuration_digest(&serde_json::json!({})).unwrap(),
+            Default::default(),
+            [("run".to_owned(), true)].into(),
+        )
+        .unwrap()],
     }
 }
 fn command() -> CapabilityDispatchCommand {
@@ -92,7 +101,7 @@ fn plugin_code(result: &Result<CapabilityDispatchResult>) -> Option<&str> {
 }
 
 #[tokio::test]
-async fn registered_endpoint_cannot_bypass_absent_expired_disabled_or_revoked_projection() {
+async fn dispatch_refuses_an_absent_expired_disabled_or_revoked_projection() {
     let (ctx, _, _) = identity(SignedActorType::User);
     let reader = Arc::new(Projection(Mutex::new(None)));
     let routes = Arc::new(PluginRouteBook::new().with_runtime_authorization(
@@ -101,18 +110,9 @@ async fn registered_endpoint_cannot_bypass_absent_expired_disabled_or_revoked_pr
             PluginCallSigner::new("call".into(), [29; 32]).unwrap(),
         )),
     ));
-    routes.upsert(
-        "app-a",
-        RegisteredPluginInstance {
-            plugin_id: "unapproved".into(),
-            capability_id: "example.echo.run".into(),
-            grpc_authority: "http://127.0.0.1:1".into(),
-            ..Default::default()
-        },
-    );
     let backend: Arc<dyn CapabilityPolicyBackend> = policy();
     use flare_im_service_kit::plugin_platform::{
-        PLUGIN_DISABLED, PLUGIN_NOT_INSTALLED, PLUGIN_PERMISSION_DENIED,
+        PLUGIN_DISABLED, PLUGIN_FEATURE_DISABLED, PLUGIN_NOT_INSTALLED, PLUGIN_PERMISSION_DENIED,
     };
     for (mode, code) in [
         (0, PLUGIN_NOT_INSTALLED),
@@ -121,6 +121,9 @@ async fn registered_endpoint_cannot_bypass_absent_expired_disabled_or_revoked_pr
         (3, PLUGIN_NOT_INSTALLED),
         (4, PLUGIN_PERMISSION_DENIED),
         (5, PLUGIN_NOT_INSTALLED),
+        (6, PLUGIN_DISABLED),
+        (7, PLUGIN_FEATURE_DISABLED),
+        (8, PLUGIN_FEATURE_DISABLED),
     ] {
         let mut value = snapshot("http://127.0.0.1:1".into());
         match mode {
@@ -129,7 +132,13 @@ async fn registered_endpoint_cannot_bypass_absent_expired_disabled_or_revoked_pr
             2 => value.plugins[0].grant.enabled = false,
             3 => value.plugins[0].grant.revoked = true,
             4 => value.plugins[0].grant.approved_permissions.clear(),
-            _ => value.tenant_id = "other".into(),
+            5 => value.tenant_id = "other".into(),
+            6 => value.plugins[0].grant.suspended = true,
+            7 => {
+                value.plugins[0] =
+                    with_features(&value.plugins[0], [("run".to_owned(), false)].into())
+            }
+            _ => value.plugins[0] = with_features(&value.plugins[0], Default::default()),
         };
         *reader.0.lock().unwrap() = Some(value);
         let result =
@@ -141,8 +150,8 @@ async fn registered_endpoint_cannot_bypass_absent_expired_disabled_or_revoked_pr
 #[tokio::test]
 async fn an_installed_plugin_needs_no_user_grant_and_the_emergency_switch_still_stops_it() {
     use flare_grpc_proto::capability::{
-        GenericResponse,
         extension_plugin_server::{ExtensionPlugin, ExtensionPluginServer},
+        GenericResponse,
     };
     struct Endpoint {
         verifier: PluginCallVerifier,
@@ -206,8 +215,6 @@ async fn an_installed_plugin_needs_no_user_grant_and_the_emergency_switch_still_
     let (ctx, _, _) = identity(SignedActorType::User);
     let policy = policy();
     let backend: Arc<dyn CapabilityPolicyBackend> = policy.clone();
-    // The tenant has no capability_user_grants row: the enabled installation authorizes.
-    assert!(policy.list_user_capabilities("app-a", "u1").is_empty());
     let result = dispatch_remote(&ctx, &command(), &routes, &backend, Duration::from_secs(1))
         .await
         .unwrap();
@@ -260,12 +267,11 @@ fn dispatch_identity_requires_exact_user_tenant_and_request() {
         assert!(origin.require_user_binding(tenant, user, request).is_err());
     }
     let (ctx, _, _) = identity(SignedActorType::Service);
-    assert!(
-        ctx.get_data::<VerifiedDispatchOrigin>()
-            .unwrap()
-            .require_user_binding("app-a", "u1", "r1")
-            .is_err()
-    );
+    assert!(ctx
+        .get_data::<VerifiedDispatchOrigin>()
+        .unwrap()
+        .require_user_binding("app-a", "u1", "r1")
+        .is_err());
 }
 #[test]
 fn absent_forged_and_duplicate_user_credentials_are_rejected() {
@@ -287,7 +293,7 @@ async fn authorization_storage_wait_is_bounded_by_dispatch_deadline() {
         async fn plugin_snapshot(
             &self,
             _: &str,
-        ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
+        ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
             std::future::pending().await
         }
     }
@@ -312,10 +318,9 @@ async fn authorization_storage_wait_is_bounded_by_dispatch_deadline() {
 async fn ui_catalog_uses_local_projection_and_strips_runtime_details() {
     let (ctx, _, _) = identity(SignedActorType::User);
     let mut projected = snapshot("http://127.0.0.1:1".into());
-    let p = &mut projected.plugins[0];
     let grant_deadline = chrono::Utc::now().timestamp_millis() + 5000;
-    p.grant.valid_until_ms = grant_deadline;
-    let mut raw: Value = serde_json::from_str(&p.manifest_json).unwrap();
+    projected.plugins[0].grant.valid_until_ms = grant_deadline;
+    let mut raw: Value = serde_json::from_str(&echo_manifest()).unwrap();
     raw["clientExtensions"] = serde_json::json!({"platforms":["web"],"contributions":[{"kind":"message-content","id":"example.echo.card","schemaVersion":1,"requiredPermissions":["example.echo.run"],"schema":{"title":"Echo","fields":[],"actions":[{"id":"run","label":"Run","target":{"kind":"operation","operation":"example.echo.run"}}]}}],"nativeCapabilities":[]});
     let mut other = raw["capabilities"][0]["operations"][0].clone();
     other["id"] = serde_json::json!("other");
@@ -325,9 +330,8 @@ async fn ui_catalog_uses_local_projection_and_strips_runtime_details() {
         .push(other);
     raw["clientExtensions"]["contributions"][0]["schema"]["actions"].as_array_mut().unwrap().push(serde_json::json!({"id":"other","label":"Other","target":{"kind":"operation","operation":"example.echo.other"}}));
     raw["clientExtensions"]["contributions"][0]["schema"]["translations"] = serde_json::json!({"en-US":{"title":"Echo","fields":[],"actions":{"run":"Run","other":"Other"}}});
-    p.manifest_json = serde_json::to_string(&raw).unwrap();
-    p.grant.manifest_digest = digest_bytes(p.manifest_json.as_bytes());
-    p.deployment.manifest_digest = p.grant.manifest_digest.clone();
+    projected.plugins[0] =
+        with_manifest(&projected.plugins[0], &serde_json::to_string(&raw).unwrap());
     let reader = Arc::new(Projection(Mutex::new(Some(projected.clone()))));
     let routes = Arc::new(PluginRouteBook::new().with_runtime_authorization(reader.clone(), None));
     let mut command = command();
@@ -341,6 +345,10 @@ async fn ui_catalog_uses_local_projection_and_strips_runtime_details() {
     assert!(!result.data.to_string().contains("grpcAuthority"));
     assert!(!result.data.to_string().contains("configurationDigest"));
     assert!(!result.data.to_string().contains("example.echo.other"));
+    assert!(
+        result.data["plugins"][0].get("queryOperations").is_none(),
+        "legacy plugins retain their previous wire shape"
+    );
     let catalog: flare_im_capability_core::plugin::ui::UiCatalog =
         serde_json::from_value(result.data).unwrap();
     let schema = &catalog.plugins[0].extensions.contributions[0].schema;
@@ -382,26 +390,224 @@ async fn ui_catalog_uses_local_projection_and_strips_runtime_details() {
 }
 
 #[tokio::test]
+async fn ui_catalog_query_operations_are_only_authorized_signed_queries() {
+    let (ctx, _, _) = identity(SignedActorType::User);
+    let mut raw: Value = serde_json::from_str(&echo_manifest()).unwrap();
+    raw["clientExtensions"] = serde_json::json!({"platforms":["web"],"contributions":[{"kind":"message-content","id":"example.echo.card","schemaVersion":1,"requiredPermissions":[],"schema":{"title":"Echo","actions":[{"id":"run","label":"Run","target":{"kind":"operation","operation":"example.echo.run"}}]}}]});
+    let original = raw["capabilities"][0]["operations"][0].clone();
+    for id in ["allowed", "unapproved", "no-permission", "stopped"] {
+        let mut query = original.clone();
+        query["id"] = serde_json::json!(id);
+        query["mode"] = serde_json::json!("query");
+        if id == "no-permission" {
+            query["permissionIds"] = serde_json::json!(["example.echo.private"]);
+        }
+        raw["capabilities"][0]["operations"]
+            .as_array_mut()
+            .unwrap()
+            .push(query);
+    }
+    let mut permission = raw["permissions"][0].clone();
+    permission["id"] = serde_json::json!("example.echo.private");
+    raw["permissions"].as_array_mut().unwrap().push(permission);
+    raw["clientExtensions"]["contributions"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "kind":"page","id":"example.echo.recovery","schemaVersion":1,"requiredPermissions":[],
+            "schema":{"title":"Recovery","actions":[{"id":"observe","label":"Check original",
+                "target":{"kind":"operation","operation":"example.echo.allowed"},
+                "command":{"slot":"example.echo.workflow","mode":"observe"}}]}
+        }));
+    let mut projected = snapshot("http://127.0.0.1:1".into());
+    projected.plugins[0] =
+        with_manifest(&projected.plugins[0], &serde_json::to_string(&raw).unwrap());
+    for id in ["allowed", "no-permission", "stopped"] {
+        projected.plugins[0]
+            .grant
+            .approved_operations
+            .insert(format!("example.echo.{id}"));
+    }
+    let reader = Arc::new(Projection(Mutex::new(Some(projected))));
+    let routes = Arc::new(PluginRouteBook::new().with_runtime_authorization(reader, None));
+    let backend_config = policy();
+    backend_config.set_tenant_capability("app-a", "example.echo.stopped", false);
+    let backend: Arc<dyn CapabilityPolicyBackend> = backend_config.clone();
+    let mut request = command();
+    request.capability_id = flare_im_capability_core::plugin::ui::UI_CATALOG_OPERATION.into();
+    let result = dispatch_remote(&ctx, &request, &routes, &backend, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let catalog: flare_im_capability_core::plugin::ui::UiCatalog =
+        serde_json::from_value(result.data).unwrap();
+    let plugin = &catalog.plugins[0];
+    assert_eq!(
+        plugin.query_operations,
+        ["example.echo.allowed".into()].into()
+    );
+    assert!(plugin.query_operations.is_subset(&plugin.operations));
+    assert!(plugin.operations.contains("example.echo.run"));
+    backend_config.set_tenant_capability("app-a", "example.echo.allowed", false);
+    let closed = dispatch_remote(&ctx, &request, &routes, &backend, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(
+        closed.data["plugins"][0].get("queryOperations").is_none(),
+        "an unavailable Observe target must not emit observation authority"
+    );
+}
+
+/// Design 6.3: an action whose operation a closed feature gates leaves every surface, including a
+/// page that stays open (the wallet's 「开户」 on its home page, V5c-W5); reopening brings it back.
+#[tokio::test]
+async fn a_closed_feature_drops_the_page_actions_targeting_its_operations() {
+    let (ctx, _, _) = identity(SignedActorType::User);
+    let mut raw: Value = serde_json::from_str(&echo_manifest()).unwrap();
+    let mut other = raw["capabilities"][0]["operations"][0].clone();
+    other["id"] = serde_json::json!("other");
+    let mut home = other.clone();
+    home["id"] = serde_json::json!("home");
+    home["mode"] = serde_json::json!("query");
+    raw["capabilities"][0]["operations"]
+        .as_array_mut()
+        .unwrap()
+        .extend([other, home]);
+    raw["clientExtensions"] = serde_json::json!({"platforms":["web"],"contributions":[{"kind":"page","id":"example.echo.page.home","schemaVersion":1,"requiredPermissions":["example.echo.run"],"source":{"operation":"example.echo.home"},"schema":{"title":"Home","fields":[],"actions":[{"id":"open","label":"Open","target":{"kind":"operation","operation":"example.echo.run"}},{"id":"other","label":"Other","target":{"kind":"operation","operation":"example.echo.other"}}],"translations":{"en-US":{"title":"Home","fields":[],"actions":{"open":"Open","other":"Other"}}}}}],"nativeCapabilities":[]});
+    let mut projected = snapshot("http://127.0.0.1:1".into());
+    projected.plugins[0] =
+        with_manifest(&projected.plugins[0], &serde_json::to_string(&raw).unwrap());
+    for operation in ["example.echo.other", "example.echo.home"] {
+        projected.plugins[0]
+            .grant
+            .approved_operations
+            .insert(operation.into());
+    }
+    let reader = Arc::new(Projection(Mutex::new(None)));
+    let routes = Arc::new(PluginRouteBook::new().with_runtime_authorization(reader.clone(), None));
+    let mut request = command();
+    request.capability_id = flare_im_capability_core::plugin::ui::UI_CATALOG_OPERATION.into();
+    let backend: Arc<dyn CapabilityPolicyBackend> = policy();
+    for (open, expected) in [(false, vec!["other"]), (true, vec!["open", "other"])] {
+        let mut value = projected.clone();
+        value.plugins[0] = with_features(&value.plugins[0], [("run".to_owned(), open)].into());
+        *reader.0.lock().unwrap() = Some(value);
+        let result = dispatch_remote(&ctx, &request, &routes, &backend, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(
+            result.data["plugins"][0].get("queryOperations").is_none(),
+            "an authorized query without Observe keeps its original wire shape"
+        );
+        let catalog: flare_im_capability_core::plugin::ui::UiCatalog =
+            serde_json::from_value(result.data).unwrap();
+        let plugin = &catalog.plugins[0];
+        assert_eq!(
+            plugin.operations.contains("example.echo.run"),
+            open,
+            "open={open}"
+        );
+        let page = &plugin.extensions.contributions[0];
+        assert_eq!(page.id, "example.echo.page.home");
+        let actions: Vec<&str> = page.schema.actions.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(actions, expected, "open={open}");
+        let translated: Vec<&str> = page.schema.translations["en-US"]
+            .actions
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(translated, expected, "open={open}");
+        page.schema.validate().unwrap();
+    }
+}
+
+/// The platform stamps a changed projection with its database clock. With Core's clock 2.85 s
+/// behind (V4 full stack), every plugin of the application read `PLUGIN_DISABLED` until Core
+/// caught up, `status` and `claim` included. A start within the tolerated skew is in effect; one
+/// beyond it, an expiry or a disable still closes the plugin.
+#[tokio::test]
+async fn projection_issued_ahead_of_core_clock_keeps_plugins_in_effect() {
+    use flare_im_capability_core::plugin::authorization::CLOCK_SKEW_MARGIN_MS;
+    use flare_im_service_kit::plugin_platform::PLUGIN_DISABLED;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut value = snapshot("http://127.0.0.1:1".into());
+    value.issued_at_ms = now + 2_850;
+    value.valid_until_ms = now + 300_000;
+    value.plugins[0].grant.valid_from_ms = value.issued_at_ms;
+    value.plugins[0].grant.valid_until_ms = value.valid_until_ms;
+    value.validate(now).unwrap();
+    let backend: Arc<dyn CapabilityPolicyBackend> = policy();
+    assert_eq!(
+        authorize_user_operation(&value, "app-a", "u1", "example.echo.run", &backend, now)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let (ctx, _, _) = identity(SignedActorType::User);
+    let mut request = command();
+    request.capability_id = flare_im_capability_core::plugin::ui::UI_CATALOG_OPERATION.into();
+    let reader = Arc::new(Projection(Mutex::new(Some(value.clone()))));
+    let routes = Arc::new(PluginRouteBook::new().with_runtime_authorization(reader, None));
+    let catalog = dispatch_remote(&ctx, &request, &routes, &backend, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(
+        catalog.data["unavailable"]
+            .as_array()
+            .is_none_or(|unavailable| unavailable.is_empty()),
+        "{}",
+        catalog.data
+    );
+
+    for close in ["start beyond skew", "expired", "disabled"] {
+        let mut closed = value.clone();
+        let grant = &mut closed.plugins[0].grant;
+        match close {
+            "start beyond skew" => grant.valid_from_ms = now + CLOCK_SKEW_MARGIN_MS + 1,
+            "expired" => grant.valid_until_ms = now,
+            _ => grant.enabled = false,
+        }
+        let result =
+            authorize_user_operation(&closed, "app-a", "u1", "example.echo.run", &backend, now)
+                .await;
+        let Err(error) = result else {
+            panic!("{close} must close the plugin");
+        };
+        assert_eq!(error.plugin_code(), Some(PLUGIN_DISABLED), "{close}");
+    }
+}
+
+#[tokio::test]
 async fn catalog_cross_plugin_pages_require_an_enabled_approved_destination() {
-    fn projected(id: &str, actions: Value) -> ProjectedPlugin {
-        let mut p = snapshot("http://127.0.0.1:1".into()).plugins.remove(0);
+    fn projected(id: &str, actions: Value) -> ResolvedPlugin {
+        let base = snapshot("http://127.0.0.1:1".into()).plugins.remove(0);
         let mut raw: Value =
-            serde_json::from_str(&p.manifest_json.replace("example.echo", id)).unwrap();
+            serde_json::from_str(&echo_manifest().replace("example.echo", id)).unwrap();
         raw["clientExtensions"] = serde_json::json!({"platforms":["web"], "nativeCapabilities":[],
             "contributions":[{"kind":"page","id":format!("{id}.home"),"schemaVersion":1,
                 "requiredPermissions":[format!("{id}.run")],
                 "schema":{"title":"Home","fields":[],"actions":actions}}]});
-        p.manifest_json = serde_json::to_string(&raw).unwrap();
-        p.grant.plugin_id = id.into();
-        p.grant.grant_id = format!("grant-{id}");
-        p.grant.approved_operations = [format!("{id}.run")].into();
-        p.grant.approved_permissions = [format!("{id}.run")].into();
-        p.grant.manifest_digest = digest_bytes(p.manifest_json.as_bytes());
-        p.deployment.plugin_id = id.into();
-        p.deployment.deployment_id = format!("deployment-{id}");
-        p.deployment.manifest_digest = p.grant.manifest_digest.clone();
-        p.manifest().unwrap();
-        p
+        let raw = serde_json::to_string(&raw).unwrap();
+        let digest = digest_bytes(raw.as_bytes());
+        let mut grant = base.grant.clone();
+        grant.plugin_id = id.into();
+        grant.grant_id = format!("grant-{id}");
+        grant.approved_operations = [format!("{id}.run")].into();
+        grant.approved_permissions = [format!("{id}.run")].into();
+        grant.manifest_digest = digest.clone();
+        let mut deployment = base.deployment.clone();
+        deployment.plugin_id = id.into();
+        deployment.deployment_id = format!("deployment-{id}");
+        deployment.manifest_digest = digest;
+        ResolvedPlugin::new(
+            grant,
+            Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap()),
+            deployment,
+            base.configuration_digest.clone(),
+            Default::default(),
+            base.features.clone(),
+        )
+        .unwrap()
     }
     let source = projected(
         "example.echo",
@@ -486,10 +692,10 @@ async fn catalog_cross_plugin_pages_require_an_enabled_approved_destination() {
 
 mod plugin_state_and_catalog {
     use super::*;
-    use crate::application::handler::plugin_card::PluginCardPoster;
     use crate::application::handler::plugin_card::tests::{MemoryOutbox, ScriptedDelivery};
+    use crate::application::handler::plugin_card::PluginCardPoster;
     use crate::application::handler::plugin_state::tests::{
-        MemoryBindings, RecordingSink, poll_snapshot, publisher,
+        poll_snapshot, publisher, MemoryBindings, RecordingSink,
     };
     use crate::application::handler::plugin_test_server::PluginServer;
     use flare_im_service_kit::plugin_platform::{
@@ -837,13 +1043,9 @@ mod plugin_state_and_catalog {
             .as_array_mut()
             .unwrap()
             .push(second);
-        let raw = serde_json::to_string(&raw).unwrap();
-        let digest = digest_bytes(raw.as_bytes());
         let mut snapshot = poll_snapshot(authority);
-        let projected = &mut snapshot.plugins[0];
-        projected.manifest_json = raw;
-        projected.grant.manifest_digest = digest.clone();
-        projected.deployment.manifest_digest = digest;
+        snapshot.plugins[0] =
+            with_manifest(&snapshot.plugins[0], &serde_json::to_string(&raw).unwrap());
         snapshot
     }
 

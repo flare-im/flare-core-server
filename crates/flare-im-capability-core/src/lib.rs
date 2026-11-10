@@ -14,15 +14,14 @@ pub mod grant;
 pub mod ports;
 pub mod recipient;
 
-pub use context::{CapabilityInvokeMeta, ConversationKind, PreSendEvaluateInput, ResolveTrigger};
+pub use context::{CapabilityInvokeMeta, ConversationKind, ResolveTrigger};
 pub use descriptor::CapabilityDescriptor;
 pub use dispatch::{CapabilityDispatchCommand, CapabilityDispatchResult};
-pub use error::{CapabilityError, GuardDecision, GuardRejection, Result};
+pub use error::{CapabilityError, Result};
 pub use extension_operation::{DynExtensionOperationHandler, ExtensionOperationHandler};
 pub use flare_plugin_protocol as plugin;
-pub use grant::{TenantCapabilitySwitch, UserCapabilityGrant};
+pub use grant::TenantCapabilitySwitch;
 pub use ports::{
-    CapabilityDispatchRoute, CapabilityPolicyBackend, PluginHealthProbe, PreSendGuard,
-    PreSendGuardPipeline, RecipientResolver,
+    CapabilityDispatchRoute, CapabilityPolicyBackend, RecipientResolver,
 };
 pub use recipient::{RecipientResolveRequest, RecipientResolveResult};

@@ -267,7 +267,6 @@ def execute(stack, sdk, token):
             'FLARE_INTERNAL_CTX_PRIVATE_KEY': pk, 'FLARE_INTERNAL_CTX_PUBLIC_KEY': pub,
             'FLARE_API_GATEWAY_TOKEN_SECRET': token, 'ACCESS_GATEWAY_TOKEN_SECRET': token,
             'MESSAGE_INGEST_HOOKS_CONFIG': '/etc/flare/config/hooks.core.toml',
-            'MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO': '0',
             'FLARE_S3_ENDPOINT': f'http://{rustfs}:9000', 'FLARE_S3_ACCESS_KEY': 'smokeaccess',
             'FLARE_S3_SECRET_KEY': s3_pw,
             'PUSH_SERVER_DELIVERY_READY': 'true', 'PUSH_WORKER_DELIVERY_READY': 'true',

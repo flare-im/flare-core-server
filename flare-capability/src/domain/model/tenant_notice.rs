@@ -11,17 +11,26 @@ pub struct NoticeOutcome {
 }
 
 /// 发布被拒绝的原因。
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeDenied {
-    #[error("invalid topic")]
     InvalidTopic,
-    #[error("version must be above zero")]
     InvalidVersion,
-    #[error("service may not publish this topic")]
     TopicNotPermitted,
-    #[error("service may not publish to every tenant")]
     TenantWideNotPermitted,
 }
+
+impl std::fmt::Display for NoticeDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidTopic => "invalid topic",
+            Self::InvalidVersion => "version must be above zero",
+            Self::TopicNotPermitted => "service may not publish this topic",
+            Self::TenantWideNotPermitted => "service may not publish to every tenant",
+        })
+    }
+}
+
+impl std::error::Error for NoticeDenied {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Publisher {

@@ -262,6 +262,8 @@ impl MediaService {
 
         let mut metadata = MediaFileMetadata {
             owner_id: Some(owner_id.to_string()),
+            owner_kind: MediaOwnerKind::User,
+            purpose: MediaPurpose::General,
             file_id: context.file_id.to_string(),
             file_name: context.file_name.to_string(),
             mime_type: context.mime_type.to_string(),
@@ -470,6 +472,45 @@ impl MediaService {
         ctx.ensure_not_cancelled().map_err(map_context_error)?;
         let tenant = require_tenant(ctx)?;
         let file_id = metadata.file_id.as_str();
+        if metadata.owner_kind == MediaOwnerKind::Application {
+            // Application assets are always signed; storage/CDN paths must never escape on failure.
+            let ttl_cap = if tenant::authenticated_user(ctx).is_some() {
+                3600
+            } else {
+                300
+            };
+            let ttl = if expires_in > 0 {
+                expires_in.min(ttl_cap)
+            } else {
+                ttl_cap
+            };
+            let repository = self.object_repo.as_ref().ok_or_else(|| {
+                flare_server_core::flare_err!(
+                    ErrorCode::ConfigurationError,
+                    "application media storage required"
+                )
+            })?;
+            let path = metadata.storage_path().ok_or_else(|| {
+                flare_server_core::flare_err!(
+                    ErrorCode::ConfigurationError,
+                    "application media storage path missing"
+                )
+            })?;
+            let url = repository.presign_object(path, ttl).await?;
+            if !is_absolute_http_url(&url) {
+                return Err(flare_server_core::flare_err!(
+                    ErrorCode::ServiceUnavailable,
+                    "signed application media URL unavailable"
+                ));
+            }
+            self.usage
+                .media_egress(tenant, usage_bytes(metadata.file_size));
+            return Ok(PresignedUrl {
+                url,
+                cdn_url: String::new(),
+                expires_at: Utc::now() + Duration::seconds(ttl),
+            });
+        }
         let expires_in = if expires_in > 0 {
             expires_in
         } else {

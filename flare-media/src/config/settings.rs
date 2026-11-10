@@ -16,6 +16,8 @@ pub struct MediaConfig {
     pub chunk_upload_dir: String,
     pub chunk_ttl_seconds: i64,
     pub max_chunk_size_bytes: i64,
+    pub admin_image_upload: crate::domain::model::AdminImageUploadPolicy,
+    pub application_media_validators: Vec<String>,
 }
 
 /// 空串一律当成「没配」。
@@ -131,6 +133,24 @@ impl MediaConfig {
             chunk_upload_dir,
             chunk_ttl_seconds,
             max_chunk_size_bytes,
+            admin_image_upload: {
+                let defaults = crate::domain::model::AdminImageUploadPolicy::default();
+                crate::domain::model::AdminImageUploadPolicy {
+                    max_bytes: service
+                        .admin_image_upload_max_bytes
+                        .unwrap_or(defaults.max_bytes),
+                    max_pixels: service
+                        .admin_image_upload_max_pixels
+                        .unwrap_or(defaults.max_pixels),
+                    max_dimension: service
+                        .admin_image_upload_max_dimension
+                        .unwrap_or(defaults.max_dimension),
+                    allowed_mime_types: service
+                        .admin_image_upload_allowed_mime_types
+                        .unwrap_or(defaults.allowed_mime_types),
+                }
+            },
+            application_media_validators: service.application_media_validators,
         }
     }
 

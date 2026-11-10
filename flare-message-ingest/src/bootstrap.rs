@@ -48,6 +48,7 @@ impl ApplicationBootstrap {
         let config = context.config.clone();
         let wal_replay_handler = context.wal_replay_handler.clone();
         let usage = context.usage;
+        let hook_tasks = context.hook_tasks;
         let wal_replay_enabled = config.wal_replay_enabled;
         let wal_replay_interval_ms = config.wal_replay_interval_ms.max(100);
         let wal_replay_error_backoff_ms = config.wal_replay_error_backoff_ms.max(100);
@@ -95,6 +96,32 @@ impl ApplicationBootstrap {
             .add_spawn_with_shutdown("message-ingest-usage", move |shutdown_rx| {
                 usage.run(shutdown_rx)
             });
+
+        if let Some(reloader) = hook_tasks.reloader {
+            service_runtime = service_runtime.add_spawn_with_shutdown(
+                "message-ingest-hook-config",
+                move |shutdown_rx| async move {
+                    reloader.run(shutdown_rx).await;
+                    Ok(())
+                },
+            );
+        }
+        // 执行记录：批量写库，停机时写完缓冲。
+        if let Some(writer) = hook_tasks.writer {
+            service_runtime = service_runtime.add_spawn_with_shutdown(
+                "message-ingest-hook-execution-writer",
+                move |shutdown_rx| async move {
+                    flare_im_hooks::hooks::execution::run_writer(
+                        writer.buffer,
+                        writer.sink,
+                        writer.flush_interval,
+                        shutdown_rx,
+                    )
+                    .await;
+                    Ok(())
+                },
+            );
+        }
 
         if context.config.metrics.enabled {
             let metrics_config = context.config.metrics.clone();

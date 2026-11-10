@@ -2,14 +2,12 @@
 
 mod administer;
 #[cfg(test)]
-mod hook_executions_pg_tests;
+mod hook_admin_pg_tests;
 #[cfg(test)]
-mod hook_secret_invalidation_pg_tests;
-mod registration;
+mod hook_executions_pg_tests;
+mod plugin_registry;
 mod service;
 #[cfg(test)]
 mod source_audit_pg_tests;
-#[cfg(test)]
-mod tenant_hooks_pg_tests;
 
 pub use service::{CapabilityGrpcServer, CapabilityInvocationMetrics, CapabilityMetricsSnapshot};

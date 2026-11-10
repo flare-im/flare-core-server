@@ -29,13 +29,11 @@ fn src_root() -> PathBuf {
 /// 每一项的理由：
 /// - `plugin_contract.rs`：约定常量的**唯一**定义处，集中就是为了别处不再出现字面量。
 /// - `adapters/`：各 kind 的后端适配器，实现领域端口本就是 kind 专有代码。
-/// - `use_case_samples.rs`：示例，不进任何运行路径。
 /// - `composition/`：组合根。「本部署装配哪些后端」是**装配决策**而非核心知识，
 ///   装配处必须能点名它要装什么，否则就没法装配了。
 const KIND_SPECIFIC_ALLOWLIST: &[&str] = &[
     "infrastructure/capability/plugin_contract.rs",
     "infrastructure/capability/adapters/",
-    "infrastructure/capability/use_case_samples.rs",
     "composition/",
 ];
 
@@ -378,8 +376,6 @@ fn every_policy_mutation_records_an_audit_event() {
 
     // 策略变更 RPC：改变了「谁能用什么」的持久状态。
     const MUTATIONS: &[&str] = &[
-        "async fn grant_user_capability",
-        "async fn revoke_user_capability",
         "async fn set_tenant_capability_switch",
     ];
 

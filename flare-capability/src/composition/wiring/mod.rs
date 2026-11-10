@@ -1,14 +1,16 @@
-//! **依赖装配（Wiring）**：按 DDD 组合根惯例拆分为配置源、Hook 运行时、能力扩展栈，再由 `initialize` 串联。
+//! **依赖装配（Wiring）**：按 DDD 组合根惯例拆分为数据库、Hook 治理、能力扩展栈，再由 `initialize` 串联。
 //!
 //! 不包含 gRPC `Server::serve` 循环（见 [`super::bootstrap::ApplicationBootstrap`]）。
 
 mod capability_extension;
-mod config_sources;
+mod database;
 mod hook_runtime;
 
-pub(crate) use hook_runtime::HookExecutionBackground;
+pub(crate) use hook_runtime::HookRetentionBackground;
 mod internal_ctx;
+mod plugin_reconcile;
 mod plugin_routes;
+pub(crate) mod message_events;
 mod resource_bridge;
 
 use std::sync::Arc;
@@ -22,34 +24,26 @@ use crate::interface::grpc::{CapabilityAdminGrpcServer, TenantProjectionGrpcServ
 
 use crate::composition::process_config::CapabilityServiceConfig;
 use crate::composition::runtime_context::ApplicationContext;
-use crate::infrastructure::config::HookExecutionSettings;
-use crate::interface::grpc::hooks::ImHookPluginServer;
+use crate::infrastructure::config::HookRetentionConfig;
 
 pub use capability_extension::init_capability_extension_stack;
 
-/// 构建完整 [`ApplicationContext`]（配置 → Hook → Capability）。
+/// 构建完整 [`ApplicationContext`]（数据库 → Hook 治理 → Capability）。
 pub(crate) async fn initialize(
     config: CapabilityServiceConfig,
     extensions: crate::composition::extensions::CapabilityExtensions,
 ) -> Result<ApplicationContext> {
-    let mut sources = config_sources::prepare_config_sources(&config).await?;
-    let runtime_config_file = config
-        .runtime_config_file
-        .clone()
-        .or_else(|| config.config_file.clone());
-    let execution_settings = HookExecutionSettings::from_sources(runtime_config_file.as_deref());
-    let hook = hook_runtime::build_hook_runtime(&sources, &execution_settings);
-    let hook_config_listener = sources.listener.take();
+    let hook_config_repository = database::open_database(&config).await?;
+    let runtime_config_file = config.runtime_config_file.clone();
+    let retention_settings = HookRetentionConfig::from_sources(runtime_config_file.as_deref());
+    let hook =
+        hook_runtime::build_hook_governance(hook_config_repository.as_ref(), &retention_settings);
 
-    let db_pool = sources
-        .hook_config_repository
-        .as_ref()
-        .map(|r| r.connection_pool());
-    // 有库时登记写 capability_plugin_endpoints；没有库时只在本进程（plugin_routes 里说明一次）。
+    let db_pool = hook_config_repository.as_ref().map(|r| r.connection_pool());
     let plugin_routes = Arc::new(
         plugin_routes::card_posting(
             plugin_routes::runtime_authorization(
-                plugin_routes::plugin_route_book(db_pool.as_ref()),
+                crate::infrastructure::capability::PluginRouteBook::new(),
                 db_pool.as_ref(),
             )?,
             db_pool.as_ref(),
@@ -66,7 +60,6 @@ pub(crate) async fn initialize(
         .await?;
     let capability_runtime = capability_grpc.runtime_config();
     // 配置发现的端点已在上面进簿；再载入库里的登记（同键时登记覆盖配置），然后起周期重读与清理。
-    plugin_routes::load_and_maintain(&plugin_routes, &capability_runtime).await?;
     // 插件实体生命周期通知（卡片撤回、代发失败）：后台按系统票据投递 outbox。
     let entity_lifecycle_worker =
         plugin_routes::lifecycle_worker(&plugin_routes, capability_runtime.plugin_call_timeout);
@@ -80,6 +73,7 @@ pub(crate) async fn initialize(
     if platform_verifier.is_none() {
         tracing::warn!("platform public key missing; tenant projection RPCs fail closed");
     }
+    let plugin_reconciler = capability_grpc.plugin_reconciler();
     let tenant_projection_repository = db_pool
         .as_ref()
         .map(|pool| Arc::new(PostgresTenantProjectionRepository::new(Arc::clone(pool))));
@@ -90,6 +84,7 @@ pub(crate) async fn initialize(
     let tenant_projection = tenant_projection_repository.as_ref().map(|repository| {
         TenantProjectionGrpcServer::new(Arc::clone(repository), platform_verifier.clone())
             .with_notices(notices.clone())
+            .with_reconcile_signal(plugin_reconciler.as_ref().map(|worker| worker.signal()))
     });
     // 管理员只读与投影接收端读同一张 `tenants` 表；开关读同一个策略后端。只认 admin-gateway
     // 转发的 Staff 上下文（Cell 公钥集，Staff 钉死 kid=gateway）。
@@ -113,16 +108,6 @@ pub(crate) async fn initialize(
     let extension_router = capability_registry.extension_router().await;
     // ExtensionPlugin.Call 只认 Cell 签名的上下文；没有公钥集时只回答健康检查。
     let extension_verifier = internal_ctx::internal_ctx_verifier_from_env("ExtensionPlugin")?;
-    // HookPlugin 只收 Cell 签名的调用（Message Ingest 等原样转发的 `x-flare-ctx`）；没有公钥时全部拒绝。
-    let hook_plugin_verifier = internal_ctx::internal_ctx_verifier_from_env("HookPlugin")?;
-    let im_hook_plugin = ImHookPluginServer::new(
-        hook.command_handler,
-        hook.registry,
-        hook.adapter_factory,
-        capability_registry.clone(),
-        hook_plugin_verifier,
-    )
-    .with_execution_guard(hook.execution_guard);
 
     let plugin_resource_bridge = resource_bridge::compose(
         &plugin_routes,
@@ -131,6 +116,7 @@ pub(crate) async fn initialize(
         extensions.service_dispatch.as_ref(),
     )
     .await?;
+    let plugin_message_events = message_events::tasks(&plugin_routes, Arc::clone(&capability_policy)).await?;
     let audit_delivery = if let Some(pool) = db_pool {
         let publisher =
             flare_im_service_kit::audit_effects::AuditEffects::from_env("flare-capability").await?;
@@ -147,8 +133,8 @@ pub(crate) async fn initialize(
     };
     Ok(ApplicationContext {
         plugin_resource_bridge,
+        plugin_message_events,
         audit_delivery,
-        im_hook_plugin,
         hook_governance: hook.hook_governance,
         plugin_routes,
         extension_router,
@@ -160,10 +146,10 @@ pub(crate) async fn initialize(
         tenant_projection,
         tenant_notice,
         capability_admin,
-        hook_config_listener,
-        hook_execution_background: hook.execution_background,
+        hook_retention_background: hook.retention,
         entity_lifecycle_worker,
         tenant_notice_relay,
+        plugin_reconciler,
     })
 }
 

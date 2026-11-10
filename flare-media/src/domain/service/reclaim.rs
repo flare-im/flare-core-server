@@ -99,6 +99,22 @@ impl MediaService {
         else {
             return Ok(());
         };
+        if session.actor_kind == UploadActorKind::Staff {
+            if let Some(storage_upload_id) = session.storage_upload_id.as_deref() {
+                object_repo
+                    .abort_multipart_upload(object_key, storage_upload_id)
+                    .await?;
+            }
+            // Staging is never a referenced asset; final bytes may already have
+            // committed even if completion's response/session cleanup failed.
+            object_repo.delete_object(object_key).await?;
+            if !self.upload_persisted(session).await? {
+                object_repo
+                    .delete_object(Self::admin_image_final_key(session)?)
+                    .await?;
+            }
+            return Ok(());
+        }
         match kind {
             // abort 只作用于未完成的分片上传，已合并的对象不受影响，所以先 abort 再单独判断
             // 合并出的对象：完成时大小不符而没删掉的，或合并后登记失败的，都没有文件记录。

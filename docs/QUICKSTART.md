@@ -139,13 +139,9 @@ start:
 
 ### Plug in your business rules
 
-`crates/flare-im-hooks` offers nine extension points:
-
-`PreSend` / `PostSend` / `Delivery` / `Recall` / `MessageRead` / `MessageReaction` /
-`ConversationLifecycle` / `ConversationMember` / `GetConversationParticipants`
-
-Content moderation before send, audit records after send, syncing your org chart on
-membership change — all belong at this layer.
+`crates/flare-im-hooks` runs the `message.pre_send` hook: allow, reject or rewrite a message
+before it is stored. Content moderation and send permissions belong at this layer. See the
+[hook contract](HOOK-PLUGIN-CONTRACT.md).
 
 ---
 

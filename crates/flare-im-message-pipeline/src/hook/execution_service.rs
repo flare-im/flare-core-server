@@ -2,8 +2,7 @@
 //!
 //! ## 核心职责
 //! 1. PreSend Hook 执行
-//! 2. PostSend Hook 执行
-//! 3. Hook 上下文构建
+//! 2. Hook 上下文构建
 //!
 //! ## 设计原则
 //! - 单一职责：只负责 Hook 的执行
@@ -21,10 +20,9 @@ use flare_server_core::error::ErrorCode;
 use flare_server_core::flare_err;
 use tracing::instrument;
 
-use super::SubmittedMessage;
 use super::builder::{
     apply_draft_to_request, build_draft_from_request, build_hook_context,
-    build_hook_context_from_ctx, build_message_record, draft_from_submission, merge_context,
+    build_hook_context_from_ctx, merge_context,
 };
 use flare_server_core::error::Result;
 
@@ -32,7 +30,7 @@ use flare_server_core::error::Result;
 pub struct HookExecutionContext {
     /// 更新后的消息
     pub message: Message,
-    /// Hook 上下文（用于 PostSend）
+    /// Hook 上下文
     pub hook_context: Ctx,
 }
 
@@ -105,7 +103,7 @@ impl HookExecutionService {
             }
 
             // 应用 Draft 到消息
-            apply_draft_to_request(&mut message, &draft);
+            apply_draft_to_request(&mut message, &draft)?;
         }
 
         // 构建更新后的上下文
@@ -116,42 +114,6 @@ impl HookExecutionService {
             message,
             hook_context,
         })
-    }
-
-    /// 执行 PostSend Hook
-    ///
-    /// # 参数
-    /// - `hook_context`: Hook 上下文（来自 PreSend）
-    /// - `submission`: 消息提交
-    ///
-    /// # 返回
-    /// - `Ok(())`: 成功
-    /// - `Err`: 错误
-    #[instrument(skip_all, fields(
-        conversation_id = %submission.message().conversation_id,
-        message_id = %submission.message_id(),
-    ))]
-    pub async fn execute_post_send<S>(&self, hook_context: &Ctx, submission: &S) -> Result<()>
-    where
-        S: SubmittedMessage + ?Sized,
-    {
-        // 构建消息记录
-        let record = build_message_record(submission, submission.message());
-
-        // 构建 Draft
-        let post_draft =
-            draft_from_submission(submission).context("Failed to build draft from submission")?;
-
-        // 执行 PostSend Hook
-        self.hooks
-            .post_send(hook_context, &record, &post_draft)
-            .await
-            .map_err(|e| {
-                flare_err!(
-                    ErrorCode::InternalError,
-                    &format!("PostSend hook failed: {}", e)
-                )
-            })
     }
 }
 
@@ -181,13 +143,11 @@ mod tests {
     #[tokio::test]
     async fn a_hook_denial_reaches_the_caller_with_its_reason_and_details() {
         let registry = HookRegistry::new();
-        registry
-            .register_pre_send(
-                HookMetadata::default().with_name("policy"),
-                HookSelector::default(),
-                Arc::new(PolicyDenial),
-            )
-            .await;
+        registry.register_pre_send(
+            HookMetadata::default().with_name("policy"),
+            HookSelector::default(),
+            Arc::new(PolicyDenial),
+        );
         let service = HookExecutionService::new(Arc::new(HookDispatcher::new(registry)), None);
         let ctx: Ctx = Arc::new(Context::with_request_id("req").with_tenant_id("tenant-a"));
         let error = match service
@@ -230,13 +190,11 @@ mod tests {
     #[tokio::test]
     async fn a_policy_rejection_keeps_its_marker_through_the_pipeline() {
         let registry = HookRegistry::new();
-        registry
-            .register_pre_send(
-                HookMetadata::default().with_name("policy"),
-                HookSelector::default(),
-                Arc::new(MarkedPolicyDenial),
-            )
-            .await;
+        registry.register_pre_send(
+            HookMetadata::default().with_name("policy"),
+            HookSelector::default(),
+            Arc::new(MarkedPolicyDenial),
+        );
         let service = HookExecutionService::new(Arc::new(HookDispatcher::new(registry)), None);
         let ctx: Ctx = Arc::new(Context::with_request_id("req").with_tenant_id("tenant-a"));
         let error = match service
@@ -268,13 +226,11 @@ mod tests {
     #[tokio::test]
     async fn attributes_written_or_stripped_by_an_allowing_hook_reach_the_message() {
         let registry = HookRegistry::new();
-        registry
-            .register_pre_send(
-                HookMetadata::default().with_name("epoch"),
-                HookSelector::default(),
-                Arc::new(StampEpoch),
-            )
-            .await;
+        registry.register_pre_send(
+            HookMetadata::default().with_name("epoch"),
+            HookSelector::default(),
+            Arc::new(StampEpoch),
+        );
         let service = HookExecutionService::new(Arc::new(HookDispatcher::new(registry)), None);
         let ctx: Ctx = Arc::new(Context::with_request_id("req").with_tenant_id("tenant-a"));
         let mut message = Message::default();
@@ -307,13 +263,11 @@ mod tests {
     #[tokio::test]
     async fn a_message_that_skips_presend_keeps_the_epoch_its_sender_wrote() {
         let registry = HookRegistry::new();
-        registry
-            .register_pre_send(
-                HookMetadata::default().with_name("epoch"),
-                HookSelector::default(),
-                Arc::new(StampEpoch),
-            )
-            .await;
+        registry.register_pre_send(
+            HookMetadata::default().with_name("epoch"),
+            HookSelector::default(),
+            Arc::new(StampEpoch),
+        );
         let service = HookExecutionService::new(Arc::new(HookDispatcher::new(registry)), None);
         let ctx: Ctx = Arc::new(Context::with_request_id("req").with_tenant_id("tenant-a"));
         let mut message = Message::default();

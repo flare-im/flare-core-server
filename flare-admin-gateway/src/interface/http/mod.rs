@@ -5,8 +5,11 @@ mod admin_handler;
 mod audit_target;
 mod hooks_handler;
 mod media_handler;
+mod media_upload_handler;
 mod ops_handler;
+mod platform_hooks_handler;
 mod plugin_admin_handler;
+mod plugin_registry_handler;
 mod router;
 
 pub use admin_auth_middleware::{AdminRoute, VerifiedStaffContext};

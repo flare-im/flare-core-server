@@ -8,7 +8,6 @@
 use axum::{Json, extract::Extension, http::HeaderMap};
 use flare_core_base::context::keys;
 use flare_grpc_proto::capability::{
-    DeregisterPluginEndpointRequest, RegisterPluginEndpointRequest,
     SetTenantCapabilitySwitchRequest,
 };
 use flare_grpc_proto::conversation::{
@@ -34,14 +33,13 @@ use super::audit_target::AuditTarget;
 use crate::application::admin_ops::{
     AdminCapabilityCatalogHttp, AdminCapabilitySwitchUpdateHttp, AdminConversationDetailHttp,
     AdminConversationListQuery, AdminConversationPageHttp, AdminDeviceKickHttp,
-    AdminParticipantListQuery, AdminParticipantPageHttp, AdminPluginDeregisterHttp,
-    AdminPluginDeregisterHttpRequest, AdminPluginListQuery, AdminPluginRegisterHttp,
-    AdminPluginRegisterHttpRequest, AdminPluginsHttp, AdminTenantCapabilitiesHttp,
+    AdminParticipantListQuery, AdminParticipantPageHttp, AdminPluginListQuery,
+    AdminPluginsHttp, AdminTenantCapabilitiesHttp,
     AdminTenantCapabilitySwitchHttpRequest, AdminTenantKickHttp, AdminTenantRuntimeHttp,
     AdminUserDevicesHttp, AdminUserKickHttp, AdminUserPresenceHttp, DEFAULT_CONVERSATION_PAGE,
     DEFAULT_PARTICIPANT_PAGE, MAX_CONVERSATION_PAGE, MAX_PARTICIPANT_PAGE, capability_catalog_http,
     conversation_http, conversation_page_http, page_limit, participant_page_http, plugins_http,
-    register_plugin_request, tenant_capabilities_http, tenant_runtime_http, user_devices_http,
+    tenant_capabilities_http, tenant_runtime_http, user_devices_http,
     user_presence_http,
 };
 
@@ -872,121 +870,6 @@ pub async fn list_plugins(
     Ok(Json(ApiResponse::success(plugins_http(
         tenant_id, response,
     ))))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/plugins/register",
-    tag = "Admin",
-    request_body = AdminPluginRegisterHttpRequest,
-    params(
-        ("x-audit-reason" = String, Header, description = "Operator reason as percent-encoded UTF-8 (encodeURIComponent; plain ASCII may be sent as is), at most 512 bytes decoded and 1536 bytes as sent; recorded decoded in the audit log"),
-        ("idempotency-key" = Option<String>, Header, description = "Required unless x-request-id is present; correlation only, not deduplicated"),
-        ("x-request-id" = Option<String>, Header, description = "Required unless idempotency-key is present"),
-    ),
-    responses(
-        (status = 200, description = "The plugin instance was registered for the staff application; `accepted=false` with a message when Capability declined", body = ApiResponse<AdminPluginRegisterHttp>),
-        (status = 400, description = "plugin_id, capability_id or grpc_authority blank (ADMIN_PLUGIN_FIELD_REQUIRED), plugin_id, capability_id or a declared_operations entry not 1 to 128 ASCII letters, digits or _ - . : (ADMIN_PLUGIN_FIELD_INVALID), or Capability refused an argument, for example a capability_id outside declared_operations (BAD_REQUEST)"),
-        (status = 401, description = "Staff context is missing or invalid"),
-        (status = 403, description = "Signed permission is not core:plugins:write (ADMIN_PERMISSION_DENIED), the caller is organization staff (ADMIN_SCOPE_DENIED), audit reason / idempotency header missing (FORBIDDEN), or Capability refused the application (FORBIDDEN)"),
-        (status = 500, description = "Capability downstream failed (ADMIN_PLUGIN_REGISTER_FAILED); its error text is not returned"),
-        (status = 502, description = "Capability downstream refused the forwarded staff context as unauthenticated, a deployment error (ADMIN_UPSTREAM_REJECTED_ASSERTION)"),
-        (status = 503, description = "Capability downstream is disabled (ADMIN_CAPABILITY_DISABLED) or unavailable (ADMIN_UPSTREAM_UNAVAILABLE)"),
-        (status = 504, description = "Capability downstream did not answer in time (ADMIN_UPSTREAM_TIMEOUT)"),
-    ),
-)]
-pub async fn register_plugin(
-    headers: HeaderMap,
-    Extension(clients): Extension<Arc<AdminGrpcClients>>,
-    Extension(capability): Extension<AdminCapability>,
-    Extension(staff): Extension<VerifiedStaffContext>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    AdminJson(request): AdminJson<AdminPluginRegisterHttpRequest>,
-) -> Result<Json<ApiResponse<AdminPluginRegisterHttp>>> {
-    let tenant_id = verified_tenant(&principal)?;
-    let proto: RegisterPluginEndpointRequest =
-        register_plugin_request(&tenant_id, staff.request_id(), request)
-            .map_err(|err| bad_request(err.code, err.message))?;
-    let plugin_id = proto.plugin_id.clone();
-    audit_write(
-        "plugins.register",
-        &principal,
-        &headers,
-        &AuditTarget::id(&plugin_id),
-    );
-    let mut client = capability.client().await?;
-    let response = clients
-        .bounded(client.register_plugin_endpoint(staff.token(), proto))
-        .await
-        .map_err(|err| admin_rpc_error(err, "ADMIN_PLUGIN_REGISTER_FAILED"))?;
-    Ok(Json(ApiResponse::success(AdminPluginRegisterHttp {
-        tenant_id,
-        plugin_id,
-        accepted: response.accepted,
-        message: response.message,
-    })))
-}
-
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/plugins/deregister",
-    tag = "Admin",
-    request_body = AdminPluginDeregisterHttpRequest,
-    params(
-        ("x-audit-reason" = String, Header, description = "Operator reason as percent-encoded UTF-8 (encodeURIComponent; plain ASCII may be sent as is), at most 512 bytes decoded and 1536 bytes as sent; recorded decoded in the audit log"),
-        ("idempotency-key" = Option<String>, Header, description = "Required unless x-request-id is present; correlation only, not deduplicated"),
-        ("x-request-id" = Option<String>, Header, description = "Required unless idempotency-key is present"),
-    ),
-    responses(
-        (status = 200, description = "The plugin instance was removed from the staff application's route book; `accepted=false` when it was not registered", body = ApiResponse<AdminPluginDeregisterHttp>),
-        (status = 400, description = "plugin_id blank (ADMIN_PLUGIN_FIELD_REQUIRED), or Capability refused an argument (BAD_REQUEST)"),
-        (status = 401, description = "Staff context is missing or invalid"),
-        (status = 403, description = "Signed permission is not core:plugins:write (ADMIN_PERMISSION_DENIED), the caller is organization staff (ADMIN_SCOPE_DENIED), audit reason / idempotency header missing (FORBIDDEN), or Capability refused the application (FORBIDDEN)"),
-        (status = 500, description = "Capability downstream failed (ADMIN_PLUGIN_DEREGISTER_FAILED); its error text is not returned"),
-        (status = 502, description = "Capability downstream refused the forwarded staff context as unauthenticated, a deployment error (ADMIN_UPSTREAM_REJECTED_ASSERTION)"),
-        (status = 503, description = "Capability downstream is disabled (ADMIN_CAPABILITY_DISABLED) or unavailable (ADMIN_UPSTREAM_UNAVAILABLE)"),
-        (status = 504, description = "Capability downstream did not answer in time (ADMIN_UPSTREAM_TIMEOUT)"),
-    ),
-)]
-pub async fn deregister_plugin(
-    headers: HeaderMap,
-    Extension(clients): Extension<Arc<AdminGrpcClients>>,
-    Extension(capability): Extension<AdminCapability>,
-    Extension(staff): Extension<VerifiedStaffContext>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    AdminJson(request): AdminJson<AdminPluginDeregisterHttpRequest>,
-) -> Result<Json<ApiResponse<AdminPluginDeregisterHttp>>> {
-    let tenant_id = verified_tenant(&principal)?;
-    let plugin_id = request.plugin_id.trim().to_string();
-    if plugin_id.is_empty() {
-        return Err(bad_request(
-            "ADMIN_PLUGIN_FIELD_REQUIRED",
-            "plugin_id is required".to_string(),
-        ));
-    }
-    audit_write(
-        "plugins.deregister",
-        &principal,
-        &headers,
-        &AuditTarget::id(&plugin_id),
-    );
-    let mut client = capability.client().await?;
-    let response = clients
-        .bounded(client.deregister_plugin_endpoint(
-            staff.token(),
-            DeregisterPluginEndpointRequest {
-                tenant_id: tenant_id.clone(),
-                plugin_id: plugin_id.clone(),
-                request_id: staff.request_id().to_string(),
-            },
-        ))
-        .await
-        .map_err(|err| admin_rpc_error(err, "ADMIN_PLUGIN_DEREGISTER_FAILED"))?;
-    Ok(Json(ApiResponse::success(AdminPluginDeregisterHttp {
-        tenant_id,
-        plugin_id,
-        accepted: response.accepted,
-    })))
 }
 
 #[cfg(test)]

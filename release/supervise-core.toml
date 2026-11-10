@@ -85,6 +85,7 @@ inherit_env = [
   "FLARE_PLUGIN_RESOURCE_CONVERSATION_URL", "FLARE_PLUGIN_RESOURCE_SOCIAL_GROUP_URL",
   "FLARE_PLUGIN_REALTIME_PUSH_URL",
   "FLARE_PLUGIN_CALL_KEY_ID", "FLARE_PLUGIN_CALL_SIGNING_KEY", "FLARE_PLUGIN_CALL_PUBLIC_KEYS",
+  "FLARE_PLUGIN_PUBLISHER_KEYS", "FLARE_PLUGIN_CONFIG_KEY",
   "FLARE_PLUGIN_RUNTIME_PUBLIC_KEYS",
   "FLARE_INTERNAL_CTX_PRIVATE_KEY",
 ]
@@ -121,7 +122,8 @@ name = "message-ingest"
 command = "/usr/local/bin/flare-message-ingest"
 # FLARE_USAGE_*: the six usage producers (ingest, storage writer, push worker, media, API
 # gateway, signaling gateway) publish flare.usage.window.v1 when FLARE_USAGE_NATS_URL is set.
-inherit_env_prefixes = ["MESSAGE_INGEST_", "INGEST_", "FLARE_USAGE_"]
+# FLARE_HOOK_*: hook execution evidence and circuit breaker settings of the hook runtime.
+inherit_env_prefixes = ["MESSAGE_INGEST_", "INGEST_", "FLARE_USAGE_", "FLARE_HOOK_"]
 # The seq floor self-heal reads Storage Reader as ingest's own Service identity for
 # the message tenant; forwarding the inbound token fails whenever its tenant differs.
 # Without the private key ingest keeps forwarding (and warns once at startup).
@@ -129,7 +131,6 @@ inherit_env_prefixes = ["MESSAGE_INGEST_", "INGEST_", "FLARE_USAGE_"]
 # key in FLARE_INTERNAL_CTX_PUBLIC_KEYS.
 inherit_env = [
   "FLARE_INTERNAL_CTX_PUBLIC_KEY", "FLARE_INTERNAL_CTX_PUBLIC_KEYS", "FLARE_INTERNAL_CTX_PRIVATE_KEY",
-  "FLARE_CAPABILITY_GRPC_URI",
   "FLARE_WRITE_PROOF_PRIVATE_KEY", "FLARE_WRITE_PROOF_PUBLIC_KEY",
 ]
 required_env = ["FLARE_INTERNAL_CTX_PUBLIC_KEY", "MESSAGE_INGEST_HOOKS_CONFIG"]

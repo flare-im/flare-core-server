@@ -31,6 +31,7 @@ use flare_server_core::auth::credential_snapshot::{
 use flare_server_core::error::grpc::IntoGrpc;
 use tonic::{Request, Response, Status};
 
+use crate::application::handler::plugin_reconcile::ReconcileSignal;
 use crate::application::commands::{apply_client_policy, apply_tenant_projection};
 use crate::application::queries::tenant_projection_versions;
 use crate::domain::model::{ClientPolicyRecord, TenantProjectionRecord};
@@ -104,6 +105,7 @@ pub struct TenantProjectionGrpcServer<R: TenantProjectionRepository + 'static> {
     repository: Arc<R>,
     control_verifier: Option<PlatformAssertionVerifier>,
     notices: Option<Arc<dyn TenantNotices>>,
+    reconcile: Option<Arc<ReconcileSignal>>,
 }
 
 impl<R: TenantProjectionRepository + 'static> TenantProjectionGrpcServer<R> {
@@ -112,7 +114,14 @@ impl<R: TenantProjectionRepository + 'static> TenantProjectionGrpcServer<R> {
             repository,
             control_verifier,
             notices: None,
+            reconcile: None,
         }
+    }
+
+    /// Woken by an accepted plugin projection, so a change does not wait for the next tick.
+    pub fn with_reconcile_signal(mut self, signal: Option<Arc<ReconcileSignal>>) -> Self {
+        self.reconcile = signal;
+        self
     }
 
     /// Where accepted plugin projections are announced (none: clients refresh on their own).
@@ -128,6 +137,7 @@ impl<R: TenantProjectionRepository + 'static> Clone for TenantProjectionGrpcServ
             repository: Arc::clone(&self.repository),
             control_verifier: self.control_verifier.clone(),
             notices: self.notices.clone(),
+            reconcile: self.reconcile.clone(),
         }
     }
 }
@@ -143,7 +153,7 @@ impl<R: TenantProjectionRepository + 'static> TenantProjection for TenantProject
         actor.require_tenant(&request.get_ref().app_id)?;
         let wire = request.into_inner();
         let now = chrono::Utc::now().timestamp_millis();
-        let snapshot = flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot::from_json(
+        let snapshot = flare_im_capability_core::plugin::runtime::PluginProjection::from_json(
             &wire.snapshot_json,
             now,
         )
@@ -158,6 +168,11 @@ impl<R: TenantProjectionRepository + 'static> TenantProjection for TenantProject
             .replace_plugins(&snapshot)
             .await
             .into_grpc()?;
+        if outcome.accepted
+            && let Some(signal) = &self.reconcile
+        {
+            signal.wake();
+        }
         // Committed above; an older or equal version changes nothing and says nothing.
         if outcome.accepted
             && let Some(notices) = &self.notices
@@ -341,7 +356,7 @@ mod tests {
         rows: Mutex<HashMap<String, (TenantProjectionRecord, u64)>>,
         credentials: Mutex<HashMap<String, CredentialSnapshot>>,
         plugins: Mutex<
-            HashMap<String, flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot>,
+            HashMap<String, flare_im_capability_core::plugin::runtime::PluginProjection>,
         >,
         client_policies: Mutex<HashMap<String, ClientPolicyRecord>>,
     }
@@ -350,7 +365,7 @@ mod tests {
     impl TenantProjectionRepository for MemoryRepo {
         async fn replace_plugins(
             &self,
-            p: &flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot,
+            p: &flare_im_capability_core::plugin::runtime::PluginProjection,
         ) -> FlareResult<TenantProjectionOutcome> {
             let mut rows = self.plugins.lock().unwrap();
             let current = rows.get(&p.tenant_id).map(|p| p.version).unwrap_or(0);
@@ -515,7 +530,7 @@ mod tests {
     #[tokio::test]
     async fn an_accepted_plugin_projection_announces_the_catalog_change() {
         use flare_grpc_proto::control::PluginsProjectionUpsert;
-        use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
+        use flare_im_capability_core::plugin::runtime::PluginProjection;
         let (repo, server) = server();
         let notices = Arc::new(RecordedNotices::default());
         let server = server.with_notices(Some(notices.clone() as Arc<dyn TenantNotices>));
@@ -523,13 +538,14 @@ mod tests {
         let body = |version: u64| PluginsProjectionUpsert {
             app_id: "app-a".into(),
             version,
-            snapshot_json: serde_json::to_vec(&PluginRuntimeSnapshot {
+            snapshot_json: serde_json::to_vec(&PluginProjection {
                 organization_id: Some("org-1".into()),
                 tenant_id: "app-a".into(),
                 version,
                 issued_at_ms: now,
                 valid_until_ms: now + 60000,
                 plugins: vec![],
+                bindings: Vec::new(),
             })
             .unwrap(),
         };
@@ -555,16 +571,17 @@ mod tests {
     #[tokio::test]
     async fn plugins_require_worker_and_exact_app_and_keep_empty_revocation_watermark() {
         use flare_grpc_proto::control::PluginsProjectionUpsert;
-        use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
+        use flare_im_capability_core::plugin::runtime::PluginProjection;
         let (_, server) = server();
         let now = chrono::Utc::now().timestamp_millis();
-        let snapshot = PluginRuntimeSnapshot {
+        let snapshot = PluginProjection {
             organization_id: Some("org-1".into()),
             tenant_id: "app-a".into(),
             version: 17,
             issued_at_ms: now,
             valid_until_ms: now + 60000,
             plugins: vec![],
+            bindings: Vec::new(),
         };
         let body = PluginsProjectionUpsert {
             app_id: "app-a".into(),

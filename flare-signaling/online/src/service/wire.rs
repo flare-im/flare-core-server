@@ -341,3 +341,18 @@ impl OnlineAdminService for WiredOnlineHandler {
         self.handle_admin_get_user_presence(request).await
     }
 }
+
+#[tonic::async_trait]
+impl flare_grpc_proto::auth_revoke::auth_revocation_service_server::AuthRevocationService
+    for WiredOnlineHandler
+{
+    async fn revoke_identity_sessions(
+        &self,
+        request: Request<flare_grpc_proto::auth_revoke::RevokeIdentitySessionsRequest>,
+    ) -> std::result::Result<
+        Response<flare_grpc_proto::auth_revoke::RevokeIdentitySessionsResponse>,
+        Status,
+    > {
+        self.handle_revoke_identity_sessions(request).await
+    }
+}

@@ -5,17 +5,19 @@
 //! 在该路径上有合法实体 ID 时才登记，`(租户, 插件, 实体) → (会话, 服务端消息 ID)`。插件之后为这个实体
 //! 发布的共享状态只投到这里登记过的消息。
 //!
-//! 投影是控制面推给 Capability 的 `plugin_authorization_snapshots`（同一个 Core 库），这里只读。解析
-//! 一次投影要校验其中每个 manifest，所以按 (租户, 投影版本) 缓存解析结果；每批插件卡片只多一次按主键
-//! 读版本号，版本变了才重读整份投影。不是插件卡片的消息不碰数据库。
+//! 投影是控制面推给 Capability 的 `plugin_authorization_snapshots`（同一个 Core 库），这里只读。投影
+//! 只按摘要指向 manifest，正文在注册表 `plugin_versions`：每个摘要在进程内只读取、解析一次。规则按
+//! (租户, 投影版本) 缓存；每批插件卡片只多一次按主键读版本号，版本变了才重读整份投影。不是插件卡片的
+//! 消息不碰数据库。
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use flare_im_capability_core::plugin::PluginManifest;
 use flare_im_capability_core::plugin::manifest::{UiContribution, UiContributionKind};
-use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
+use flare_im_capability_core::plugin::runtime::{ManifestCache, PluginProjection};
 use flare_im_capability_core::plugin::ui::PluginMessage;
 use flare_im_contracts::Ctx;
 use flare_proto::common::message_content::Content;
@@ -28,7 +30,7 @@ use crate::domain::repository::PluginEntityBindingRepository;
 
 /// APP_CARD `card_type` of a plugin card.
 pub const PLUGIN_MESSAGE_CARD_TYPE: &str = "flare.plugin.message.v1";
-/// Tenants whose parsed projection is kept; the cache starts over when it is full.
+/// Tenants whose rules are kept; the cache starts over when it is full.
 const MAX_CACHED_TENANTS: usize = 1024;
 
 /// One binding a stored card asks for.
@@ -64,34 +66,38 @@ pub struct EntityRules {
 }
 
 impl EntityRules {
-    pub fn from_snapshot(snapshot: &PluginRuntimeSnapshot, now_ms: i64) -> Self {
+    /// `manifests` holds the projection's manifests by digest; a plugin without one is skipped.
+    pub fn from_projection(
+        projection: &PluginProjection,
+        manifests: &HashMap<String, Arc<PluginManifest>>,
+        now_ms: i64,
+    ) -> Self {
         let mut contributions = HashMap::new();
-        for projected in &snapshot.plugins {
+        for projected in &projection.plugins {
             let grant = &projected.grant;
             if !grant.enabled
                 || grant.revoked
-                || now_ms < grant.valid_from_ms
-                || now_ms >= grant.valid_until_ms
+                || !grant.in_effect(now_ms)
             {
                 continue;
             }
-            let Ok(manifest) = projected.manifest() else {
+            let Some(manifest) = manifests.get(projected.manifest_digest()) else {
                 continue;
             };
-            for contribution in manifest.client_extensions.contributions {
+            for contribution in &manifest.client_extensions.contributions {
                 if contribution.kind == UiContributionKind::MessageContent
                     && contribution.entity_path.is_some()
                 {
                     contributions.insert(
                         (manifest.plugin_id.clone(), contribution.id.clone()),
-                        contribution,
+                        contribution.clone(),
                     );
                 }
             }
         }
         Self {
-            version: snapshot.version,
-            valid_until_ms: snapshot.valid_until_ms,
+            version: projection.version,
+            valid_until_ms: projection.valid_until_ms,
             contributions,
         }
     }
@@ -125,6 +131,7 @@ impl EntityRules {
 pub struct PostgresPluginEntityBindings {
     pool: Pool<Postgres>,
     rules: Mutex<HashMap<String, Arc<EntityRules>>>,
+    manifests: ManifestCache,
 }
 
 fn db_error(operation: &str, err: sqlx::Error) -> flare_server_core::error::FlareError {
@@ -136,7 +143,56 @@ impl PostgresPluginEntityBindings {
         Self {
             pool,
             rules: Mutex::new(HashMap::new()),
+            manifests: ManifestCache::default(),
         }
+    }
+
+    /// The manifests of `projection` by digest. The registry is read only for digests this process
+    /// has not parsed yet. A digest it does not hold, or whose text does not hash to it, stays out
+    /// of the answer, so its plugin is skipped.
+    async fn manifests(
+        &self,
+        projection: &PluginProjection,
+    ) -> Result<HashMap<String, Arc<PluginManifest>>> {
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        for projected in &projection.plugins {
+            let digest = projected.manifest_digest();
+            match self.manifests.get(digest) {
+                Some(manifest) => {
+                    found.insert(digest.to_owned(), manifest);
+                }
+                None => missing.push(digest.to_owned()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(found);
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_json FROM plugin_versions \
+             WHERE manifest_digest = ANY($1)",
+        )
+        .bind(&missing)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| db_error("read plugin manifests", err))?;
+        for (digest, raw) in rows {
+            match self.manifests.insert(&digest, raw.as_bytes()) {
+                Ok(manifest) => {
+                    found.insert(digest, manifest);
+                }
+                Err(error) => {
+                    warn!(digest, %error, "registered plugin manifest is invalid; its plugin cards stay unbound");
+                }
+            }
+        }
+        for digest in missing.iter().filter(|digest| !found.contains_key(*digest)) {
+            warn!(
+                digest,
+                "plugin manifest is not in the registry; its plugin cards stay unbound"
+            );
+        }
+        Ok(found)
     }
 
     /// The rules of the tenant's current, unexpired projection; `None` without one.
@@ -173,8 +229,8 @@ impl PostgresPluginEntityBindings {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
-        let snapshot = match serde_json::from_value::<PluginRuntimeSnapshot>(snapshot) {
-            Ok(snapshot) if snapshot.validate(now_ms).is_ok() => snapshot,
+        let projection = match serde_json::from_value::<PluginProjection>(snapshot) {
+            Ok(projection) if projection.validate(now_ms).is_ok() => projection,
             _ => {
                 warn!(
                     tenant_id,
@@ -183,7 +239,12 @@ impl PostgresPluginEntityBindings {
                 return Ok(None);
             }
         };
-        let rules = Arc::new(EntityRules::from_snapshot(&snapshot, now_ms));
+        let manifests = self.manifests(&projection).await?;
+        let rules = Arc::new(EntityRules::from_projection(
+            &projection,
+            &manifests,
+            now_ms,
+        ));
         if let Ok(mut cache) = self.rules.lock() {
             if cache.len() >= MAX_CACHED_TENANTS && !cache.contains_key(tenant_id) {
                 cache.clear();
@@ -263,7 +324,7 @@ mod tests {
     use super::*;
     use flare_im_capability_core::plugin::authorization::TenantPluginGrant;
     use flare_im_capability_core::plugin::runtime::{
-        PluginDeployment, ProjectedPlugin, configuration_digest, digest_bytes,
+        ProjectedLifecycle, ProjectedPlugin, digest_bytes,
     };
     use flare_proto::common::{AppCardContent, MessageContent};
 
@@ -273,11 +334,16 @@ mod tests {
         "/../../../flare-protocol/flare-plugin-protocol/tests/fixtures/plugin-ui-v2-manifest.json"
     ));
 
-    pub(crate) fn poll_snapshot(tenant: &str, now: i64) -> PluginRuntimeSnapshot {
+    /// A projection of the poll, and the manifests its digests name.
+    pub(crate) fn poll_projection(
+        tenant: &str,
+        now: i64,
+    ) -> (PluginProjection, HashMap<String, Arc<PluginManifest>>) {
         let manifest: serde_json::Value = serde_json::from_str(POLL_MANIFEST).unwrap();
         let raw = serde_json::to_string(&manifest).unwrap();
         let digest = digest_bytes(raw.as_bytes());
-        PluginRuntimeSnapshot {
+        let parsed = Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap());
+        let projection = PluginProjection {
             organization_id: Some("org-1".into()),
             tenant_id: tenant.into(),
             version: 7,
@@ -296,22 +362,17 @@ mod tests {
                     approved_data_scopes: Default::default(),
                     enabled: true,
                     revoked: false,
+                    suspended: false,
                     valid_from_ms: now,
                     valid_until_ms: now + 300_000,
                 },
-                manifest_json: raw,
-                deployment: PluginDeployment {
-                    deployment_id: "poll-1".into(),
-                    plugin_id: "example.poll".into(),
-                    plugin_version: "0.2.0".into(),
-                    manifest_digest: digest,
-                    artifact_digest: manifest["artifact"]["digest"].as_str().unwrap().into(),
-                    grpc_authority: "http://127.0.0.1:1".into(),
-                },
-                configuration_digest: configuration_digest(&serde_json::json!({})).unwrap(),
-                client_configuration: Default::default(),
+                lifecycle: ProjectedLifecycle::Installed,
+                export_until_ms: None,
+                features: Default::default(),
             }],
-        }
+            bindings: Vec::new(),
+        };
+        (projection, HashMap::from([(digest, parsed)]))
     }
 
     pub(crate) fn card(server_id: &str, app_id: &str, envelope: serde_json::Value) -> Message {
@@ -347,7 +408,8 @@ mod tests {
     #[test]
     fn a_card_of_an_enabled_plugin_binds_its_entity() {
         let now = chrono::Utc::now().timestamp_millis();
-        let rules = EntityRules::from_snapshot(&poll_snapshot("app-a", now), now);
+        let (projection, manifests) = poll_projection("app-a", now);
+        let rules = EntityRules::from_projection(&projection, &manifests, now);
         let message = card("m-1", "example.poll", poll_envelope("poll-1".into()));
         assert_eq!(
             binding_for(&rules, &message, now),
@@ -367,7 +429,8 @@ mod tests {
     #[test]
     fn other_cards_plugins_and_payloads_bind_nothing() {
         let now = chrono::Utc::now().timestamp_millis();
-        let rules = EntityRules::from_snapshot(&poll_snapshot("app-a", now), now);
+        let (projection, manifests) = poll_projection("app-a", now);
+        let rules = EntityRules::from_projection(&projection, &manifests, now);
         // app_id is not the envelope's plugin.
         let forged = card("m-1", "example.other", poll_envelope("poll-1".into()));
         assert!(plugin_card(&forged).is_none());
@@ -396,17 +459,21 @@ mod tests {
     fn disabled_revoked_and_expired_grants_bind_nothing() {
         let now = chrono::Utc::now().timestamp_millis();
         let message = card("m-1", "example.poll", poll_envelope("poll-1".into()));
+        let (enabled, manifests) = poll_projection("app-a", now);
         for mode in 0..3 {
-            let mut snapshot = poll_snapshot("app-a", now);
+            let mut projection = enabled.clone();
             match mode {
-                0 => snapshot.plugins[0].grant.enabled = false,
-                1 => snapshot.plugins[0].grant.revoked = true,
-                _ => snapshot.plugins[0].grant.valid_until_ms = now,
+                0 => projection.plugins[0].grant.enabled = false,
+                1 => projection.plugins[0].grant.revoked = true,
+                _ => projection.plugins[0].grant.valid_until_ms = now,
             }
-            let rules = EntityRules::from_snapshot(&snapshot, now);
+            let rules = EntityRules::from_projection(&projection, &manifests, now);
             assert!(binding_for(&rules, &message, now).is_none(), "mode {mode}");
         }
-        let rules = EntityRules::from_snapshot(&poll_snapshot("app-a", now), now);
+        let rules = EntityRules::from_projection(&enabled, &manifests, now);
         assert!(binding_for(&rules, &message, now + 300_000).is_none());
+        // A digest the registry does not hold skips the plugin.
+        let rules = EntityRules::from_projection(&enabled, &HashMap::new(), now);
+        assert!(binding_for(&rules, &message, now).is_none());
     }
 }

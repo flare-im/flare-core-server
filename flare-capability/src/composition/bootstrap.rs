@@ -6,8 +6,6 @@ use flare_im_contracts::service_names::CAPABILITY;
 use flare_server_core::error::Result;
 use tracing::info;
 
-use crate::domain::model::ExecutionMode;
-
 use super::extensions::CapabilityExtensions;
 use super::process_config::CapabilityServiceConfig;
 use super::runtime_context::ApplicationContext;
@@ -29,10 +27,7 @@ impl ApplicationBootstrap {
 
         let config = capability_config_from_env(app_config)?;
         info!(
-            config_file = ?config.config_file,
             runtime_config_file = ?config.runtime_config_file,
-            tenant_id = ?config.tenant_id,
-            refresh_interval_secs = config.refresh_interval_secs,
             "Starting Flare Capability service"
         );
 
@@ -77,11 +72,10 @@ impl ApplicationBootstrap {
         info!(
             address = %address,
             port = %address.port(),
-            "Starting Flare Capability gRPC (HookPlugin + ExtensionPlugin + CapabilityService)..."
+            "Starting Flare Capability gRPC (ExtensionPlugin + CapabilityService)..."
         );
 
         let address_clone = address;
-        let im_hook_plugin = context.im_hook_plugin;
         let capability_grpc = context.capability_grpc;
         let extension_router = context.extension_router;
         let extension_verifier = context.extension_verifier;
@@ -89,12 +83,15 @@ impl ApplicationBootstrap {
         let tenant_projection = context.tenant_projection;
         let tenant_notice = context.tenant_notice;
         let capability_admin = context.capability_admin;
-        let hook_config_listener = context.hook_config_listener;
-        let hook_execution_background = context.hook_execution_background;
+        let hook_retention_background = context.hook_retention_background;
         let entity_lifecycle_worker = context.entity_lifecycle_worker;
         let tenant_notice_relay = context.tenant_notice_relay;
+        let plugin_reconciler = context.plugin_reconciler;
 
         let mut runtime = runtime_plan.service_runtime();
+        for task in context.plugin_message_events {
+            runtime = runtime.add_task(Box::new(task));
+        }
         if let Some((pool, publisher)) = context.audit_delivery {
             runtime = runtime.add_spawn_with_shutdown(
                 "flare-capability-audit-delivery",
@@ -122,6 +119,20 @@ impl ApplicationBootstrap {
                 },
             );
         }
+        // 插件运行时收敛：比较期望和已确认状态，向插件进程下发，停机时结束本轮。
+        if let Some(reconciler) = plugin_reconciler {
+            runtime = runtime.add_spawn_with_shutdown(
+                "flare-capability-plugin-reconcile",
+                move |shutdown| async move {
+                    reconciler
+                        .run(async {
+                            let _ = shutdown.await;
+                        })
+                        .await;
+                    Ok(())
+                },
+            );
+        }
         // 租户通知 outbox：至少一次发到通知通道，多副本并发时通道按版本去重。
         if let Some(relay) = tenant_notice_relay {
             runtime = runtime.add_spawn_with_shutdown(
@@ -136,60 +147,25 @@ impl ApplicationBootstrap {
                 },
             );
         }
-        // Hook 配置失效通知的监听任务（独立 PostgreSQL 连接）随进程停机停掉、关掉连接。
-        if let Some(listener) = hook_config_listener {
+        // Hook 执行证据的保留期清理；写入在 Ingest。
+        if let Some(background) = hook_retention_background {
             runtime = runtime.add_spawn_with_shutdown(
-                "flare-capability-hook-config-listener",
+                "flare-capability-hook-execution-retention",
                 move |shutdown_rx| async move {
-                    let _ = shutdown_rx.await;
-                    listener.shutdown().await;
+                    crate::infrastructure::hook_retention::run_retention(
+                        background.repository,
+                        background.metrics,
+                        background.task,
+                        shutdown_rx,
+                    )
+                    .await;
                     Ok(())
                 },
             );
         }
-        // Hook 执行证据：后台批量写库（停机时写完缓冲）与保留期清理。
-        if let Some(background) = hook_execution_background {
-            let tasks = background.tasks;
-            let writer_buffer = background.buffer;
-            let writer_repository = std::sync::Arc::clone(&background.repository);
-            runtime = runtime
-                .add_spawn_with_shutdown(
-                    "flare-capability-hook-execution-writer",
-                    move |shutdown_rx| async move {
-                        crate::infrastructure::hook_execution::run_writer(
-                            writer_buffer,
-                            writer_repository,
-                            tasks.flush_interval,
-                            shutdown_rx,
-                        )
-                        .await;
-                        Ok(())
-                    },
-                )
-                .add_spawn_with_shutdown(
-                    "flare-capability-hook-execution-retention",
-                    move |shutdown_rx| async move {
-                        crate::infrastructure::hook_execution::run_retention(
-                            background.repository,
-                            background.metrics,
-                            tasks,
-                            shutdown_rx,
-                        )
-                        .await;
-                        Ok(())
-                    },
-                );
-        }
         let runtime = runtime
             .add_spawn_with_shutdown("flare-capability-grpc", move |shutdown_rx| async move {
                 use flare_server_core::middleware::ContextLayer;
-
-                // HookPlugin 不经旧元数据上下文：每个 Call 在服务内验 `x-flare-ctx`，无签名或
-                // 验不过一律 UNAUTHENTICATED（见 ImHookPluginServer）。
-                let hook_plugin_service =
-                    flare_grpc_proto::capability::hook_plugin_server::HookPluginServer::new(
-                        im_hook_plugin,
-                    );
 
                 // ExtensionPlugin.Call: the Cell-signed `x-flare-ctx` is the only identity. Anonymous
                 // admission answers the health check alone; without a key set the router is served
@@ -203,9 +179,12 @@ impl ApplicationBootstrap {
                 let capability_service = ContextLayer::new()
                     .allow_missing()
                     .layer(
+                        // Administer carries plugin packages: up to 32 MiB of raw bytes.
                         flare_grpc_proto::capability::capability_service_server::CapabilityServiceServer::new(
                             capability_grpc,
-                        ),
+                        )
+                        .max_decoding_message_size(48 * 1024 * 1024)
+                        .max_encoding_message_size(48 * 1024 * 1024),
                     );
 
                 let capability_admin_service = ContextLayer::new().allow_missing().layer(
@@ -224,11 +203,10 @@ impl ApplicationBootstrap {
 
                 info!(
                     tenant_projection = tenant_projection_service.is_some(),
-                    "HookPlugin + ExtensionPlugin (router) + CapabilityService registered"
+                    "ExtensionPlugin (router) + CapabilityService registered"
                 );
                 let server = Server::builder()
                     .layer(grpc_metrics)
-                    .add_service(hook_plugin_service)
                     .add_optional_service(extension_plugin_signed)
                     .add_optional_service(extension_plugin_unverified)
                     .add_service(capability_service)
@@ -275,14 +253,6 @@ impl ApplicationBootstrap {
             })
             .await
             .map_err(flare_server_core::error::FlareError::from)
-    }
-}
-
-fn default_config_center(explicit: Option<String>, static_registry: bool) -> Option<String> {
-    match explicit {
-        Some(endpoint) => Some(endpoint),
-        None if static_registry => None,
-        None => Some("consul://localhost:28500".to_string()),
     }
 }
 
@@ -350,23 +320,6 @@ fn capability_config_from_env(
         .or_else(|| postgres_profile.and_then(|p| p.max_lifetime_seconds))
         .unwrap_or(1800);
 
-    // Config center is Consul (see deploy/docker-compose.yml: Consul serves both service
-    // registry and config center); there is no etcd in the deployment. Defaulting to the
-    // stale etcd endpoint caused the config watcher to fail every 60s with "tcp connect error".
-    // Explicit static mode has no Consul at all: only an explicitly configured config
-    // center is used, otherwise the watcher polls a nonexistent localhost agent forever.
-    let explicit_endpoint = std::env::var("CONFIG_CENTER_ENDPOINT")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let config_center_endpoint =
-        default_config_center(explicit_endpoint, app_config.uses_static_registry());
-
-    let tenant_id = std::env::var("TENANT_ID").ok();
-    let config_file = std::env::var("CONFIG_FILE")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| Some(std::path::PathBuf::from("config/hooks.toml")));
     let runtime_config_file = std::env::var("CAPABILITY_RUNTIME_CONFIG_FILE")
         .ok()
         .map(std::path::PathBuf::from)
@@ -393,7 +346,6 @@ fn capability_config_from_env(
     );
 
     Ok(CapabilityServiceConfig {
-        config_file,
         runtime_config_file,
         database_url,
         postgres_max_connections,
@@ -401,32 +353,10 @@ fn capability_config_from_env(
         postgres_acquire_timeout_seconds,
         postgres_idle_timeout_seconds,
         postgres_max_lifetime_seconds,
-        config_center_endpoint,
-        tenant_id,
-        execution_mode: ExecutionMode::Sequential,
-        refresh_interval_secs: 60,
         notice_redis_url,
         notice_channel,
         notice_publishers,
     })
-}
-
-#[cfg(test)]
-mod config_center_tests {
-    use super::default_config_center;
-
-    #[test]
-    fn static_registry_uses_only_an_explicit_config_center() {
-        assert_eq!(default_config_center(None, true), None);
-        assert_eq!(
-            default_config_center(Some("consul://consul:8500".into()), true).as_deref(),
-            Some("consul://consul:8500")
-        );
-        assert_eq!(
-            default_config_center(None, false).as_deref(),
-            Some("consul://localhost:28500")
-        );
-    }
 }
 
 #[cfg(test)]

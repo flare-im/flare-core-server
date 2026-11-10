@@ -34,6 +34,15 @@ pub fn to_proto_file_info(metadata: &MediaFileMetadata) -> flare_grpc_proto::med
         grace_expires_at: metadata.grace_expires_at.map(to_proto_timestamp),
         bucket,
         object_key,
+        owner_kind: match metadata.owner_kind {
+            crate::domain::model::MediaOwnerKind::User => 1,
+            crate::domain::model::MediaOwnerKind::Application => 2,
+        },
+        purpose: match metadata.purpose {
+            crate::domain::model::MediaPurpose::General => 0,
+            crate::domain::model::MediaPurpose::Avatar => 1,
+            crate::domain::model::MediaPurpose::Image => 2,
+        },
     }
 }
 

@@ -1,19 +1,19 @@
 //! Hook 治理路由（`/hooks/**`）的 HTTP 契约，以及与 `CapabilityService.Administer` 载荷
 //! （`flare.capability.v1.*HookConfig*` 消息）的双向映射。
 //!
-//! 租户永远来自已验签的 Staff 上下文：创建与列表请求的 `tenant_id` 由网关填入，调用方给的
-//! 一律忽略；按 hook_id 的操作由 Capability 先核对该配置的租户。时间统一为 Unix 毫秒；枚举
-//! `HookPoint` 用 proto 的名字（如 `HOOK_POINT_MESSAGE_PRE_SEND`），未知名字拒绝。webhook
-//! 的签名密钥只进不出：读回的传输配置不含 `secret`，只说明是否已配置。
+//! 一条 Hook = 一个点位（`hook_type`）+ 一个目标，加名称、选择器、`order`、`required` 和超时。
+//! 范围永远来自已验签的 Staff 上下文：`/hooks/**` 是签名里的应用，`/platform/hooks/**` 是平台
+//! （`tenant_id` 为空），调用方给的一律忽略；按 hook_id 的操作由 Capability 先核对该配置的范围。时间
+//! 统一为 Unix 毫秒。webhook 的签名密钥只进不出：读回的传输配置不含 `secret`，只说明是否已配置。
 
 use std::collections::HashMap;
 
-use base64::Engine as _;
 use flare_grpc_proto::capability::{
-    CreateHookConfigRequest, DeleteHookConfigResponse, GetHookStatisticsRequest, HookConfig,
-    HookExecution, HookExtensionBag, HookPoint, HookRetryPolicy, HookSelector, HookStatistics,
-    HookTransport, ListHookConfigsRequest, ListHookConfigsResponse, QueryHookExecutionsRequest,
-    QueryHookExecutionsResponse, SetHookStatusRequest, SetHookStatusResponse,
+    CreateHookConfigRequest, DeleteHookConfigResponse, DeploymentHook, GetHookStatisticsRequest,
+    HookConfig, HookExecution, HookPointEntry, HookProfile, HookSelector, HookStatistics,
+    HookTransport, ListHookConfigsRequest, ListHookConfigsResponse, ListHookPointsResponse,
+    ListHookProfilesResponse, QueryHookExecutionsRequest, QueryHookExecutionsResponse,
+    SetHookStatusRequest, SetHookStatusResponse, TestHookConfigRequest, TestHookConfigResponse,
     UpdateHookConfigRequest,
 };
 use flare_proto::common::{Pagination, TimeRange};
@@ -23,6 +23,9 @@ use utoipa::ToSchema;
 /// 列表与执行记录的页大小：缺省 100，上限 1000（Capability 同样截到 1000）。
 pub const DEFAULT_HOOK_PAGE: i32 = 100;
 pub const MAX_HOOK_PAGE: i32 = 1000;
+
+/// 平台范围的 `tenant_id`。
+pub const PLATFORM_TENANT: &str = "";
 
 /// `Administer` 的 operation 名。
 pub mod operation {
@@ -34,6 +37,9 @@ pub mod operation {
     pub const SET_STATUS: &str = "flare.extension.v1.hook_config.set_status";
     pub const GET_STATISTICS: &str = "flare.extension.v1.hook_config.get_statistics";
     pub const QUERY_EXECUTIONS: &str = "flare.extension.v1.hook_config.query_executions";
+    pub const TEST: &str = "flare.extension.v1.hook_config.test";
+    pub const POINT_LIST: &str = "flare.extension.v1.hook_point.list";
+    pub const PROFILE_LIST: &str = "flare.extension.v1.hook_profile.list";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +58,7 @@ fn invalid(code: &'static str, message: impl Into<String>) -> AdminHookArgError 
 /// 传输配置。读回时 `secret` 不出网关：`secret_configured` 说明 Capability 持有的配置里有无签名密钥。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct AdminHookTransportHttp {
-    /// `grpc` / `webhook` / `local`
+    /// `grpc` / `webhook`
     #[serde(rename = "type", default)]
     pub transport_type: String,
     #[serde(default)]
@@ -73,15 +79,14 @@ pub struct AdminHookTransportHttp {
     pub secret_configured: Option<bool>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    #[serde(default)]
-    pub target: String,
-    /// 毫秒，0 = Capability 缺省（5000）。
+    /// 这条 Hook 的超时，毫秒，1 到 30000。
     #[serde(default)]
     pub timeout_ms: i32,
     #[serde(default)]
     pub metadata: HashMap<String, String>,
 }
 
+/// 运行时实际判断的三个字段，空表示全部。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct AdminHookSelectorHttp {
     #[serde(default)]
@@ -90,43 +95,6 @@ pub struct AdminHookSelectorHttp {
     pub conversation_types: Vec<String>,
     #[serde(default)]
     pub message_types: Vec<String>,
-    #[serde(default)]
-    pub business_types: Vec<String>,
-    /// `HookPoint` 名字，如 `HOOK_POINT_MESSAGE_PRE_SEND`。
-    #[serde(default)]
-    pub hook_points: Vec<String>,
-    #[serde(default)]
-    pub app_ids: Vec<String>,
-    #[serde(default)]
-    pub conversation_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct AdminHookRetryPolicyHttp {
-    #[serde(default)]
-    pub max_retries: i32,
-    #[serde(default)]
-    pub retry_interval_ms: i32,
-    /// `exponential` / `linear`
-    #[serde(default)]
-    pub backoff_strategy: String,
-}
-
-/// `google.protobuf.Any`：类型地址与 base64 编码的原始字节。
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct AdminProtoAnyHttp {
-    pub type_url: String,
-    pub value_base64: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct AdminHookExtensionBagHttp {
-    #[serde(default)]
-    pub contract_version: u32,
-    #[serde(default)]
-    pub attributes: HashMap<String, String>,
-    #[serde(default)]
-    pub extensions: HashMap<String, AdminProtoAnyHttp>,
 }
 
 /// 一条 Hook 配置（读回形状）。
@@ -135,17 +103,18 @@ pub struct AdminHookHttp {
     pub hook_id: String,
     pub name: String,
     pub hook_type: String,
+    /// 应用 ID；空为平台 Hook。
     pub tenant_id: String,
-    pub priority: i32,
+    /// 同一来源内的先后，0 到 1000，小的先执行。
+    pub order: i32,
+    /// 必需：目标不可用时回可重试的 503；否则跳过。
+    pub required: bool,
     pub enabled: bool,
     pub transport: Option<AdminHookTransportHttp>,
     pub selector: Option<AdminHookSelectorHttp>,
-    pub retry_policy: Option<AdminHookRetryPolicyHttp>,
     /// Unix 毫秒。
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
-    pub hook_points: Vec<String>,
-    pub config_extensions: Option<AdminHookExtensionBagHttp>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -178,35 +147,33 @@ pub struct AdminHookCreateHttpRequest {
     pub name: String,
     pub hook_type: String,
     #[serde(default)]
-    pub priority: i32,
+    pub order: i32,
+    /// 缺省为必需。
+    #[serde(default = "required_by_default")]
+    pub required: bool,
     #[serde(default)]
     pub transport: Option<AdminHookTransportHttp>,
     #[serde(default)]
     pub selector: Option<AdminHookSelectorHttp>,
-    #[serde(default)]
-    pub retry_policy: Option<AdminHookRetryPolicyHttp>,
-    #[serde(default)]
-    pub hook_points: Vec<String>,
-    #[serde(default)]
-    pub config_extensions: Option<AdminHookExtensionBagHttp>,
 }
 
+fn required_by_default() -> bool {
+    true
+}
+
+/// 没给的字段不变。
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct AdminHookUpdateHttpRequest {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
-    pub priority: i32,
+    pub order: Option<i32>,
+    #[serde(default)]
+    pub required: Option<bool>,
     #[serde(default)]
     pub transport: Option<AdminHookTransportHttp>,
     #[serde(default)]
     pub selector: Option<AdminHookSelectorHttp>,
-    #[serde(default)]
-    pub retry_policy: Option<AdminHookRetryPolicyHttp>,
-    #[serde(default)]
-    pub hook_points: Vec<String>,
-    #[serde(default)]
-    pub config_extensions: Option<AdminHookExtensionBagHttp>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -285,6 +252,73 @@ pub struct AdminHookExecutionsPageHttp {
     pub has_more: bool,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminHookPointHttp {
+    /// 对外的点位名，如 `message.pre_send`。
+    pub id: String,
+    /// 存储名，创建时的 `hook_type`。
+    pub hook_type: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminHookPointsHttp {
+    pub points: Vec<AdminHookPointHttp>,
+}
+
+/// 部署文件里的一条 Hook，只读。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminDeploymentHookHttp {
+    pub name: String,
+    pub hook_type: String,
+    pub description: String,
+    pub enabled: bool,
+    pub order: i32,
+    pub required: bool,
+    pub timeout_ms: i64,
+    /// `grpc` / `webhook` / `local`
+    pub target_type: String,
+    pub target_endpoint: String,
+    pub selector: Option<AdminHookSelectorHttp>,
+}
+
+/// 一个服务装载的部署 Hook。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminHookProfileHttp {
+    pub service: String,
+    pub source: String,
+    pub instance_id: String,
+    /// Unix 毫秒。
+    pub loaded_at: Option<i64>,
+    pub hooks: Vec<AdminDeploymentHookHttp>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminHookProfilesHttp {
+    pub profiles: Vec<AdminHookProfileHttp>,
+}
+
+/// 测试调用：给 `hook_id` 测已存的目标，`transport` 测一个还没保存的目标；都给时目标变了就不沿用
+/// 已存的密钥和请求头。
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct AdminHookTestHttpRequest {
+    #[serde(default)]
+    pub hook_id: String,
+    #[serde(default)]
+    pub hook_type: String,
+    #[serde(default)]
+    pub transport: Option<AdminHookTransportHttp>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AdminHookTestHttp {
+    /// `allowed` / `rewritten` / `rejected` / `identity_required` / `failed`
+    pub outcome: String,
+    pub latency_ms: i64,
+    /// 目标给的拒绝原因码，或失败类别（`timeout`、`unavailable`、`bad_response`）。
+    pub code: String,
+}
+
 fn timestamp_ms(ts: &prost_types::Timestamp) -> i64 {
     ts.seconds
         .saturating_mul(1000)
@@ -303,32 +337,8 @@ pub fn hook_page_limit(requested: Option<i32>) -> Result<i32, AdminHookArgError>
     }
 }
 
-fn hook_points_from_http(names: &[String]) -> Result<Vec<i32>, AdminHookArgError> {
-    names
-        .iter()
-        .map(|name| {
-            HookPoint::from_str_name(name)
-                .map(|point| point as i32)
-                .ok_or_else(|| {
-                    invalid(
-                        "ADMIN_HOOK_POINT_INVALID",
-                        format!("unknown hook point {name}"),
-                    )
-                })
-        })
-        .collect()
-}
-
-fn hook_points_to_http(points: &[i32]) -> Vec<String> {
-    points
-        .iter()
-        .map(|point| {
-            HookPoint::try_from(*point)
-                .map(|point| point.as_str_name().to_string())
-                .unwrap_or_else(|_| format!("HOOK_POINT_{point}"))
-        })
-        .collect()
-}
+/// Capability 读回时在 `transport.metadata` 里说明签名密钥是否已设置的键。
+const SECRET_CONFIGURED_KEY: &str = "signing_secret_configured";
 
 fn transport_from_http(transport: AdminHookTransportHttp) -> HookTransport {
     HookTransport {
@@ -340,13 +350,16 @@ fn transport_from_http(transport: AdminHookTransportHttp) -> HookTransport {
         load_balance: transport.load_balance,
         secret: transport.secret.unwrap_or_default(),
         headers: transport.headers,
-        target: transport.target,
         timeout_ms: transport.timeout_ms,
         metadata: transport.metadata,
     }
 }
 
 fn transport_to_http(transport: HookTransport) -> AdminHookTransportHttp {
+    let secret_configured = transport
+        .metadata
+        .get(SECRET_CONFIGURED_KEY)
+        .is_some_and(|value| value == "true");
     AdminHookTransportHttp {
         transport_type: transport.r#type,
         service_name: transport.service_name,
@@ -355,24 +368,19 @@ fn transport_to_http(transport: HookTransport) -> AdminHookTransportHttp {
         namespace: transport.namespace,
         load_balance: transport.load_balance,
         secret: None,
-        secret_configured: Some(!transport.secret.is_empty()),
+        secret_configured: Some(secret_configured),
         headers: HashMap::new(),
-        target: transport.target,
         timeout_ms: transport.timeout_ms,
         metadata: HashMap::new(),
     }
 }
 
-fn selector_from_http(selector: AdminHookSelectorHttp) -> Result<HookSelector, AdminHookArgError> {
-    Ok(HookSelector {
+fn selector_from_http(selector: AdminHookSelectorHttp) -> HookSelector {
+    HookSelector {
         tenants: selector.tenants,
         conversation_types: selector.conversation_types,
         message_types: selector.message_types,
-        business_types: selector.business_types,
-        hook_points: hook_points_from_http(&selector.hook_points)?,
-        app_ids: selector.app_ids,
-        conversation_ids: selector.conversation_ids,
-    })
+    }
 }
 
 fn selector_to_http(selector: HookSelector) -> AdminHookSelectorHttp {
@@ -380,74 +388,6 @@ fn selector_to_http(selector: HookSelector) -> AdminHookSelectorHttp {
         tenants: selector.tenants,
         conversation_types: selector.conversation_types,
         message_types: selector.message_types,
-        business_types: selector.business_types,
-        hook_points: hook_points_to_http(&selector.hook_points),
-        app_ids: selector.app_ids,
-        conversation_ids: selector.conversation_ids,
-    }
-}
-
-fn retry_policy_from_http(policy: AdminHookRetryPolicyHttp) -> HookRetryPolicy {
-    HookRetryPolicy {
-        max_retries: policy.max_retries,
-        retry_interval_ms: policy.retry_interval_ms,
-        backoff_strategy: policy.backoff_strategy,
-    }
-}
-
-fn retry_policy_to_http(policy: HookRetryPolicy) -> AdminHookRetryPolicyHttp {
-    AdminHookRetryPolicyHttp {
-        max_retries: policy.max_retries,
-        retry_interval_ms: policy.retry_interval_ms,
-        backoff_strategy: policy.backoff_strategy,
-    }
-}
-
-fn extensions_from_http(
-    bag: AdminHookExtensionBagHttp,
-) -> Result<HookExtensionBag, AdminHookArgError> {
-    let mut extensions = HashMap::new();
-    for (key, any) in bag.extensions {
-        let value = base64::engine::general_purpose::STANDARD
-            .decode(any.value_base64.as_bytes())
-            .map_err(|_| {
-                invalid(
-                    "ADMIN_HOOK_EXTENSION_INVALID",
-                    format!("extension {key} is not base64"),
-                )
-            })?;
-        extensions.insert(
-            key,
-            prost_types::Any {
-                type_url: any.type_url,
-                value,
-            },
-        );
-    }
-    Ok(HookExtensionBag {
-        contract_version: bag.contract_version,
-        attributes: bag.attributes,
-        extensions,
-    })
-}
-
-fn extensions_to_http(bag: HookExtensionBag) -> AdminHookExtensionBagHttp {
-    AdminHookExtensionBagHttp {
-        contract_version: bag.contract_version,
-        attributes: bag.attributes,
-        extensions: bag
-            .extensions
-            .into_iter()
-            .map(|(key, any)| {
-                (
-                    key,
-                    AdminProtoAnyHttp {
-                        type_url: any.type_url,
-                        value_base64: base64::engine::general_purpose::STANDARD.encode(any.value),
-                    },
-                )
-            })
-            .collect(),
     }
 }
 
@@ -457,15 +397,13 @@ pub fn hook_http(config: HookConfig) -> AdminHookHttp {
         name: config.name,
         hook_type: config.hook_type,
         tenant_id: config.tenant_id,
-        priority: config.priority,
+        order: config.order,
+        required: config.required,
         enabled: config.enabled,
         transport: config.transport.map(transport_to_http),
         selector: config.selector.map(selector_to_http),
-        retry_policy: config.retry_policy.map(retry_policy_to_http),
         created_at: config.created_at.as_ref().map(timestamp_ms),
         updated_at: config.updated_at.as_ref().map(timestamp_ms),
-        hook_points: hook_points_to_http(&config.hook_points),
-        config_extensions: config.config_extensions.map(extensions_to_http),
     }
 }
 
@@ -483,35 +421,98 @@ pub fn build_create_request(
         name: request.name,
         hook_type: request.hook_type,
         tenant_id: tenant_id.to_string(),
-        priority: request.priority,
+        order: request.order,
+        required: request.required,
         transport: request.transport.map(transport_from_http),
-        selector: request.selector.map(selector_from_http).transpose()?,
-        retry_policy: request.retry_policy.map(retry_policy_from_http),
-        hook_points: hook_points_from_http(&request.hook_points)?,
-        config_extensions: request
-            .config_extensions
-            .map(extensions_from_http)
-            .transpose()?,
+        selector: request.selector.map(selector_from_http),
     })
 }
 
 pub fn build_update_request(
     hook_id: &str,
     request: AdminHookUpdateHttpRequest,
-) -> Result<UpdateHookConfigRequest, AdminHookArgError> {
-    Ok(UpdateHookConfigRequest {
+) -> UpdateHookConfigRequest {
+    UpdateHookConfigRequest {
         hook_id: hook_id.to_string(),
         name: request.name,
-        priority: request.priority,
+        order: request.order,
+        required: request.required,
         transport: request.transport.map(transport_from_http),
-        selector: request.selector.map(selector_from_http).transpose()?,
-        retry_policy: request.retry_policy.map(retry_policy_from_http),
-        hook_points: hook_points_from_http(&request.hook_points)?,
-        config_extensions: request
-            .config_extensions
-            .map(extensions_from_http)
-            .transpose()?,
+        selector: request.selector.map(selector_from_http),
+    }
+}
+
+pub fn build_test_request(
+    request: AdminHookTestHttpRequest,
+) -> Result<TestHookConfigRequest, AdminHookArgError> {
+    if request.hook_id.is_empty() && request.transport.is_none() {
+        return Err(invalid(
+            "ADMIN_HOOK_TARGET_REQUIRED",
+            "hook_id or transport is required",
+        ));
+    }
+    Ok(TestHookConfigRequest {
+        hook_id: request.hook_id,
+        hook_type: request.hook_type,
+        transport: request.transport.map(transport_from_http),
     })
+}
+
+pub fn test_http(response: TestHookConfigResponse) -> AdminHookTestHttp {
+    AdminHookTestHttp {
+        outcome: response.outcome,
+        latency_ms: response.latency_ms,
+        code: response.code,
+    }
+}
+
+fn point_http(point: HookPointEntry) -> AdminHookPointHttp {
+    AdminHookPointHttp {
+        id: point.id,
+        hook_type: point.hook_type,
+        summary: point.summary,
+    }
+}
+
+pub fn points_http(response: ListHookPointsResponse) -> AdminHookPointsHttp {
+    AdminHookPointsHttp {
+        points: response.points.into_iter().map(point_http).collect(),
+    }
+}
+
+fn deployment_hook_http(hook: DeploymentHook) -> AdminDeploymentHookHttp {
+    AdminDeploymentHookHttp {
+        name: hook.name,
+        hook_type: hook.hook_type,
+        description: hook.description,
+        enabled: hook.enabled,
+        order: hook.order,
+        required: hook.required,
+        timeout_ms: hook.timeout_ms,
+        target_type: hook.target_type,
+        target_endpoint: hook.target_endpoint,
+        selector: hook.selector.map(selector_to_http),
+    }
+}
+
+fn profile_http(profile: HookProfile) -> AdminHookProfileHttp {
+    AdminHookProfileHttp {
+        service: profile.service,
+        source: profile.source,
+        instance_id: profile.instance_id,
+        loaded_at: profile.loaded_at.as_ref().map(timestamp_ms),
+        hooks: profile
+            .hooks
+            .into_iter()
+            .map(deployment_hook_http)
+            .collect(),
+    }
+}
+
+pub fn profiles_http(response: ListHookProfilesResponse) -> AdminHookProfilesHttp {
+    AdminHookProfilesHttp {
+        profiles: response.profiles.into_iter().map(profile_http).collect(),
+    }
 }
 
 pub fn build_list_request(
@@ -680,12 +681,12 @@ pub fn executions_page_http(
 mod tests {
     use super::*;
 
-    #[test]
-    fn create_requests_take_the_tenant_from_the_caller_and_validate_names() {
-        let request = AdminHookCreateHttpRequest {
+    fn create_body() -> AdminHookCreateHttpRequest {
+        AdminHookCreateHttpRequest {
             name: "dlp".into(),
-            hook_type: "message_pre_send".into(),
-            priority: 10,
+            hook_type: "pre_send".into(),
+            order: 10,
+            required: false,
             transport: Some(AdminHookTransportHttp {
                 transport_type: "webhook".into(),
                 endpoint: "https://hooks.example/dlp".into(),
@@ -693,62 +694,58 @@ mod tests {
                 ..Default::default()
             }),
             selector: Some(AdminHookSelectorHttp {
-                hook_points: vec!["HOOK_POINT_MESSAGE_PRE_SEND".into()],
+                message_types: vec!["text".into()],
                 ..Default::default()
             }),
-            retry_policy: None,
-            hook_points: vec!["HOOK_POINT_MESSAGE_PRE_SEND".into()],
-            config_extensions: Some(AdminHookExtensionBagHttp {
-                contract_version: 1,
-                attributes: HashMap::from([("k".to_string(), "v".to_string())]),
-                extensions: HashMap::from([(
-                    "x".to_string(),
-                    AdminProtoAnyHttp {
-                        type_url: "type.googleapis.com/google.protobuf.Empty".into(),
-                        value_base64: "AQI=".into(),
-                    },
-                )]),
-            }),
-        };
-        let proto = build_create_request("tenant-a", request).unwrap();
-        assert_eq!(proto.tenant_id, "tenant-a");
-        assert_eq!(proto.hook_points, vec![HookPoint::MessagePreSend as i32]);
+        }
+    }
+
+    #[test]
+    fn create_requests_take_the_scope_from_the_caller_and_validate_names() {
+        let proto = build_create_request(PLATFORM_TENANT, create_body()).unwrap();
+        assert_eq!(proto.tenant_id, "");
+        assert_eq!(proto.order, 10);
+        assert!(!proto.required);
         assert_eq!(proto.transport.as_ref().unwrap().secret, "s3cret");
-        assert_eq!(
-            proto.config_extensions.as_ref().unwrap().extensions["x"].value,
-            vec![1, 2]
-        );
+        assert_eq!(proto.selector.unwrap().message_types, vec!["text"]);
 
         let unnamed = AdminHookCreateHttpRequest {
             name: " ".into(),
-            hook_type: "message_pre_send".into(),
-            priority: 0,
-            transport: None,
-            selector: None,
-            retry_policy: None,
-            hook_points: Vec::new(),
-            config_extensions: None,
+            ..create_body()
         };
         assert_eq!(
-            build_create_request("tenant-a", unnamed).unwrap_err().code,
-            "ADMIN_HOOK_NAME_REQUIRED"
-        );
-        let bad_point = AdminHookCreateHttpRequest {
-            name: "dlp".into(),
-            hook_type: "message_pre_send".into(),
-            priority: 0,
-            transport: None,
-            selector: None,
-            retry_policy: None,
-            hook_points: vec!["pre_send".into()],
-            config_extensions: None,
-        };
-        assert_eq!(
-            build_create_request("tenant-a", bad_point)
+            build_create_request(PLATFORM_TENANT, unnamed)
                 .unwrap_err()
                 .code,
-            "ADMIN_HOOK_POINT_INVALID"
+            "ADMIN_HOOK_NAME_REQUIRED"
         );
+    }
+
+    /// 缺省必需；已删的字段不再是请求的一部分，写了也不进 proto。
+    #[test]
+    fn a_hook_is_required_unless_it_says_otherwise() {
+        let body: AdminHookCreateHttpRequest =
+            serde_json::from_str(r#"{"name":"a","hook_type":"pre_send"}"#).unwrap();
+        assert!(body.required);
+        let update: AdminHookUpdateHttpRequest = serde_json::from_str(r#"{"order":0}"#).unwrap();
+        let update = build_update_request("7", update);
+        assert_eq!(update.order, Some(0));
+        assert_eq!(update.required, None);
+    }
+
+    #[test]
+    fn a_test_call_needs_a_target() {
+        assert_eq!(
+            build_test_request(AdminHookTestHttpRequest::default())
+                .unwrap_err()
+                .code,
+            "ADMIN_HOOK_TARGET_REQUIRED"
+        );
+        let saved = AdminHookTestHttpRequest {
+            hook_id: "7".into(),
+            ..Default::default()
+        };
+        assert_eq!(build_test_request(saved).unwrap().hook_id, "7");
     }
 
     #[test]
@@ -764,37 +761,36 @@ mod tests {
         let hook = hook_http(HookConfig {
             hook_id: "7".into(),
             name: "dlp".into(),
-            hook_type: "message_pre_send".into(),
-            tenant_id: "tenant-a".into(),
-            priority: 10,
+            hook_type: "pre_send".into(),
+            tenant_id: "".into(),
+            order: 10,
+            required: true,
             enabled: true,
             transport: Some(HookTransport {
                 r#type: "webhook".into(),
                 secret: "s3cret".into(),
                 headers: HashMap::from([("authorization".into(), "header-canary".into())]),
-                metadata: HashMap::from([("x-api-key".into(), "metadata-canary".into())]),
+                metadata: HashMap::from([
+                    ("x-api-key".into(), "metadata-canary".into()),
+                    (SECRET_CONFIGURED_KEY.into(), "true".into()),
+                ]),
                 ..Default::default()
             }),
             selector: None,
-            retry_policy: None,
             created_at: Some(prost_types::Timestamp {
                 seconds: 1_700_000_000,
                 nanos: 250_000_000,
             }),
             updated_at: None,
-            hook_points: vec![HookPoint::MessagePreSend as i32, 999],
-            config_extensions: None,
         });
+        assert_eq!(hook.order, 10);
+        assert!(hook.required);
         let transport = hook.transport.unwrap();
         assert_eq!(transport.secret, None);
         assert_eq!(transport.secret_configured, Some(true));
         assert!(transport.headers.is_empty());
         assert!(transport.metadata.is_empty());
         assert_eq!(hook.created_at, Some(1_700_000_000_250));
-        assert_eq!(
-            hook.hook_points,
-            vec!["HOOK_POINT_MESSAGE_PRE_SEND", "HOOK_POINT_999"]
-        );
         let json = serde_json::to_string(&transport).unwrap();
         assert!(!json.contains("s3cret"));
         assert!(!json.contains("canary"));
@@ -812,7 +808,7 @@ mod tests {
         let (list, limit) = build_list_request(
             "tenant-a",
             &AdminHookListQuery {
-                hook_type: Some("message_pre_send".into()),
+                hook_type: Some("pre_send".into()),
                 enabled_only: Some(true),
                 limit: Some(20),
             },

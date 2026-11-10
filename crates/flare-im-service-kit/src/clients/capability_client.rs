@@ -15,11 +15,9 @@ use crate::staff_context::staff_context_request;
 use flare_grpc_proto::capability::capability_admin_service_client::CapabilityAdminServiceClient;
 use flare_grpc_proto::capability::capability_service_client::CapabilityServiceClient;
 use flare_grpc_proto::capability::{
-    DeregisterPluginEndpointRequest, DeregisterPluginEndpointResponse, GenericRequest,
-    GenericResponse, GetTenantRuntimeRequest, GetTenantRuntimeResponse, ListCapabilitiesRequest,
+    GenericRequest, GenericResponse, GetTenantRuntimeRequest, GetTenantRuntimeResponse, ListCapabilitiesRequest,
     ListCapabilitiesResponse, ListRegisteredPluginsRequest, ListRegisteredPluginsResponse,
     ListTenantCapabilitySwitchesRequest, ListTenantCapabilitySwitchesResponse,
-    RegisterPluginEndpointRequest, RegisterPluginEndpointResponse,
     SetTenantCapabilitySwitchRequest, SetTenantCapabilitySwitchResponse,
 };
 
@@ -150,35 +148,9 @@ impl CapabilityAdminClientWrapper {
         Ok(response.into_inner())
     }
 
-    /// 登记一个扩展插件实例（仅平台员工，`core:plugins:write`）。
-    pub async fn register_plugin_endpoint(
-        &mut self,
-        staff_token: &str,
-        request: RegisterPluginEndpointRequest,
-    ) -> Result<RegisterPluginEndpointResponse> {
-        let response = self
-            .service
-            .register_plugin_endpoint(staff_context_request(request, staff_token)?)
-            .await?;
-        Ok(response.into_inner())
-    }
-
-    /// 注销一个扩展插件实例（仅平台员工，`core:plugins:write`）。
-    pub async fn deregister_plugin_endpoint(
-        &mut self,
-        staff_token: &str,
-        request: DeregisterPluginEndpointRequest,
-    ) -> Result<DeregisterPluginEndpointResponse> {
-        let response = self
-            .service
-            .deregister_plugin_endpoint(staff_context_request(request, staff_token)?)
-            .await?;
-        Ok(response.into_inner())
-    }
-
-    /// 一次 Hook 治理操作：`operation` 是 `flare.extension.v1.hook_config.*`，`payload` 是对应
-    /// 请求消息（打包成 `Any`，类型名 `flare.capability.v1.<Request>`）。读操作要求
-    /// `core:hooks:read`，写操作 `core:hooks:write`，由 Capability 按 operation 复核。
+    /// 一次 Hook 治理操作：`operation` 是 `flare.extension.v1.hook_*`，`payload` 是对应请求消息
+    /// （打包成 `Any`，类型名 `flare.capability.v1.<Request>`）。读操作要求 `core:hooks:read`，写操作
+    /// 要求 `core:hooks:write` 或 `core:hooks:platform:write`，由 Capability 按 operation 和范围复核。
     pub async fn administer<P: Message>(
         &mut self,
         staff_token: &str,

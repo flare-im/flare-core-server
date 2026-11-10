@@ -21,6 +21,9 @@ use std::collections::HashMap;
 use tonic::Code;
 use tonic::transport::Channel;
 
+#[path = "admin_upload_tests.rs"]
+mod admin_upload_tests;
+
 fn keys(seed: u8) -> (SignedContextSigner, SignedContextVerifier) {
     let key = SigningKey::from_bytes(&[seed; 32]);
     let private = key.to_pkcs8_pem(Default::default()).unwrap();
@@ -48,17 +51,26 @@ impl Drop for Harness {
 }
 
 async fn serve() -> Harness {
+    serve_with(None, Vec::new()).await
+}
+
+async fn serve_with(
+    objects: Option<crate::domain::repository::ObjectRepositoryRef>,
+    validators: Vec<String>,
+) -> Harness {
     let (signer, verifier) = keys(71);
     let metadata = Arc::new(Metadata::default());
     let chunks = std::env::temp_dir().join(format!("flare-media-auth-{}", uuid::Uuid::new_v4()));
+    let mut config = MediaDomainConfig::new(3600, None, 60, chunks.clone(), 3600, 8 * 1024 * 1024);
+    config.application_media_validators = validators;
     let service = Arc::new(MediaService::new(
-        None,
+        objects,
         Some(metadata.clone()),
         None,
         None,
         Some(Arc::new(Sessions::default())),
         Some(Arc::new(Files::default())),
-        MediaDomainConfig::new(3600, None, 60, chunks.clone(), 3600, 8 * 1024 * 1024),
+        config,
     ));
     let handler = MediaGrpcHandler::new(
         Arc::new(MediaCommandHandler::new(service.clone())),

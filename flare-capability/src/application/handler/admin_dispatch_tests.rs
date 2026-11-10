@@ -1,7 +1,7 @@
 use super::*;
 use crate::application::handler::plugin_state::PluginStatePublisher;
 use crate::application::handler::plugin_state::tests::{
-    MemoryBindings, POLL_MANIFEST, RecordingSink, poll_snapshot, publisher,
+    MemoryBindings, POLL_MANIFEST, RecordingSink, poll_snapshot, publisher, with_manifest,
 };
 use crate::application::handler::plugin_test_server::PluginServer;
 use crate::domain::repository::PluginAuthorizationReader;
@@ -96,19 +96,23 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
         Ok(self
             .0
             .lock()
             .unwrap()
             .clone()
-            .filter(|s| s.tenant_id == tenant))
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
 
 #[derive(Clone, Copy)]
 enum ProjectionReadTiming {
     Renewed,
+    /// Renewed by an issuer whose clock runs 2.85 s ahead of Core's (seen on the full stack).
+    RenewedByIssuerAhead,
+    /// A start beyond the clock skew Core tolerates.
     FutureGrant,
     ExpiredSnapshot,
     ExpiredGrant,
@@ -124,7 +128,7 @@ impl PluginAuthorizationReader for ProjectionChangingDuringRead {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
         if tenant != self.snapshot.tenant_id {
             return Ok(None);
         }
@@ -150,7 +154,19 @@ impl PluginAuthorizationReader for ProjectionChangingDuringRead {
         grant.valid_until_ms = snapshot.valid_until_ms;
         match self.timing {
             ProjectionReadTiming::Renewed => {}
-            ProjectionReadTiming::FutureGrant => grant.valid_from_ms += 5_000,
+            ProjectionReadTiming::RenewedByIssuerAhead => {
+                snapshot.issued_at_ms += 2_850;
+                snapshot.valid_until_ms += 2_850;
+                grant.valid_from_ms = snapshot.issued_at_ms;
+                grant.valid_until_ms = snapshot.valid_until_ms;
+            }
+            ProjectionReadTiming::FutureGrant => {
+                use flare_im_capability_core::plugin::authorization::CLOCK_SKEW_MARGIN_MS;
+                // The lease must outlast the late start, or the snapshot itself is refused.
+                snapshot.valid_until_ms = completed_at + 120_000;
+                grant.valid_until_ms = snapshot.valid_until_ms;
+                grant.valid_from_ms += CLOCK_SKEW_MARGIN_MS + 5_000;
+            }
             ProjectionReadTiming::ExpiredSnapshot | ProjectionReadTiming::ExpiredGrant => {
                 snapshot.issued_at_ms = entered_at - 1_000;
                 grant.valid_from_ms = snapshot.issued_at_ms;
@@ -160,7 +176,7 @@ impl PluginAuthorizationReader for ProjectionChangingDuringRead {
                 }
             }
         }
-        Ok(Some(snapshot))
+        Ok(Some(Arc::new(snapshot)))
     }
 }
 
@@ -320,6 +336,23 @@ async fn admin_projection_renewed_during_read_is_effective_when_read_completes()
 }
 
 #[tokio::test]
+async fn admin_projection_issued_ahead_of_core_clock_is_effective() {
+    let h = projection_read_harness(ProjectionReadTiming::RenewedByIssuerAhead).await;
+    let result = dispatch_admin(
+        &staff(READ),
+        &h.routes,
+        AdminCall::Query,
+        request("example.poll.list", json!({})),
+        Duration::from_secs(2),
+        &ALLOW_EVIDENCE,
+    )
+    .await
+    .unwrap();
+    assert!(result.success);
+    assert_eq!(h.plugin.calls().len(), 1);
+}
+
+#[tokio::test]
 async fn admin_projection_future_grant_remains_refused() {
     let h = projection_read_harness(ProjectionReadTiming::FutureGrant).await;
     let result = dispatch_admin(
@@ -363,19 +396,16 @@ async fn organization_operations_require_signed_scope_matching_the_projected_own
         let mut source = h.reader.0.lock().unwrap();
         let snapshot = source.as_mut().unwrap();
         snapshot.organization_id = Some("org-1".into());
-        let projected = &mut snapshot.plugins[0];
-        let mut manifest: Value = serde_json::from_str(&projected.manifest_json).unwrap();
+        let mut manifest: Value = serde_json::from_str(POLL_MANIFEST).unwrap();
         for op in manifest["admin"]["operations"].as_array_mut().unwrap() {
             if op["permission"] == "read" {
                 op["scope"] = json!("organization");
             }
         }
-        projected.manifest_json = serde_json::to_string(&manifest).unwrap();
-        let digest = flare_im_capability_core::plugin::runtime::digest_bytes(
-            projected.manifest_json.as_bytes(),
+        snapshot.plugins[0] = with_manifest(
+            &snapshot.plugins[0],
+            &serde_json::to_string(&manifest).unwrap(),
         );
-        projected.grant.manifest_digest = digest.clone();
-        projected.deployment.manifest_digest = digest;
     }
     for caller in [
         staff(READ),

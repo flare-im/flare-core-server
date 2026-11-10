@@ -78,6 +78,23 @@ pub trait ConversationRepository: Send + Sync {
             "conditional session removal unavailable"
         ))
     }
+    /// Persist exact revoked authentication sessions before enumerating/kicking connections.
+    /// Admission and tombstones share the same storage serialization boundary.
+    async fn revoke_identity_sessions(
+        &self,
+        _tenant: &str,
+        _user: &UserId,
+        _session_ids: &[String],
+        _cutoff_ms: i64,
+        _request_id: &str,
+        _signing_key_id: &str,
+    ) -> Result<u32> {
+        Err(flare_server_core::flare_err!(
+            flare_server_core::error::ErrorCode::ServiceUnavailable,
+            "identity session revocation unavailable"
+        ))
+    }
+
     async fn touch_connection(
         &self,
         tenant_id: &str,

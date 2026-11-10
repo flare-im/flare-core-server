@@ -18,11 +18,8 @@ pub use builder::{
     PushEnvelopeBuildError, PushEnvelopeBuilder, build_ack_push, build_custom_push,
     build_notification_push, build_system_push,
 };
-pub use extension::{
-    ExtensionFailureMode, ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting,
-    ExtensionRuntimePolicy,
-};
-pub use hook::{HookExecutionContext, HookExecutionService, SubmittedMessage};
+pub use extension::{ExtensionOrchestrator, ExtensionRouting};
+pub use hook::{HookExecutionContext, HookExecutionService};
 pub use messaging::MqPushRepository;
 pub use model::ConversationType;
 pub use persistence::RecipientRepositoryImpl;

@@ -128,12 +128,8 @@ NEGOTIATION_HOST=localhost:60051 \
 
 ### 接入你的业务规则
 
-`crates/flare-im-hooks` 提供 9 个扩展点：
-
-`PreSend` / `PostSend` / `Delivery` / `Recall` / `MessageRead` /
-`MessageReaction` / `ConversationLifecycle` / `ConversationMember`
-
-发消息前做敏感词校验、发送后写审计、成员变更时同步你的组织架构，都在这一层。
+`crates/flare-im-hooks` 运行 `message.pre_send` Hook：消息落库之前放行、拒绝或改写。敏感词校验、
+发送权限都在这一层，见 [Hook 合同](HOOK-PLUGIN-CONTRACT.md)。
 
 ---
 

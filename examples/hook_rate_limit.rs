@@ -17,7 +17,7 @@
 //! # 2. 让核心用它：把下面这段写进 flare-im-core 的 config/hooks.toml
 //! #    [[pre_send]]
 //! #    name = "rate-limit"
-//! #    priority = 10
+//! #    order = 10
 //! #    timeout_ms = 200
 //! #    require_success = true          # 插件不可用时拒发；改 false 则放行
 //! #    [pre_send.transport]

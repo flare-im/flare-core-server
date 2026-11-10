@@ -88,6 +88,9 @@ impl ApplicationBootstrap {
                 let online_admin_service = ContextLayer::new()
                     .allow_missing()
                     .layer(OnlineAdminServiceServer::new(online_handler.clone()));
+                let auth_revocation_service = ContextLayer::new().allow_missing().layer(
+                    flare_grpc_proto::auth_revoke::auth_revocation_service_server::AuthRevocationServiceServer::new(online_handler.clone())
+                );
                 let online_service = ContextLayer::new()
                     .allow_missing()
                     .layer(OnlineServiceServer::new(online_handler));
@@ -96,6 +99,7 @@ impl ApplicationBootstrap {
                     .layer(grpc_metrics)
                     .add_service(online_service)
                     .add_service(online_admin_service)
+                    .add_service(auth_revocation_service)
                     .serve_with_shutdown(address_clone, async {
                         let _ = shutdown_rx.await;
                     })

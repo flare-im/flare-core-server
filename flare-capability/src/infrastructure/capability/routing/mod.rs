@@ -2,4 +2,4 @@
 
 mod plugin_route_book;
 
-pub use plugin_route_book::{PluginRouteBook, RouteOrigin};
+pub use plugin_route_book::PluginRouteBook;

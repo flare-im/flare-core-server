@@ -173,7 +173,7 @@ async fn build_media_service(
     };
 
     // 构建领域配置值对象
-    let domain_config = MediaDomainConfig::new(
+    let mut domain_config = MediaDomainConfig::new(
         config.redis_ttl_seconds,
         config.cdn_base_url.clone(),
         config.orphan_grace_seconds,
@@ -181,6 +181,14 @@ async fn build_media_service(
         config.chunk_ttl_seconds,
         config.max_chunk_size_bytes,
     );
+    config.admin_image_upload.validate().map_err(|message| {
+        flare_server_core::flare_err!(
+            flare_server_core::error::ErrorCode::ConfigurationError,
+            message
+        )
+    })?;
+    domain_config.admin_image_upload = config.admin_image_upload.clone();
+    domain_config.application_media_validators = config.application_media_validators.clone();
 
     Ok((
         Arc::new(

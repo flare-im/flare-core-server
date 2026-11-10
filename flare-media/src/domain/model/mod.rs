@@ -3,6 +3,9 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 
+mod ownership;
+pub use ownership::{AdminImageUploadPolicy, MediaOwnerKind, MediaPurpose, UploadActorKind};
+
 pub const STORAGE_PATH_METADATA_KEY: &str = "storage_path";
 pub const STORAGE_BUCKET_METADATA_KEY: &str = "storage_bucket";
 pub const FILE_CATEGORY_METADATA_KEY: &str = "file_category";
@@ -25,6 +28,9 @@ pub struct MediaDomainConfig {
     pub chunk_ttl_seconds: i64,
     /// 最大分块大小（字节）
     pub max_chunk_size_bytes: i64,
+    pub admin_image_upload: AdminImageUploadPolicy,
+    /// Explicit trusted Service actor ids for the two application-media RPCs. Empty denies all.
+    pub application_media_validators: Vec<String>,
 }
 
 impl MediaDomainConfig {
@@ -43,6 +49,8 @@ impl MediaDomainConfig {
             chunk_root_dir,
             chunk_ttl_seconds,
             max_chunk_size_bytes,
+            admin_image_upload: AdminImageUploadPolicy::default(),
+            application_media_validators: Vec::new(),
         }
     }
 }
@@ -94,6 +102,8 @@ pub enum FileAccessType {
 pub struct MediaFileMetadata {
     /// Established by authenticated upload context; absent for unaudited legacy data.
     pub owner_id: Option<String>,
+    pub owner_kind: MediaOwnerKind,
+    pub purpose: MediaPurpose,
     pub file_id: String,
     pub file_name: String,
     pub mime_type: String,
@@ -117,6 +127,8 @@ impl Default for MediaFileMetadata {
     fn default() -> Self {
         Self {
             owner_id: None,
+            owner_kind: MediaOwnerKind::User,
+            purpose: MediaPurpose::General,
             file_id: String::new(),
             file_name: String::new(),
             mime_type: String::new(),
@@ -331,7 +343,14 @@ pub struct UploadSession {
     pub full_sha256: Option<String>,
     #[serde(default)]
     pub total_parts: Option<u32>,
-    pub user_id: String,
+    /// Historical sessions serialized this as `user_id`; new sessions write
+    /// only `actor_id` and its explicit actor kind.
+    #[serde(alias = "user_id")]
+    pub actor_id: String,
+    #[serde(default)]
+    pub actor_kind: UploadActorKind,
+    #[serde(default)]
+    pub purpose: MediaPurpose,
     pub namespace: Option<String>,
     pub business_tag: Option<String>,
     pub trace_id: Option<String>,

@@ -1,11 +1,12 @@
 # Hook Plugin Contract
 
-A hook plugin is a gRPC service Flare calls **during** message handling, so it can
-allow, reject, or rewrite what happens. This document is the wire contract.
+A hook plugin is a gRPC service or webhook Flare calls **before** a message is stored, so it can
+allow, reject, or rewrite it. This document is the wire contract.
 
-Runnable references live in this repository:
-[`hook_rate_limit`](../examples/hook_rate_limit.rs),
-[`hook_audit_log`](../examples/hook_audit_log.rs).
+A runnable reference lives in this repository: [`hook_rate_limit`](../examples/hook_rate_limit.rs).
+
+Hooks are synchronous interception only. To learn what happened rather than stop it, use events,
+not a hook.
 
 ## 1. One RPC
 
@@ -19,24 +20,19 @@ service HookPlugin {
 **protobuf-encoded** message — this differs from `ExtensionPlugin`, whose payload
 is raw JSON. Decode it with prost using the `type_url` below.
 
-## 2. The four operations reachable over gRPC
+## 2. One hook point
 
-| `operation` | Request `type_url` suffix | When |
-|---|---|---|
-| `flare.hook.v1.pre_send` | `flare.capability.v1.PreSendHookRequest` | Before a message is stored or delivered |
-| `flare.hook.v1.post_send` | `flare.capability.v1.PostSendHookRequest` | After it is accepted |
-| `flare.hook.v1.delivery` | `flare.capability.v1.DeliveryHookRequest` | On delivery to a recipient |
-| `flare.hook.v1.recall` | `flare.capability.v1.RecallHookRequest` | On recall |
+| Point | `operation` | Request `type_url` suffix | When |
+|---|---|---|---|
+| `message.pre_send` | `flare.hook.v1.pre_send` | `flare.capability.v1.PreSendHookRequest` | Before a message is stored or delivered |
 
-`type_url` is the suffix above prefixed with `type.googleapis.com/`.
+`type_url` is the suffix above prefixed with `type.googleapis.com/`. Answer any other `operation`
+by allowing it, so a point added later does not stop your traffic.
 
-> The internal `HookKind` enum has more variants than these four (push, presence,
-> login/logout, reactions, conversation lifecycle). **Those are in-process only.**
-> A remote gRPC plugin can implement exactly the four above — the gRPC adapter
-> does not dispatch the rest. Writing a remote handler for `message_read` or
-> `presence` compiles fine and is never called.
+The point catalog lives in `flare-im-hooks`. A new point is added at the command that needs
+interception; the runtime and the control plane do not change.
 
-## 3. pre_send is the one that can say no
+## 3. A hook allows, rejects or rewrites
 
 ```protobuf
 message PreSendHookResponse {
@@ -56,128 +52,97 @@ in a support ticket. Rejecting with neither produces a message that vanished wit
 no explanation anywhere.
 
 Returning a modified `draft` rewrites the message. This is how moderation
-(masking) is implemented rather than rejecting outright.
+(masking) is implemented rather than rejecting outright. A returned `draft` replaces the payload,
+headers and metadata, so send all three back. `payload` must decode as a `MessageContent` and must
+not empty a message that had content; otherwise the rewrite failed (see §5). To change nothing,
+leave `draft` unset.
 
-## 4. Failure policy is configuration, not code
+## 4. One chain
 
-Your hook does not decide what happens when it fails — the operator does, per hook:
+Message Ingest runs one chain per send, serially:
 
-| `error_policy` | Behaviour on failure |
-|---|---|
-| `fail_fast` | Abort the main flow (default) |
-| `retry` | Retry, then alarm |
-| `ignore` | Log and continue |
+**application hooks, then platform hooks, then deployment hooks**, and by `order` (lower first)
+within a source.
 
-Choose `fail_fast` for anything whose absence would be a correctness or
-compliance problem (moderation, quota). Choose `ignore` for observational hooks:
-an audit-log hook that is down should not stop people from sending messages.
+Each hook sees the draft the previous one left. The deployment hooks are last on purpose: they see
+the final content, so an application rewrite cannot get past them, and their allow is the final
+verdict. A hook that rejects ends the chain.
 
-Case and underscores do not matter: `fail_fast`, `FailFast` and `failfast` are the same
-policy, as are `retry`/`Retry` and `ignore`/`Ignore`, so a profile reads the same in Message
-Ingest and in the Capability service. Any other value is a configuration error when the
-configuration is loaded or written through Administer; it is not read as `fail_fast`. The
-Capability service's engine records the policy but decides by group and `require_success`
-(§5).
+`hook_type` says which point a hook belongs to. There are no priorities, groups, error policies or
+retries: a hook is required or optional (`require_success`).
 
-## 5. Priority decides ordering and concurrency
+Application hooks cannot be created yet: Administer refuses them until there are outbound
+validation, an egress switch and quotas. Platform hooks are not affected.
 
-Message Ingest runs the hooks of its own configuration serially in priority
-order (lower first); each one's `require_success` decides what a failure does.
-A required pre-send hook that cannot be reached or does not answer in time — its
-own `timeout_ms`, or Message Ingest's overall pre-send deadline
-(`MESSAGE_INGEST_EXTENSION_PRE_SEND_TIMEOUT_MS`), whichever ends first — fails
-the send with a retryable `SERVICE_UNAVAILABLE` (gRPC `UNAVAILABLE`, HTTP 503),
-not a policy rejection.
+Applications cannot switch off or replace a platform or deployment hook. Their names are reserved
+within the hook type: Administer rejects an application `hook_config.create` or `update` using one
+with `ALREADY_EXISTS` (a disabled platform row reserves its name too). A non-empty
+`selector.tenants` further limits a hook to the listed tenants.
 
-The Capability service's hook engine (the `HookPlugin` it serves) also groups
-hooks. A hook's `group` (`validation`, `critical` or `business`, case-insensitive)
-places it; without one, priority 100 and above is `validation` and below is
-`business`. Any other `group` value is a configuration error. The group decides
-how the hook runs:
+## 5. Failure semantics
 
-| Group | Execution | Hook rejects | Hook unreachable or timed out |
-|---|---|---|---|
-| Validation | serial, first | stops the chain | rejects if `require_success`, else skipped |
-| Critical | serial, order preserved, after validation | stops the chain | always rejects |
-| Business | last, fault tolerant | logged, chain continues | logged, chain continues |
+| Case | Required | Optional |
+|---|---|---|
+| Target rejects explicitly | Rejected | Rejected |
+| Target times out, is unreachable or answers something unreadable; circuit open | 503, retryable | Skipped |
+| Rewrite does not decode, or empties the message | 503, original kept | This rewrite skipped |
+| Total budget exhausted | 503, retryable | Skipped |
+| Disabled by an administrator | Not called | Not called |
 
-A rejection caused by an unreachable or timed-out hook is answered as a gRPC
-`UNAVAILABLE` or `DEADLINE_EXCEEDED`, never as `allow=false`: the caller then
-reports a retryable `SERVICE_UNAVAILABLE` (HTTP 503) instead of a policy rejection
-(HTTP 422).
+503 means `SERVICE_UNAVAILABLE`, gRPC `UNAVAILABLE`, HTTP 503. An explicit rejection is HTTP 422
+and must not be retried. The error a sender sees names the hook, never the downstream error text.
 
-Post-send and delivery hooks have no allow/deny answer. When a required one (critical
-group, or `require_success`) times out in the Capability engine, the call is answered
-`UNAVAILABLE`, which a caller may retry; any other failure (the hook reporting failure,
-or its call failing before the timeout) is still answered `INTERNAL`. An optional one
-that times out is skipped. A recall the hook refuses is answered `allow=false`.
+Every step gets the smaller of the hook's `timeout_ms` and what is left of the total budget,
+`MESSAGE_INGEST_EXTENSION_PRE_SEND_TIMEOUT_MS` (1500 ms by default). Keep hooks fast: a slow hook
+spends the budget of the hooks after it.
 
-A hook that must observe the *final* draft has to sort after every hook that
-rewrites it — put rewriting hooks in an earlier group, not merely a lower number
-inside the same one.
+A hook that fails or is skipped leaves the draft as it found it.
 
-A hook that is meant to decide (reject a send or a recall) therefore needs
-`group = "validation"` or `"critical"`, or priority 100 or above; with neither, the
-Capability engine only logs its rejection. Profiles that Message Ingest loads as well
-(`config/hooks*.toml`) cannot use `group` — Message Ingest rejects unknown fields — so
-they use priority 100 and above; the shipped examples do, and a test loads every shipped
-profile with both loaders.
+Each Ingest instance keeps a circuit breaker per (application, hook): consecutive failures or
+timeouts inside a window open it, and while open the hook is not called and the table above applies.
+After the open period one probe goes through. An answer, allow or reject, counts as healthy. Budget
+exhaustion counts for nothing, since the hook was not at fault. Settings are `[hook_circuit]` in
+`config/services/message-ingest.toml` and `FLARE_HOOK_CIRCUIT_*`.
 
-When Message Ingest reaches the Capability service's hook engine through one of its
-own hooks (a gRPC transport pointing at the Capability `HookPlugin`), that Ingest-side
-hook must keep `require_success = true`. The Capability engine answers an unreachable
-or timed-out required hook with `UNAVAILABLE` or `DEADLINE_EXCEEDED`; with
-`require_success = false` Message Ingest would treat that as an infrastructure failure
-and let the message through, so every tenant and global hook behind the Capability
-service — moderation, quota, compliance — would be skipped whenever it is down or slow.
-An explicit rejection (`allow=false`) rejects either way.
+Message Ingest records each call in `hook_executions` through a bounded buffer: rejections,
+failures and timeouts in full, allows and short circuits sampled, without message content or
+downstream error text. Sending never waits for this. Settings are `[hook_executions]` and
+`FLARE_HOOK_EXECUTIONS_*`. Statistics, queries and retention are in the Capability service.
 
 ## 6. Configuration
 
 Hooks are **not** self-registering: the operator wires them in, unlike capability
-plugins which announce themselves. See `config/hooks.business.example.toml` in
-this repository for the shape (endpoint, priority, timeout, error policy).
-
-An explicitly configured file or directory is mandatory: a missing path, unreadable
-file, malformed TOML or unreadable directory entry aborts startup. Multiple explicit
-sources are merged in their configured order (directory files sort by name). No
-implicit `config/hooks.toml` path can shadow the supplied Social profile. With no
-configured source, the embedded empty `hooks.core.toml` profile is used. Startup logs
-the source, profile and hook counts; the dispatcher also logs its installed counts.
-Container deployments use `MESSAGE_INGEST_HOOKS_CONFIG=/etc/flare/config/hooks.toml`.
-
-The Capability service reads its own hook file (`CONFIG_FILE`, default
-`config/hooks.toml`) as its lowest-priority global source. That file is optional: a
-missing file means no file hooks. A file that exists but cannot be read, is not a hook
-configuration (including a top-level table that is not a hook type) or holds a hook that
-fails validation stops Capability at startup, before it connects to its database. The
-error names the file and the line and column (or the hook), never the file's content.
-While Capability runs, such a file keeps its last loaded hooks, each refresh logs the
-error, and the service keeps serving.
-
-That asymmetry is deliberate. A hook sits in the critical path of every message
+plugins which announce themselves. A hook sits in the critical path of every message
 and can reject traffic; letting an arbitrary process insert itself there by
 announcing would be a way to take the system down from outside.
 
-The Capability service's hook engine also runs the hooks tenants register through
-`CapabilityService/Administer` (`hook_config.*`). Rows without a tenant (and the
-Capability configuration file) apply to every tenant; a tenant's rows apply only to
-that tenant's events and run in addition to the global hooks. A tenant cannot replace
-or switch off a global hook: the name of a global hook is reserved within its hook
-type, Administer rejects a tenant `hook_config.create` or `update` that uses it with
-`ALREADY_EXISTS` (a disabled global row reserves its name too), and a same-named
-tenant row written some other way is not loaded (a warning is logged) while the global
-hook keeps running. A non-empty `selector.tenants` further limits a hook to the listed
-tenants. A write through Administer reloads that tenant's hooks at once on the instance
-that handled it, and every other Capability instance sharing the database reloads the
-same tenant (all hooks, for a global row) on a PostgreSQL `NOTIFY` on
-`flare_hook_config_changed`; changes made some other way arrive with the periodic refresh
-(60 s by default), which also covers a missed notification. Each instance listens on a
-connection of its own, outside the configuration repository's pool (one more PostgreSQL
-connection per instance; `CAPABILITY_POSTGRES_MAX_CONNECTIONS=1` still leaves the
-repository its connection), reconnects after a drop, and closes it on shutdown. A Capability process started with
-`TENANT_ID` keeps the single-tenant behaviour: it loads the global rows and that
-tenant's rows only, as one configuration, without the name reservation.
+There are two sources.
+
+| | Deployment file | Database `hook_configs` |
+|---|---|---|
+| Holds | Required policy, such as the Social send policy | Platform and application hooks |
+| Change | Edit the deployment, restart | Takes effect in about a second |
+| At startup | Missing or invalid: the service exits | Unreadable: the service does not become ready |
+| Target | Internal | gRPC or webhook |
+
+**Deployment file.** See `config/hooks.business.example.toml` for the shape. An explicitly
+configured file or directory is mandatory: a missing path, unreadable file, malformed TOML or
+unreadable directory entry aborts startup. Multiple explicit sources are merged in their configured
+order (directory files sort by name). No implicit `config/hooks.toml` path can shadow the supplied
+Social profile. With no configured source, the embedded empty `hooks.core.toml` profile is used.
+Startup logs the source, profile and hook counts; the dispatcher also logs its installed counts.
+Container deployments use `MESSAGE_INGEST_HOOKS_CONFIG=/etc/flare/config/hooks.toml`. Message
+Ingest writes a summary of what it installed to `hook_deployment_summary`, without secrets, header
+or metadata values, for read-only display.
+
+**`hook_configs`.** The Capability service writes rows through `CapabilityService/Administer`
+(`hook_config.*`). A row with a tenant belongs to that application; a row without one is a platform
+hook. Each write bumps the row's scope in `hook_config_versions` in the same transaction. Message
+Ingest polls about once a second, fetches the rows of the scopes that changed and swaps them in
+behind an atomic pointer, so a send costs one load and one lookup per application. While the
+database is unreachable Message Ingest keeps the last good configuration and warns; a scope with an
+invalid row keeps its last good hooks while other scopes reload. The Capability service does not run
+hooks, so a Capability outage does not affect sending.
 
 ## 7. Context
 
@@ -185,15 +150,12 @@ tenant's rows only, as one configuration, without the name reservation.
 
 When a webhook transport secret is configured, requests carry
 `Flare-Signature: t=<unix-seconds>,v1=<hex(HMAC-SHA256(secret, timestamp + "." + raw-body))>`.
-Core's webhook adapter and the Capability service's webhook transport (hooks a tenant
-registers through `CapabilityService/Administer`) sign the same way. The signing secret
-is never sent. The old `x-flare-signature` plaintext header and the Capability
-service's old `X-Hook-Signature` (an HMAC of the body alone, without a timestamp) are
-removed; custom headers cannot use any of these names or Content-Type (compared
-case-insensitively). A hook with such a header is rejected when the configuration is loaded
-(file, config center or database row, in either engine) or written through Administer
-(`INVALID_ARGUMENT`), not on every delivery. Unsigned endpoints remain possible only when no
-secret was configured. A delivery whose context has no tenant is not sent.
+The signing secret is never sent. The old `x-flare-signature` plaintext header and the old
+`X-Hook-Signature` (an HMAC of the body alone, without a timestamp) are removed; custom
+headers cannot use any of these names or Content-Type (compared case-insensitively). A hook
+with such a header is rejected when the deployment file is loaded or written through
+Administer (`INVALID_ARGUMENT`), not on every delivery. Unsigned endpoints remain possible
+only when no secret was configured. A delivery whose context has no tenant is not sent.
 
 A secret registered through Administer is write-only: `hook_config.create`, `get`,
 `list` and `update` return an empty `transport.secret`, and
@@ -225,19 +187,12 @@ hook could point it at an endpoint of their own and receive the hidden `Authoriz
 header, API key or signing secret with the next delivery. Changing only the load balancing
 or the timeout keeps the stored values.
 
-`hook_config.create` registers only the hook types the Capability service calls:
-`pre_send`, `post_send`, `delivery` and `recall`. The other types its configuration knows
-(`session_*`, `push_*`, `user_login`/`logout`/`online`/`offline`,
-`get_conversation_participants`) are `INVALID_ARGUMENT` with a message saying the Capability
-service does not execute them (it only logs those events, and nothing calls
-`get_conversation_participants`); types the configuration does not know at all (for example
-`message_read`, `presence`, `custom`), which a reload would drop, are `INVALID_ARGUMENT` as
-unknown.
+`hook_config.create` registers only `pre_send`; any other `hook_type` is `INVALID_ARGUMENT`
+as unknown. A target is gRPC or a webhook: `local` is for code linked into the process and is
+refused.
 
-A webhook in the hook configuration file or config center with `secret = ""` is rejected
-when the configuration is loaded (the error names the hook; at startup the service does
-not start, on a refresh the previous configuration stays). Omit `secret` for unsigned
-delivery.
+A webhook with `secret = ""` in the deployment file is rejected when the file is loaded (the
+error names the hook; the service does not start). Omit `secret` for unsigned delivery.
 
 Verify the **raw request bytes**, before JSON parsing, and reject timestamps outside
 the allowed clock skew. Example receiver logic (Python standard library):
@@ -272,27 +227,25 @@ side effects by message/event identity. TLS remains required outside local tests
 `HookInvocationContext` carries tenant, user and trace identity. Flare calls you
 out of process, so nothing restores this for you — read it from the request.
 
-### Calling the Capability service's HookPlugin
+`HookInvocationContext` carries tenant, user and trace identity. Flare calls you
+out of process, so nothing restores this for you — read it from the request.
 
-The Capability service's `HookPlugin` accepts only Cell-signed callers: each `Call`
-must carry the `x-flare-ctx` token the caller received (verified with
-`FLARE_INTERNAL_CTX_PUBLIC_KEY`; the Message Ingest hook adapter forwards it
-unchanged). A missing or unverifiable token, or a service started without the public
-key, gets `UNAUTHENTICATED`. A `HookInvocationContext` whose `tenant_id` differs from
-the signed tenant, or whose `operator_user_id` differs from a signed user, gets
-`PERMISSION_DENIED`; `pre_send` accepts only a signed user. Hooks are selected by the
-signed tenant, and the hooks it runs see the signed identity, not the request body's.
+### gRPC hook caller identity
 
-When those hooks use the gRPC transport, the Capability service forwards the same
-`x-flare-ctx` token and sets `GenericRequest.request_id` to the signed request ID, so a
-plugin can apply the checks above; it does not call a gRPC hook without a signed context.
+A gRPC hook call carries the `x-flare-ctx` token Message Ingest received and sets
+`GenericRequest.request_id` to the signed request ID, so a plugin can verify the caller with
+`FLARE_INTERNAL_CTX_PUBLIC_KEY`. Message Ingest does not call a gRPC hook without a signed context,
+and `pre_send` runs only for a signed user: system and platform senders skip it. A plugin should
+answer `UNAUTHENTICATED` to a missing or unverifiable token and `PERMISSION_DENIED` when a
+`HookInvocationContext` names another tenant or user than the signed one.
 
 Do not trust the draft's author field as an identity assertion; use the context.
 
 ## 8. Checklist
 
-- [ ] Implement only the four operations above; return an error for anything else
+- [ ] Implement `flare.hook.v1.pre_send`; allow any other operation
 - [ ] Decode `payload` with prost, using the `type_url`, not JSON
-- [ ] `pre_send`: always set `deny_reason_code` **and** `deny_reason_message` when denying
+- [ ] Always set `deny_reason_code` **and** `deny_reason_message` when denying
+- [ ] When rewriting, send the whole draft back with a payload that decodes as `MessageContent`
 - [ ] Keep the hook faster than its configured timeout — it is in the send path
-- [ ] Tell the operator which `error_policy` your hook needs, and why
+- [ ] Tell the operator whether your hook must be required, and why

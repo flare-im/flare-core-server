@@ -55,11 +55,16 @@ impl PluginServiceDispatch for RouterDispatch {
     }
 }
 
-/// Unavailable and deadline answers leave the provider's outcome unknown; anything else is a
-/// refusal.
+/// Unavailable and deadline answers leave the provider's outcome unknown; a closed feature is
+/// named so the caller can tell its user; anything else is a refusal.
 fn dispatch_error(status: &Status) -> ServiceDispatchError {
     match status.code() {
         Code::Unavailable | Code::DeadlineExceeded => ServiceDispatchError::OutcomeUnknown,
+        Code::PermissionDenied
+            if status.message() == flare_plugin_host::service::FEATURE_DISABLED =>
+        {
+            ServiceDispatchError::FeatureDisabled
+        }
         _ => ServiceDispatchError::Refused,
     }
 }
@@ -68,7 +73,7 @@ struct Directory(Arc<ServiceDirectory>);
 
 #[tonic::async_trait]
 impl flare_plugin_host::service::ServiceDirectory for Directory {
-    async fn snapshot(&self, tenant: &str) -> Result<PluginRuntimeSnapshot, Status> {
+    async fn snapshot(&self, tenant: &str) -> Result<Arc<PluginRuntimeSnapshot>, Status> {
         self.0.snapshot(tenant).await
     }
     async fn check_policy(&self, tenant: &str, operation: &str) -> Result<(), Status> {
@@ -107,6 +112,12 @@ mod tests {
                 ServiceDispatchError::Refused
             );
         }
+        assert_eq!(
+            dispatch_error(&Status::permission_denied(
+                flare_plugin_host::service::FEATURE_DISABLED
+            )),
+            ServiceDispatchError::FeatureDisabled
+        );
     }
 
     #[test]

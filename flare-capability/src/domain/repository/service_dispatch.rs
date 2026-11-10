@@ -13,6 +13,9 @@ use flare_im_capability_core::plugin::service::PluginServiceResponse;
 pub enum ServiceDispatchError {
     /// Refused before or by the provider: credential, grant, policy, budget or target.
     Refused,
+    /// The application closed or never published the feature that gates this `user` mode
+    /// operation. `recovery` calls never end here.
+    FeatureDisabled,
     /// The provider may or may not have run the call (unavailable or timed out); the caller
     /// must reconcile instead of assuming it did not happen.
     OutcomeUnknown,

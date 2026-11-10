@@ -1,22 +1,4 @@
-//! # Hook仓储接口
-//!
-//! 定义Hook配置的仓储接口
-
-use crate::domain::model::HookConfig;
-
-/// Hook配置仓储接口
-pub trait HookConfigRepository: Send + Sync {
-    /// 加载Hook配置
-    async fn load(&self) -> flare_server_core::error::Result<HookConfig>;
-
-    /// 保存Hook配置
-    async fn save(&self, config: &HookConfig) -> flare_server_core::error::Result<()>;
-
-    /// 监听配置变更
-    async fn watch<F>(&self, callback: F) -> flare_server_core::error::Result<()>
-    where
-        F: Fn(HookConfig) + Send + Sync + 'static;
-}
+//! 控制面仓储端口。
 
 /// 租户投影仓储：按 version 幂等写入 `tenants` 表，并回答本地持有的版本。
 ///
@@ -25,7 +7,7 @@ pub trait HookConfigRepository: Send + Sync {
 pub trait TenantProjectionRepository: Send + Sync {
     async fn replace_plugins(
         &self,
-        _snapshot: &flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot,
+        _projection: &flare_im_capability_core::plugin::runtime::PluginProjection,
     ) -> flare_server_core::error::Result<crate::domain::model::TenantProjectionOutcome> {
         Err(flare_server_core::error::FlareError::system(
             "plugin projection store unavailable",
@@ -76,14 +58,45 @@ pub trait TenantProjectionRepository: Send + Sync {
 }
 
 /// Local, durable authorization. No Marketplace call is permitted on this port.
+#[derive(Default)]
+pub struct PluginEventDirectory {
+    /// Desired, approved subscriptions, retained when their deployment is temporarily absent.
+    pub subscriptions: std::collections::BTreeSet<(String, String)>,
+    /// Enabled bindings whose release is not yet available. They retain retries without
+    /// preventing other bindings from receiving the event.
+    pub unavailable_grants: std::collections::BTreeSet<String>,
+    /// Current routing facts. `None` cannot erase a desired subscription.
+    pub routes:
+        Option<std::sync::Arc<flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot>>,
+}
+
 #[async_trait::async_trait]
 pub trait PluginAuthorizationReader: Send + Sync {
+    async fn event_directory(
+        &self,
+        _tenant: &str,
+    ) -> flare_server_core::error::Result<PluginEventDirectory> {
+        Err(flare_server_core::error::FlareError::system(
+            "plugin event directory unavailable",
+        ))
+    }
     async fn plugin_snapshot(
         &self,
         tenant: &str,
     ) -> flare_server_core::error::Result<
-        Option<flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot>,
+        Option<std::sync::Arc<flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot>>,
     >;
+    /// Durable activation of the effective grant/configuration. A reader that cannot prove
+    /// this boundary cannot disclose historical events. Lease renewal never advances it.
+    async fn event_active_since_ms(
+        &self,
+        _tenant: &str,
+        _grant: &str,
+        _revision: u64,
+        _configuration_digest: &str,
+    ) -> flare_server_core::error::Result<Option<i64>> {
+        Ok(None)
+    }
 }
 
 /// 租户运行时只读（管理员查看本进程持有的投影）。与写路径分开，读侧不需要写权限。
@@ -96,51 +109,10 @@ pub trait TenantRuntimeReader: Send + Sync {
     ) -> flare_server_core::error::Result<Option<crate::domain::model::TenantRuntimeView>>;
 }
 
-/// 经 `RegisterPluginEndpoint` 登记的插件端点的持久化端口（`capability_plugin_endpoints`）。
-/// 读模型仍是进程内的 `PluginRouteBook`：启动时整表载入、登记/注销先写这里、按周期重读。
-#[async_trait::async_trait]
-pub trait PluginEndpointRepository: Send + Sync {
-    /// 写入或覆盖一条登记；首次登记时间保留，`updated_at` 取当前时间。
-    async fn upsert(
-        &self,
-        endpoint: &crate::domain::model::PluginEndpoint,
-    ) -> flare_server_core::error::Result<()>;
-
-    /// 删除一条登记；返回是否删到了行。
-    async fn delete(
-        &self,
-        tenant_id: &str,
-        plugin_id: &str,
-    ) -> flare_server_core::error::Result<bool>;
-
-    /// 全部登记，按 `(tenant_id, plugin_id)` 排序。
-    async fn list_all(
-        &self,
-    ) -> flare_server_core::error::Result<Vec<crate::domain::model::PluginEndpoint>>;
-
-    /// 把这些登记的 `last_healthy_at` 记为当前时间（一条语句）；返回更新的行数。
-    async fn record_healthy(
-        &self,
-        keys: &[crate::domain::model::PluginEndpointKey],
-    ) -> flare_server_core::error::Result<u64>;
-
-    /// 删除 `cutoff` 之后既没重新登记、也没有健康检查通过的登记；返回删掉的键。
-    async fn delete_stale(
-        &self,
-        cutoff: chrono::DateTime<chrono::Utc>,
-    ) -> flare_server_core::error::Result<Vec<crate::domain::model::PluginEndpointKey>>;
-}
-
-/// Hook 执行证据的持久化端口（`hook_executions`）。写入方是后台的批量写入任务，读取方是
-/// `hook_config.get_statistics` / `query_executions`；读写都按租户与 Hook 限定。
+/// Hook 执行证据的读与保留期端口（`hook_executions`）。写入方是 Ingest；这里是
+/// `hook_config.get_statistics` / `query_executions` 与保留期清理，读都按租户与 Hook 限定。
 #[async_trait::async_trait]
 pub trait HookExecutionRepository: Send + Sync {
-    /// 一次写入一批记录，返回写入的行数。
-    async fn insert_batch(
-        &self,
-        records: &[crate::domain::model::HookExecutionRecord],
-    ) -> flare_server_core::error::Result<u64>;
-
     /// 删除执行时间早于 `cutoff` 的至多 `limit` 行（最旧的先删），返回删除的行数。
     async fn delete_executed_before(
         &self,
@@ -163,6 +135,8 @@ pub trait HookExecutionRepository: Send + Sync {
 }
 pub mod entity_lifecycle;
 pub mod plugin_card;
+pub mod plugin_registry;
+pub mod plugin_runtime;
 pub mod plugin_state;
 pub mod realtime_delivery;
 pub mod resource_access;

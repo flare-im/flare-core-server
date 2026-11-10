@@ -1,7 +1,10 @@
 //! Generic Core communication database initialization. No product directories/policy.
-use anyhow::{Result, ensure};
+use flare_server_core::error::{FlareError, Result};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, PgConnection};
+mod model;
+mod upgrade;
+pub use upgrade::upgrade;
 pub const SQL: &str = include_str!("../../../initial/schema.sql");
 pub const SEEDS: &str = include_str!("../../../initial/seeds.sql");
 pub fn digest() -> String {
@@ -12,6 +15,15 @@ pub fn digest() -> String {
     format!("{:x}", value.finalize())
 }
 
+/// Refuses with `message` unless `condition` holds.
+pub fn ensure(condition: bool, message: &str) -> Result<()> {
+    if condition {
+        Ok(())
+    } else {
+        Err(FlareError::system(message))
+    }
+}
+
 pub async fn initialize(connection: &mut PgConnection) -> Result<bool> {
     initialize_sql(connection, SQL).await
 }
@@ -19,38 +31,38 @@ async fn initialize_sql(connection: &mut PgConnection, sql: &str) -> Result<bool
     let mut tx = connection
         .begin()
         .await
-        .map_err(|_| anyhow::anyhow!("Core initializer transaction unavailable"))?;
+        .map_err(|_| FlareError::system("Core initializer transaction unavailable"))?;
     let work=async {
-        sqlx::raw_sql("SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='30s'; SELECT pg_advisory_xact_lock(5065494824365673545);")
-            .execute(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initializer is busy"))?;
-        let allowed:bool=sqlx::query_scalar("SELECT current_user=session_user AND current_user='core_initialize' AND NOT r.rolsuper AND NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication FROM pg_roles r WHERE r.rolname=current_user")
-            .fetch_one(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initializer role check unavailable"))?;
-        ensure!(allowed,"Core initializer requires the isolated core_initialize login");
-        let extension:bool=sqlx::query_scalar("SELECT current_setting('server_version_num')::int>=160000 AND EXISTS(SELECT 1 FROM pg_extension WHERE extname='timescaledb')")
-            .fetch_one(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core extension check unavailable"))?;
-        ensure!(extension,"Core requires PostgreSQL 16+ and TimescaleDB installed by the new-cluster administrator");
+        model::begin_checks(&mut tx).await?;
         let exists:bool=sqlx::query_scalar("SELECT to_regclass('public.core_initial_schema') IS NOT NULL")
-            .fetch_one(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initialization state unavailable"))?;
+            .fetch_one(&mut *tx).await.map_err(|_|FlareError::system("Core initialization state unavailable"))?;
         if exists {
-            let actual:String=sqlx::query_scalar("SELECT schema_sha256 FROM public.core_initial_schema WHERE version=1")
-                .fetch_one(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initial version unavailable"))?;
-            ensure!(actual==digest(),"Core initial schema differs from this build");
+            model::lock_tables(&mut tx).await?;
+            model::verify_current(&mut tx).await?;
             return Ok(false);
         }
         let empty:bool=sqlx::query_scalar("SELECT NOT EXISTS(SELECT 1 FROM pg_namespace n WHERE nspname NOT IN('public','information_schema') AND nspname NOT LIKE 'pg\\_%' ESCAPE '\\' AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_namespace'::regclass AND d.objid=n.oid AND d.deptype='e')) AND NOT EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relkind IN('r','p','v','m','S','f') AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e')) AND NOT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public' AND NOT EXISTS(SELECT 1 FROM pg_depend d WHERE d.classid='pg_proc'::regclass AND d.objid=p.oid AND d.deptype='e'))")
-            .fetch_one(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core empty-database check unavailable"))?;
-        ensure!(empty,"Core initializer refuses existing data; use a new empty owned database");
-        sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initial schema failed; transaction rolled back"))?;
-        sqlx::raw_sql(SEEDS).execute(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initial system seed failed; transaction rolled back"))?;
-        sqlx::query("INSERT INTO public.core_initial_schema(version,schema_sha256) VALUES(1,$1)")
-            .bind(digest()).execute(&mut *tx).await.map_err(|_|anyhow::anyhow!("Core initial version failed; transaction rolled back"))?;
+            .fetch_one(&mut *tx).await.map_err(|_|FlareError::system("Core empty-database check unavailable"))?;
+        ensure(empty,"Core initializer refuses existing data; use a new empty owned database")?;
+        // The accepted fresh source creates unqualified public objects. Existing
+        // databases never enter this branch; metadata admission keeps pg_catalog
+        // first so application functions cannot shadow the catalog verifier.
+        sqlx::raw_sql("SET LOCAL search_path=public,pg_catalog,pg_temp;").execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial public schema unavailable"))?;
+        sqlx::raw_sql(sql).execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial schema failed; transaction rolled back"))?;
+        sqlx::raw_sql(SEEDS).execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial system seed failed; transaction rolled back"))?;
+        sqlx::raw_sql("SET LOCAL search_path=pg_catalog,public,pg_temp;").execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial catalog schema unavailable"))?;
+        sqlx::query("INSERT INTO public.core_initial_schema(version,schema_sha256) VALUES(2,$1)")
+            .bind(digest()).execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial version failed; transaction rolled back"))?;
+        sqlx::query("INSERT INTO public.core_initial_history(to_version,from_version,to_sha256,transition,ddl_sha256) VALUES(2,0,$1,'fresh',$1)")
+            .bind(digest()).execute(&mut *tx).await.map_err(|_|FlareError::system("Core initial provenance failed; transaction rolled back"))?;
+        model::verify_current(&mut tx).await?;
         Ok(true)
     }.await;
     match work {
         Ok(created) => {
             tx.commit().await.map_err(|_| {
-                anyhow::anyhow!(
-                    "Core initialization commit unconfirmed; retry explicit initializer"
+                FlareError::system(
+                    "Core initialization commit unconfirmed; retry explicit initializer",
                 )
             })?;
             Ok(created)
@@ -68,7 +80,7 @@ mod tests {
     #[test]
     fn target_is_generic_and_has_no_implicit_tenant_or_grant() {
         assert!(!SQL.contains("INSERT INTO tenants"));
-        assert!(!SQL.contains("INSERT INTO capability_user_grants"));
+        assert!(!SQL.contains("INSERT INTO capability_tenant_switches"));
         assert!(!SQL.contains("platform_iam"));
         assert!(!SQL.contains("flare_friendships"));
         assert!(!SQL.contains("_sqlx_migrations"));
@@ -127,7 +139,7 @@ mod tests {
         for table in [
             "tenants",
             "messages",
-            "capability_user_grants",
+            "capability_tenant_switches",
             "core_audit_outbox",
             "online_kick_commands",
             "plugin_entity_lifecycle_outbox",

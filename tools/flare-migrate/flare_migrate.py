@@ -317,7 +317,7 @@ def execute_migration(db, sql):
 # change nothing on it), the shapes after 0008 through 0011, 0019, 0020 and 0022, and the current latest.
 # When a migration changes the shape, keep the previous latest as `v<NNNN>` so ledgered databases at that
 # version still pass the pre-check.
-REVIEWED_SHAPES = ("baseline", "v0008", "v0009", "v0010", "v0011", "v0019", "v0020", "v0022", "latest")
+REVIEWED_SHAPES = ("baseline", "v0008", "v0009", "v0010", "v0011", "v0019", "v0020", "v0022", "v0023", "v0027", "v0028", "latest")
 
 
 def assert_reviewed_baseline(actual):
@@ -325,15 +325,23 @@ def assert_reviewed_baseline(actual):
         raise MigrationError("schema mismatch: not a reviewed Core baseline; audited import required")
 
 
+def seed_tables(db):
+    """The tables holding seeds. Migration 0027 retired capability_user_grants."""
+    grants = db.query("SELECT to_regclass('public.capability_user_grants') IS NOT NULL;") == "t"
+    return "public.tenants,public.capability_service_settings" + (",public.capability_user_grants" if grants else "")
+
+
 def seed_state(db):
-    return db.json("""SELECT jsonb_build_object(
+    grants = "capability_user_grants" in seed_tables(db)
+    rtc_grant = """(SELECT jsonb_build_object('tenant_id',tenant_id,'user_id',user_id,
+        'capability_id',capability_id,'expires_at',expires_at,'plan_code',plan_code,'source',source)
+        FROM public.capability_user_grants WHERE tenant_id='0' AND user_id='*' AND capability_id='rtc.*')""" if grants else "NULL::jsonb"
+    return db.json(f"""SELECT jsonb_build_object(
       'tenant_0',(SELECT jsonb_build_object('tenant_id',tenant_id,'status',status,'version',version)
         FROM public.tenants WHERE tenant_id='0'),
       'capability_service_settings_1',(SELECT jsonb_build_object('id',id,'global_enabled',global_enabled)
         FROM public.capability_service_settings WHERE id=1),
-      'rtc_tenant_0_wildcard',(SELECT jsonb_build_object('tenant_id',tenant_id,'user_id',user_id,
-        'capability_id',capability_id,'expires_at',expires_at,'plan_code',plan_code,'source',source)
-        FROM public.capability_user_grants WHERE tenant_id='0' AND user_id='*' AND capability_id='rtc.*')
+      'rtc_tenant_0_wildcard',{rtc_grant}
     );""")
 
 
@@ -461,7 +469,7 @@ def run(db, migrations, admission=None):
             assert_reviewed_baseline(actual)
             if db.query("SELECT EXISTS(SELECT 1 FROM messages WHERE status IN (5,6,7,8));") == "t":
                 raise MigrationError("historical message-status provenance is ambiguous; audited import required")
-            db.query("LOCK TABLE public.tenants,public.capability_service_settings,public.capability_user_grants IN SHARE MODE;")
+            db.query(f"LOCK TABLE {seed_tables(db)} IN SHARE MODE;")
             validate_admission(admission, baseline_evidence(db, migrations))
             preserved_seeds = admission["evidence"]["seeds"]
             adopted = True
@@ -478,7 +486,7 @@ def run(db, migrations, admission=None):
         # Validate BEFORE executing pending SQL, not just afterward; an extra public
         # function/trigger must not be allowed to run under the migrator's authority.
         assert_reviewed_baseline(snapshot(db))
-        db.query("LOCK TABLE public.tenants,public.capability_service_settings,public.capability_user_grants IN SHARE MODE;")
+        db.query(f"LOCK TABLE {seed_tables(db)} IN SHARE MODE;")
         preserved_seeds = seed_state(db)
     pending = migrations[applied:]
     expected_seeds = preserved_seeds
@@ -487,6 +495,9 @@ def run(db, migrations, admission=None):
         rtc_grant = preserved_seeds["rtc_tenant_0_wildcard"]
         if rtc_grant is not None and rtc_grant["source"] == "init_bootstrap":
             expected_seeds = {**preserved_seeds, "rtc_tenant_0_wildcard": None}
+    if preserved_seeds is not None and any(migration.version == 27 for migration in pending):
+        # 0027 drops the user grant table, operator-issued rows included.
+        expected_seeds = {**expected_seeds, "rtc_tenant_0_wildcard": None}
     for migration in pending:
         execute_migration(db, migration.sql)
         insert_ledger(db, migration)

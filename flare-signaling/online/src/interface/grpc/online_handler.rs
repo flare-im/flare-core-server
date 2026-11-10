@@ -183,6 +183,9 @@ where
                 "authenticated signaling connection required for Online login",
             ));
         }
+        if request.get_ref().metadata.get("identity_session_id").map(String::as_str) != claims.session_id.as_deref() {
+            return Err(Status::permission_denied("authenticated identity session mismatch"));
+        }
         if request
             .get_ref()
             .metadata
@@ -587,6 +590,58 @@ where
         Ok(Response::new(response))
     }
 
+    /// Private durable identity-owner effect. Staff and ordinary Service contexts
+    /// cannot use it, even when they can kick a device through another route.
+    pub async fn handle_revoke_identity_sessions(
+        &self,
+        request: Request<flare_grpc_proto::auth_revoke::RevokeIdentitySessionsRequest>,
+    ) -> Result<Response<flare_grpc_proto::auth_revoke::RevokeIdentitySessionsResponse>, Status>
+    {
+        let (_, claims) = self.verified_identity(&request)?;
+        if claims.actor_type != SignedActorType::Service
+            || claims.actor_id != "flare-social-bridge"
+            || claims.roles.as_slice() != ["identity.revoke"]
+            || claims.permission.is_some()
+        {
+            return Err(Status::permission_denied(
+                "identity revocation owner required",
+            ));
+        }
+        let input = request.into_inner();
+        let now = chrono::Utc::now().timestamp_millis();
+        if input.user_id.is_empty()
+            || input.user_id.len() > 128
+            || input.user_id.chars().any(char::is_control)
+            || uuid::Uuid::parse_str(&input.revocation_id).is_err()
+            || input.cutoff_ms <= 0
+            || input.cutoff_ms > now.saturating_add(30_000)
+            || input.session_ids.len() > 100
+            || input
+                .session_ids
+                .iter()
+                .any(|sid| uuid::Uuid::parse_str(sid).is_err())
+        {
+            return Err(Status::invalid_argument(
+                "invalid identity revocation intent",
+            ));
+        }
+        let kicked = self
+            .user_handler
+            .revoke_identity_sessions(
+                &claims.tenant_id,
+                &input.user_id,
+                &input.session_ids,
+                input.cutoff_ms,
+                &claims.request_id,
+                &claims.kid,
+            )
+            .await
+            .into_grpc()?;
+        Ok(Response::new(
+            flare_grpc_proto::auth_revoke::RevokeIdentitySessionsResponse { kicked },
+        ))
+    }
+
     pub async fn handle_get_device(
         &self,
         request: Request<GetDeviceRequest>,
@@ -700,6 +755,21 @@ mod admin_branch_tests {
                 list.retain(|c| c.id() != connection_id);
             }
             Ok(())
+        }
+        async fn revoke_identity_sessions(
+            &self,
+            tenant: &str,
+            user: &UserId,
+            _: &[String],
+            _: i64,
+            _: &str,
+            _: &str,
+        ) -> FlareResult<u32> {
+            self.kicked
+                .lock()
+                .unwrap()
+                .push((tenant.to_owned(), user.as_str().to_owned()));
+            Ok(1)
         }
         async fn touch_connection(&self, _: &str, _: &ConnectionId, _: &UserId) -> FlareResult<()> {
             Ok(())
@@ -1358,4 +1428,120 @@ mod admin_branch_tests {
                 .all(|(tenant, _)| tenant == "tenant-a" || tenant == "tenant-b")
         );
     }
+    #[tokio::test]
+    async fn identity_revocation_is_owner_only_and_uses_the_verified_tenant() {
+        use flare_grpc_proto::auth_revoke::RevokeIdentitySessionsRequest;
+        let repo = seeded();
+        let verifier = SignedContextVerifier::from_public_key(&pem(GATEWAY_KEY).1).unwrap();
+        let online = handler(repo.clone(), true).with_identity_verifier(Some(verifier));
+        let input = RevokeIdentitySessionsRequest {
+            user_id: "u1".into(),
+            revocation_id: uuid::Uuid::new_v4().to_string(),
+            cutoff_ms: chrono::Utc::now().timestamp_millis(),
+            session_ids: vec![uuid::Uuid::new_v4().to_string()],
+        };
+        assert_eq!(
+            online
+                .handle_revoke_identity_sessions(Request::new(input.clone()))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unauthenticated
+        );
+        let call = |kind, actor: &str, roles: Vec<String>, app: &str, input| {
+            let identity =
+                SignedContextIdentity::new(kind, actor, app, "owned-revocation").with_roles(roles);
+            let identity = if kind == SignedActorType::Staff {
+                identity.with_staff_grant(
+                    Some("org-a".into()),
+                    Some("im:users:reset-password".into()),
+                    1,
+                )
+            } else {
+                identity
+            };
+            let token = SignedContextSigner::from_private_key(&pem(GATEWAY_KEY).0)
+                .unwrap()
+                .sign(&identity)
+                .unwrap();
+            with_ctx(input, &token)
+        };
+        for (kind, actor, roles) in [
+            (
+                SignedActorType::Staff,
+                "employee",
+                vec!["identity.revoke".into()],
+            ),
+            (SignedActorType::User, "u1", vec!["identity.revoke".into()]),
+            (
+                SignedActorType::Service,
+                "another-service",
+                vec!["identity.revoke".into()],
+            ),
+            (SignedActorType::Service, "flare-social-bridge", vec![]),
+        ] {
+            assert!(
+                online
+                    .handle_revoke_identity_sessions(call(
+                        kind,
+                        actor,
+                        roles,
+                        "tenant-a",
+                        input.clone()
+                    ))
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(repo.kicked.lock().unwrap().is_empty());
+        let result = online
+            .handle_revoke_identity_sessions(call(
+                SignedActorType::Service,
+                "flare-social-bridge",
+                vec!["identity.revoke".into()],
+                "tenant-b",
+                input.clone(),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.kicked, 1);
+        assert_eq!(
+            repo.kicked.lock().unwrap().as_slice(),
+            &[("tenant-b".into(), "u1".into())]
+        );
+        let mut malformed = input;
+        malformed.session_ids.push("untrusted-session".into());
+        assert_eq!(
+            online
+                .handle_revoke_identity_sessions(call(
+                    SignedActorType::Service,
+                    "flare-social-bridge",
+                    vec!["identity.revoke".into()],
+                    "tenant-a",
+                    malformed
+                ))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert_eq!(repo.kicked.lock().unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn login_rejects_unbound_or_tampered_identity_sid_metadata() {
+        let verifier=SignedContextVerifier::from_public_key(&pem(GATEWAY_KEY).1).unwrap();
+        let online=handler(seeded(),true).with_identity_verifier(Some(verifier));
+        let sid=uuid::Uuid::new_v4().to_string();let different=uuid::Uuid::new_v4().to_string();
+        for (claim,body) in [(None,Some(sid.as_str())),(Some(sid.as_str()),Some(different.as_str())),(Some(sid.as_str()),None)] {
+            let identity=SignedContextIdentity::new(SignedActorType::User,"u1","tenant-a","physical-owned").with_credential_id("signaling-gateway");
+            let identity=if let Some(sid)=claim {identity.with_session_id(sid)} else {identity};
+            let token=SignedContextSigner::from_private_key(&pem(GATEWAY_KEY).0).unwrap().sign(&identity).unwrap();
+            let mut metadata=HashMap::from([("connection_id".into(),"physical-owned".into())]);
+            if let Some(sid)=body {metadata.insert("identity_session_id".into(),sid.into());}
+            let request=LoginRequest {user_id:"u1".into(),device_id:"owned-device".into(),metadata,..Default::default()};
+            assert_eq!(online.handle_login(with_ctx(request,&token)).await.unwrap_err().code(),Code::PermissionDenied);
+        }
+    }
+
 }

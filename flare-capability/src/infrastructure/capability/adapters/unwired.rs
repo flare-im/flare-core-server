@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use flare_core_base::context::Ctx;
 
 use crate::domain::capability::{
-    CapabilityError, ConversationKind, GuardDecision, PreSendEvaluateInput, PreSendGuard,
-    RecipientResolveRequest, RecipientResolveResult, RecipientResolver, ResolveTrigger, Result,
+    CapabilityError, ConversationKind, RecipientResolveRequest, RecipientResolveResult,
+    RecipientResolver, ResolveTrigger, Result,
 };
 
 /// 接收者解析占位（未启用任何远端解析器）
@@ -41,57 +41,5 @@ impl RecipientResolver for UnwiredRecipientResolver {
         Err(CapabilityError::NotSupported(
             "UnwiredRecipientResolver".into(),
         ))
-    }
-}
-
-/// 静音检查占位（恒通过，待接入真实服务）
-pub struct UnwiredMuteGuard;
-
-impl Default for UnwiredMuteGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UnwiredMuteGuard {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl PreSendGuard for UnwiredMuteGuard {
-    fn id(&self) -> &str {
-        "unwired.mute"
-    }
-
-    async fn evaluate(&self, _ctx: &Ctx, _input: &PreSendEvaluateInput) -> Result<GuardDecision> {
-        Ok(GuardDecision::Allow)
-    }
-}
-
-/// 好友关系检查占位（恒通过，待接入真实服务）
-pub struct UnwiredFriendshipGuard;
-
-impl Default for UnwiredFriendshipGuard {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl UnwiredFriendshipGuard {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl PreSendGuard for UnwiredFriendshipGuard {
-    fn id(&self) -> &str {
-        "unwired.friendship"
-    }
-
-    async fn evaluate(&self, _ctx: &Ctx, _input: &PreSendEvaluateInput) -> Result<GuardDecision> {
-        Ok(GuardDecision::Allow)
     }
 }

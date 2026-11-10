@@ -11,6 +11,14 @@ upload_session_store = "upload_conversations"
 chunk_upload_dir = "./data/media/chunks"
 chunk_ttl_seconds = 172800
 max_chunk_size_bytes = 52428800
+# Administrative image policy is authoritative for init and completion. The UI reads it.
+admin_image_upload_max_bytes = 8388608
+admin_image_upload_max_pixels = 16777216
+admin_image_upload_max_dimension = 8192
+admin_image_upload_allowed_mime_types = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+# Explicit signed Service actors allowed to validate/resolve application avatar assets.
+# Deployments enabling Social profile avatars must explicitly add their profile service actor.
+application_media_validators = []
 local_storage_dir = "./data/media"
 # 本地文件回退统一走 flare-api-gateway 代理，避免客户端直连宿主机文件服务。
 # 默认开发端口与 flare-api-gateway 当前配置保持一致：50050。

@@ -30,9 +30,7 @@ pub fn capability_error_to_status(e: CapabilityError) -> Status {
     }
     let msg = e.to_string();
     match &e {
-        CapabilityError::PolicyDenied(_) | CapabilityError::Rejected(_) => {
-            Status::permission_denied(msg)
-        }
+        CapabilityError::PolicyDenied(_) => Status::permission_denied(msg),
         CapabilityError::NotRegistered(_) => Status::not_found(msg),
         CapabilityError::NotSupported(_) => Status::unimplemented(msg),
         CapabilityError::Timeout(_) => Status::deadline_exceeded(msg),

@@ -202,7 +202,17 @@ where
             token_version: token_vo,
             initial_quality: connection_quality.clone(),
         };
-        let session = Connection::create(params);
+        let identity_session_id = request.metadata.get("identity_session_id").cloned();
+        if identity_session_id
+            .as_ref()
+            .is_some_and(|sid| uuid::Uuid::parse_str(sid).is_err())
+        {
+            return Err(flare_err!(
+                ErrorCode::PermissionDenied,
+                "invalid authenticated identity session"
+            ));
+        }
+        let session = Connection::create(params).with_identity_session_id(identity_session_id);
         let conversation_id = session.id().as_str().to_string();
 
         let gateway_connection_id = request.metadata.get("connection_id").ok_or_else(|| {

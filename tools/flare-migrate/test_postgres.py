@@ -37,7 +37,7 @@ SOCIAL_TABLES = (
     "flare_moments_audience", "flare_moments_settings", "flare_moments_visibility_rules",
     "flare_my_group_settings", "flare_referral_stats", "flare_refresh_tokens", "flare_reports",
     "flare_role_bundle", "flare_sensitive_hits", "flare_sensitive_words", "flare_social_outbox",
-    "flare_social_outbox_aggregate_seq", "flare_tenant_counters", "flare_tenants",
+    "flare_social_outbox_aggregate_seq", "flare_tenant_client_policy", "flare_tenant_counters", "flare_tenants",
     "flare_user_credentials", "flare_user_groups", "flare_user_login_keys", "flare_user_privacy",
     "flare_user_profiles", "flare_user_qr_tokens", "flare_user_referrals", "flare_users",
     "flare_verification_codes", "social_notification_policy",
@@ -199,20 +199,11 @@ class PostgresMigrationTests(unittest.TestCase):
             self.run_tool(db)
             self.assertEqual(len(migrate.ledger(db, self.migrations)), len(self.migrations))
             self.assertEqual(db.query("SELECT version FROM credential_projection_versions WHERE app_id='app-a';"), "777")
-            self.assertEqual(db.query("SELECT count(*) FROM capability_plugin_endpoints;"), "0")
-            db.query("INSERT INTO capability_plugin_endpoints(tenant_id,plugin_id,capability_id,grpc_authority,declared_operations,unverified) VALUES('t1','p1','rtc.call','http://p1:9',ARRAY['rtc.call'],FALSE);")
-            # The table enforces what the registration RPC enforces: a concrete tenant and a
-            # consistent unverified flag.
-            # (psql stops on the first error, so each refused row gets its own session.)
-            for row in ("('*','p2','c','a','{}',TRUE)", "('t1','p3','c','a',ARRAY['c'],TRUE)", "('t1','p4','c','','{}',TRUE)"):
-                with self.subTest(row=row), self.connect(name) as other, self.assertRaises(migrate.MigrationError):
-                    other.query("INSERT INTO capability_plugin_endpoints(tenant_id,plugin_id,capability_id,grpc_authority,declared_operations,unverified) VALUES " + row + ";")
-            self.run_tool(db)
-            self.assertEqual(db.query("SELECT plugin_id FROM capability_plugin_endpoints;"), "p1")
+            self.assertEqual(db.query("SELECT to_regclass('public.capability_plugin_endpoints') IS NULL;"), "t")
             actual = migrate.snapshot(db)
             migrate.assert_schema(actual, migrate.read_profile("latest", actual["environment"]))
 
-    def test_0019_upgrades_0011_and_retires_only_the_bootstrap_rtc_grant(self):
+    def test_0027_drops_the_user_grant_table_even_with_an_operator_grant(self):
         for source in ("init_bootstrap", "operator"):
             with self.subTest(source=source), self.fixture() as name, self.connect(name) as db:
                 db.query("BEGIN;")
@@ -229,10 +220,8 @@ class PostgresMigrationTests(unittest.TestCase):
 
                 self.run_tool(db)
 
-                expected = dict(before)
-                if source == "init_bootstrap":
-                    expected["rtc_tenant_0_wildcard"] = None
-                self.assertEqual(migrate.seed_state(db), expected)
+                self.assertEqual(migrate.seed_state(db), {**before, "rtc_tenant_0_wildcard": None})
+                self.assertEqual(db.query("SELECT to_regclass('public.capability_user_grants') IS NULL;"), "t")
                 self.assertEqual(db.query("SELECT version FROM credential_projection_versions WHERE app_id='app-a';"), "777")
                 self.assertEqual(len(migrate.ledger(db, self.migrations)), len(self.migrations))
 
@@ -247,6 +236,40 @@ class PostgresMigrationTests(unittest.TestCase):
         actual = migrate.snapshot(db)
         migrate.assert_schema(actual, migrate.read_profile("v0008", actual["environment"]))
 
+    def test_0029_upgrades_ledgered_0028_without_promoting_user_media(self):
+        for timescale in ("2.30.0", "2.29.1"):
+            with self.subTest(timescale=timescale), self.fixture() as name, self.connect(name) as db:
+                db.query(f"CREATE EXTENSION timescaledb WITH SCHEMA public VERSION '{timescale}';")
+                db.query("BEGIN;")
+                db.query(migrate.LEDGER_DDL)
+                for migration in self.migrations[:28]:
+                    migrate.execute_migration(db, migration.sql)
+                    migrate.insert_ledger(db, migration)
+                db.query("COMMIT;")
+                before = migrate.snapshot(db)
+                self.assertEqual(before["environment"]["timescaledb"], timescale)
+                migrate.assert_schema(before, migrate.read_profile("v0028", before["environment"]))
+                db.query("""INSERT INTO media_assets
+                    (tenant_id,file_id,owner_id,file_name,mime_type,file_size,url,metadata) VALUES
+                    ('app-a','same-number','app-a','legacy','text/plain',1,'','{"owner_kind":"application"}'),
+                    ('app-a','unreviewed',NULL,'legacy','text/plain',1,'','{"owner_id":"app-a"}');""")
+                self.run_tool(db)
+                self.assertEqual(db.query("SELECT file_id||'|'||owner_kind||'|'||purpose||'|'||COALESCE(owner_id,'NULL') FROM media_assets ORDER BY file_id;"),
+                                 "same-number|user|general|app-a\nunreviewed|user|general|NULL")
+                self.assertEqual(len(migrate.ledger(db, self.migrations)), len(self.migrations))
+                # Purpose and application-owner constraints reject a cross-app reference.
+                db.query("""DO $$ BEGIN
+                    BEGIN
+                        INSERT INTO media_assets(tenant_id,file_id,owner_id,owner_kind,purpose,file_name,mime_type,file_size,url)
+                        VALUES('app-a','must-fail','app-b','application','avatar','avatar','image/png',1,'');
+                        RAISE EXCEPTION 'application ownership constraint did not reject';
+                    EXCEPTION WHEN check_violation THEN NULL;
+                    END;
+                END $$;""")
+                self.assertEqual(db.query("SELECT count(*) FROM media_assets WHERE file_id='must-fail';"), "0")
+                self.run_tool(db)
+                after = migrate.snapshot(db)
+                migrate.assert_schema(after, migrate.read_profile("latest", after["environment"]))
     def test_0009_upgrades_a_ledgered_0008_database_and_keeps_duplicate_history_rows(self):
         # Rows written before 0009 have no identity; duplicates from redelivery stay and do not block the index.
         history = "INSERT INTO message_operation_history(tenant_id,message_id,operation_type,operator_id,operation_data,timestamp) VALUES ('retained','m1','EVENT_REACTION','u1','{\"event_base64\":\"CAg=\"}','2026-10-01T00:00:00Z');"
@@ -513,7 +536,7 @@ class PostgresMigrationTests(unittest.TestCase):
                     self.run_tool(db, admission=missing_waiver)
             with self.connect(name) as db:
                 self.run_tool(db, admission=approved)
-                self.assertEqual(db.query("SELECT (SELECT count(*) FROM capability_service_settings)+(SELECT count(*) FROM capability_user_grants);"), "0")
+                self.assertEqual(db.query("SELECT count(*) FROM capability_service_settings;"), "0")
                 audit = migrate.ledger(db, self.migrations)[0]
                 self.assertEqual(audit["baseline_admission"], approved)
                 self.assertEqual(audit["admission_sha256"], migrate.digest(approved))
@@ -538,7 +561,7 @@ class PostgresMigrationTests(unittest.TestCase):
             self.run_tool(db, admission=self.approved_fixture(db))
             self.assertEqual(db.query("SELECT status FROM tenants WHERE tenant_id='0';"), "suspended")
             self.assertEqual(db.query("SELECT global_enabled FROM capability_service_settings WHERE id=1;"), "f")
-            self.assertEqual(db.query("SELECT count(*) FROM capability_user_grants;"), "0")
+            self.assertEqual(db.query("SELECT to_regclass('public.capability_user_grants') IS NULL;"), "t")
 
     def test_stale_seed_review_is_rejected(self):
         with self.fixture() as name:

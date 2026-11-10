@@ -1,4 +1,4 @@
-//! gRPC 传输层：按 **控制面 / IM Hook / 媒体扩展 / 共享工具** 分包，避免单目录堆叠。
+//! gRPC 传输层：按 **控制面 / Hook 治理 / 媒体扩展 / 共享工具** 分包，避免单目录堆叠。
 
 pub mod capability;
 pub mod capability_admin;
@@ -15,6 +15,6 @@ pub use capability::{
 pub use capability_admin::CapabilityAdminGrpcServer;
 pub use extensions::ExtensionPluginRouter;
 pub use flare_grpc_proto::capability::capability_service_server::CapabilityServiceServer;
-pub use hooks::{HookServiceServer, ImHookPluginServer};
+pub use hooks::HookServiceServer;
 pub use tenant_notice::TenantNoticeGrpcServer;
 pub use tenant_projection::TenantProjectionGrpcServer;

@@ -33,7 +33,7 @@ impl ServiceDirectory {
     }
 
     /// The tenant's current local projection; a tenant without one has nothing installed.
-    pub async fn snapshot(&self, tenant: &str) -> Result<PluginRuntimeSnapshot, Status> {
+    pub async fn snapshot(&self, tenant: &str) -> Result<Arc<PluginRuntimeSnapshot>, Status> {
         self.authorization
             .plugin_snapshot(tenant)
             .await

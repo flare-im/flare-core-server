@@ -7,9 +7,7 @@ pub mod repository;
 pub mod service;
 
 pub use enums::{MessageCategory, MessageFsmState, PersistenceMode};
-pub use extension::{
-    ExtensionFailureMode, ExtensionPolicy, ExtensionRouting, ExtensionRuntimePolicy,
-};
+pub use extension::ExtensionRouting;
 pub use model::ConversationType;
 pub use model::message_kind::MessageProfile;
 pub use model::message_submission::{MessageDefaults, MessageSubmission};

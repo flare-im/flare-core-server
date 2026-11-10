@@ -281,6 +281,7 @@ mod tests {
         for (code, status) in [
             ("PLUGIN_NOT_INSTALLED", ErrorCode::HttpNotFound),
             ("PLUGIN_DISABLED", ErrorCode::HttpForbidden),
+            ("PLUGIN_FEATURE_DISABLED", ErrorCode::HttpForbidden),
             ("PLUGIN_PERMISSION_DENIED", ErrorCode::HttpForbidden),
             ("PLUGIN_UNSUPPORTED_PLATFORM", ErrorCode::HttpForbidden),
             ("PLUGIN_CARD_UNBOUND", ErrorCode::HttpConflict),

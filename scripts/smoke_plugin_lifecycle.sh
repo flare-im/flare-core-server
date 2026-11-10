@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# 能力插件生命周期冒烟：登记 → 未授权被拒 → 控制面下发授权投影 → 调用 → 撤销后被拒 →
-# 租约到期后被拒 → 退出即注销。
+# 能力插件生命周期冒烟：起插件 → 未授权被拒 → 控制面下发授权投影 → 调用 → 撤销后被拒 →
+# 租约到期后被拒。
 #
 # 为什么需要它：插件「装上就能用」这句话此前只有人工验证过一次。登记、授权投影、调用票据、
 # Dispatch 转发任意一处坏掉，都不会有任何信号——单测覆盖不到跨进程的这条链路，而它正是
 # 能力插件对外的全部承诺。
 #
 # 核心的远程插件调用只认控制面下发、平台签名、带租约的插件授权投影（TenantProjection.
-# UpsertPlugins）；插件登记要平台签发、绑定请求体的注册凭据；每次调用核心都签一张调用票据，
+# UpsertPlugins）；每次调用核心都签一张调用票据，
 # 插件验过才执行。开源栈没有控制面，本脚本用 examples/capability_dev_control 在本机扮演它：
 # --prepare 现生成一把平台密钥与一把调用票据密钥，Core 启动时只信任这把平台公钥
 # （FLARE_PLATFORM_PUBLIC_KEY），用这把密钥签调用票据（FLARE_PLUGIN_CALL_KEY_ID /
@@ -20,7 +20,7 @@
 #
 # 只需要带库运行的 capability 服务（默认 :50110）。调用方身份用 start_server.sh 的 Cell 私钥
 # 签（FLARE_INTERNAL_CTX_KEY_DIR，缺省 logs/.dev-internal-context），与网关、插件宿主签的相同。
-# 每次运行用一个新租户，不受上一次留下的登记与投影影响。
+# 每次运行用一个新租户，不受上一次留下的投影影响。
 #
 # 退出码 0 = 全部通过；缺前提即失败，不跳过。
 set -uo pipefail
@@ -30,7 +30,6 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CAPABILITY_ADDR="${CAPABILITY_ADDR:-127.0.0.1:50110}"
 PLUGIN_ADDR="${PLUGIN_ADDR:-127.0.0.1:7803}"
-BROKER_ADDR="${PLUGIN_BROKER_ADDR:-127.0.0.1:7811}"
 USER_ID="${PLUGIN_USER:-smoke-alice}"
 STEP_TIMEOUT="${PLUGIN_SMOKE_TIMEOUT:-60}"
 CAPABILITY_ID="link.preview.v1"
@@ -39,7 +38,7 @@ DEPLOYMENT_ID="link-preview-smoke"
 CALL_KEY_ID="plugin-smoke"
 MANIFEST="$ROOT/examples/capability_link_preview.manifest.json"
 LOG_DIR="$ROOT/logs/plugin-smoke"
-TOTAL=7
+TOTAL=6
 
 # ---- --prepare：启动 Core 之前现生成夹具密钥 --------------------------------
 
@@ -59,8 +58,7 @@ if [ "${1:-}" = "--prepare" ]; then
   (
     umask 077
     openssl genpkey -algorithm Ed25519 -out "$dir/platform.pem" 2>/dev/null &&
-      openssl genpkey -algorithm Ed25519 -out "$dir/call.pem" 2>/dev/null &&
-      openssl rand -hex 32 > "$dir/workload.token"
+      openssl genpkey -algorithm Ed25519 -out "$dir/call.pem" 2>/dev/null
   ) || { echo "生成夹具密钥失败" >&2; exit 2; }
   # Ed25519 的 PKCS#8 DER 固定 48 字节（16 字节前缀 + 32 字节种子），下面按这个取种子。
   if [ "$(openssl pkey -in "$dir/call.pem" -outform DER 2>/dev/null | wc -c | tr -d ' ')" != 48 ]; then
@@ -87,14 +85,14 @@ if [ "${1:-}" = "--prepare" ]; then
 fi
 
 pass=0; fail=0
-plugin_pid=""; broker_pid=""
+plugin_pid=""
 
 note_pass() { pass=$((pass+1)); echo -e "  ${GREEN}✓${NC} $1"; }
 note_fail() { fail=$((fail+1)); echo -e "  ${RED}✗${NC} $1"; [ -n "${2:-}" ] && echo "      $2"; }
 abort() { echo -e "${RED}✗ $1${NC}"; [ -n "${2:-}" ] && echo "  $2"; exit 1; }
 
 cleanup() {
-  for pid in $plugin_pid $broker_pid; do
+  for pid in $plugin_pid; do
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
   done
@@ -104,7 +102,7 @@ trap cleanup EXIT
 # ---- 前置检查：缺什么就明说缺什么，不静默跳过 ------------------------------
 
 DIR="${PLUGIN_SMOKE_DIR:-}"
-if [ -z "$DIR" ] || [ ! -f "$DIR/platform.pem" ] || [ ! -f "$DIR/call.pem" ] || [ ! -f "$DIR/workload.token" ]; then
+if [ -z "$DIR" ] || [ ! -f "$DIR/platform.pem" ] || [ ! -f "$DIR/call.pem" ]; then
   abort "缺少夹具目录（PLUGIN_SMOKE_DIR）" \
     "先 $0 --prepare DIR，按 DIR/core.env 启动 Core，再 PLUGIN_SMOKE_DIR=DIR $0"
 fi
@@ -145,10 +143,6 @@ dispatch() {
   control dispatch --capability "$CAPABILITY_URL" --cell-key "$CELL_KEY" --tenant "$TENANT" \
     --user "$USER_ID" --operation "$CAPABILITY_ID" --payload '{"url":"https://example.com"}'
 }
-listed() {
-  control list --capability "$CAPABILITY_URL" --cell-key "$CELL_KEY" --tenant "$TENANT" \
-    --plugin-id "$PLUGIN_ID"
-}
 # 投影缺席、撤销与租约到期，核心都按平台错误码拒绝，命令不到插件。
 refused_as_unusable() {
   echo "$1" | grep -qE '^refused code=PermissionDenied reason=PLUGIN_(NOT_INSTALLED|DISABLED) '
@@ -159,57 +153,35 @@ dispatched_by_plugin() {
 
 echo -e "${YELLOW}能力插件生命周期冒烟（$TOTAL 步，租户 $TENANT）${NC}"
 
-# ---- 0. 注册凭据交换（平台的一部分，由夹具扮演） -------------------------------
-
-"$CONTROL_BIN" broker --listen "$BROKER_ADDR" --platform-key "$DIR/platform.pem" \
-  --workload-token-file "$DIR/workload.token" --deployment-id "$DEPLOYMENT_ID" \
-  --plugin-id "$PLUGIN_ID" --tenant "$TENANT" >"$LOG_DIR/broker.log" 2>&1 &
-broker_pid=$!
-for _ in $(seq 1 20); do
-  grep -q "^broker listening=" "$LOG_DIR/broker.log" 2>/dev/null && break
-  kill -0 "$broker_pid" 2>/dev/null || break
-  sleep 0.5
-done
-grep -q "^broker listening=" "$LOG_DIR/broker.log" 2>/dev/null ||
-  abort "注册凭据交换没有起来" "$(tail -3 "$LOG_DIR/broker.log" 2>/dev/null)"
-
-# ---- 1. 起插件，它应当带平台签的注册凭据自登记 ------------------------------------
+# ---- 1. 起插件，部署由运维登记，进程自己不登记 ------------------------------------
 
 call_public="$(openssl pkey -in "$DIR/call.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | openssl base64 -A)"
 LINK_PREVIEW_ADDR="$PLUGIN_ADDR" \
-CAPABILITY_CORE_ADDR="$CAPABILITY_URL" \
-LINK_PREVIEW_TENANT="$TENANT" \
 FLARE_PLUGIN_CALL_PUBLIC_KEYS="[{\"key_id\":\"$CALL_KEY_ID\",\"public_key_base64\":\"$call_public\"}]" \
-FLARE_PLUGIN_BROKER_URL="http://$BROKER_ADDR/api/v1/internal/plugins/registration-tokens" \
-FLARE_PLUGIN_WORKLOAD_TOKEN_FILE="$DIR/workload.token" \
 FLARE_PLUGIN_DEPLOYMENT_ID="$DEPLOYMENT_ID" \
   "$PLUGIN_BIN" >"$LOG_DIR/plugin.log" 2>&1 &
 plugin_pid=$!
 
-# 轮询而不是固定 sleep：慢机器上固定等待要么不够要么浪费。
-registered=""
 for _ in $(seq 1 "$STEP_TIMEOUT"); do
-  registered="$(listed)"
-  echo "$registered" | grep -q "^listed registered=true" && break
+  nc -z ${PLUGIN_ADDR%:*} ${PLUGIN_ADDR##*:} 2>/dev/null && break
   kill -0 "$plugin_pid" 2>/dev/null || break
   sleep 1
 done
-if echo "$registered" | grep -q "^listed registered=true"; then
-  note_pass "插件带平台签的注册凭据自登记到核心"
+if nc -z ${PLUGIN_ADDR%:*} ${PLUGIN_ADDR##*:} 2>/dev/null; then
+  note_pass "插件在监听"
 else
-  note_fail "插件未能在 ${STEP_TIMEOUT}s 内登记" \
-    "$(echo "$registered" | tail -1)；插件日志：$(tail -2 "$LOG_DIR/plugin.log" 2>/dev/null)"
+  note_fail "插件未能在 ${STEP_TIMEOUT}s 内监听" "插件日志：$(tail -2 "$LOG_DIR/plugin.log" 2>/dev/null)"
   echo -e "\n${RED}❌ 后续步骤依赖插件在线，中止${NC}"
   exit 1
 fi
 
 # ---- 2. 没有授权投影时应被拒 -----------------------------------------------------
 #
-# 反向断言：登记不授予调用权。少了它，就算授权判断被误删，这个冒烟也照样全绿。
+# 反向断言：部署在线不授予调用权。少了它，就算授权判断被误删，这个冒烟也照样全绿。
 
 denied="$(dispatch)"
 if refused_as_unusable "$denied"; then
-  note_pass "控制面未下发授权投影时调用被拒（登记不授予调用权）"
+  note_pass "控制面未下发授权投影时调用被拒"
 else
   note_fail "没有授权投影却调通了——授权校验可能失效" "$denied"
 fi
@@ -271,21 +243,8 @@ else
   note_fail "租约到期后仍能调用" "$after_expiry"
 fi
 
-# ---- 7. 插件退出应自动注销 ---------------------------------------------------------
-
 kill -INT "$plugin_pid" 2>/dev/null
-for _ in $(seq 1 15); do
-  kill -0 "$plugin_pid" 2>/dev/null || break
-  sleep 1
-done
 plugin_pid=""
-
-gone="$(listed)"
-if echo "$gone" | grep -q "^listed registered=false"; then
-  note_pass "插件退出后已从路由簿摘除"
-else
-  note_fail "插件退出后仍留在路由簿" "$gone；插件日志：$(tail -2 "$LOG_DIR/plugin.log" 2>/dev/null)"
-fi
 
 echo ""
 if [ "$fail" -eq 0 ] && [ "$pass" -eq "$TOTAL" ]; then

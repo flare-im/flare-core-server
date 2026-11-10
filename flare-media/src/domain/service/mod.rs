@@ -13,10 +13,11 @@ use crate::domain::model::{
     DirectUploadSessionState, DirectUploadTransportKind, EXTERNAL_MEDIA_LIFECYCLE_SCOPE,
     FILE_CATEGORY_METADATA_KEY, FileAccessType, MEDIA_LIFECYCLE_SCOPE_METADATA_KEY,
     MESSAGE_MEDIA_LIFECYCLE_SCOPE, MediaAssetStatus, MediaDomainConfig, MediaFileMetadata,
-    MediaReference, MediaReferenceScope, MultipartChunkPayload, MultipartUploadInit,
-    MultipartUploadSession, ObjectStat, PresignedUploadPartUrl, PresignedUrl,
-    STORAGE_BUCKET_METADATA_KEY, STORAGE_PATH_METADATA_KEY, UploadContext, UploadSession,
-    UploadSessionStatus, UploadedPartRecord, infer_file_category, is_absolute_http_url,
+    MediaOwnerKind, MediaPurpose, MediaReference, MediaReferenceScope, MultipartChunkPayload,
+    MultipartUploadInit, MultipartUploadSession, ObjectStat, PresignedUploadPartUrl, PresignedUrl,
+    STORAGE_BUCKET_METADATA_KEY, STORAGE_PATH_METADATA_KEY, UploadActorKind, UploadContext,
+    UploadSession, UploadSessionStatus, UploadedPartRecord, infer_file_category,
+    is_absolute_http_url,
 };
 use crate::domain::repository::{
     LocalStoreRef, MetadataCacheRef, MetadataStoreRef, ObjectRepositoryRef, ReferenceStoreRef,
@@ -115,11 +116,13 @@ impl MediaService {
     }
 }
 
+mod admin_upload;
 mod attachment_read;
 #[cfg(test)]
 mod cdn_url_tests;
 mod direct;
 mod helpers;
+mod image_probe;
 #[cfg(test)]
 pub(crate) mod isolation_tests;
 mod multipart;

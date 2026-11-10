@@ -66,6 +66,14 @@ fn staff() -> flare_im_contracts::Ctx {
 #[tokio::test]
 #[ignore = "requires explicit owned-test PG and redis-server on PATH"]
 async fn command_survives_missing_receiver_tail_failure_and_keeps_new_physical_session() {
+    owned_command_fixture(false).await;
+}
+#[tokio::test]
+#[ignore = "requires explicit owned-test PG and redis-server on PATH"]
+async fn identity_revocation_requires_ack_preserves_new_sid_and_fences_pending_connect() {
+    owned_command_fixture(true).await;
+}
+async fn owned_command_fixture(identity: bool) {
     let url = std::env::var("FLARE_FUNCTIONAL_PG_ADMIN_URL").unwrap();
     let root = PathBuf::from("/tmp").join(format!("flare-online-audit-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
@@ -112,7 +120,11 @@ async fn command_survives_missing_receiver_tail_failure_and_keeps_new_physical_s
     );
     let run = pool.clone();
     let result = tokio::spawn(async move {
-        check_commands(run, client, redis_url).await;
+        if identity {
+            check_identity_commands(run, client, redis_url).await;
+        } else {
+            check_commands(run, client, redis_url).await;
+        }
     })
     .await;
     pool.close().await;
@@ -163,6 +175,7 @@ async fn check_commands(pool: Arc<PgPool>, client: Arc<redis::Client>, url: Stri
         last_seen: 1,
         device_priority: 2,
         token_version: 1,
+        identity_session_id: None,
     };
     let mut redis = client.get_multiplexed_async_connection().await.unwrap();
     let _: () = redis
@@ -345,4 +358,229 @@ async fn check_commands(pool: Arc<PgPool>, client: Arc<redis::Client>, url: Stri
         serde_json::from_str::<Value>(&current).unwrap()["connection_id"],
         "physical-new"
     );
+}
+
+async fn check_identity_commands(pool: Arc<PgPool>, client: Arc<redis::Client>, url: String) {
+    sqlx::raw_sql(include_str!(
+        "../../../../../../migrations/0012_20261015_core_audit_outbox.sql"
+    ))
+    .execute(&*pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../../../migrations/0014_20261015_online_kick_commands.sql"
+    ))
+    .execute(&*pool)
+    .await
+    .unwrap();
+    let config = Arc::new(OnlineConfig {
+        redis_url: url.clone(),
+        kick_redis_url: url,
+        kick_channel: "owned:identity-kick".into(),
+        presence_prefix: "owned:presence".into(),
+        redis_ttl_seconds: 3600,
+        tenant_runtime_postgres_url: None,
+        tenant_policy: flare_im_service_kit::tenant_runtime::TenantAccessPolicy::Lenient,
+        max_online_devices_per_user: 10,
+    });
+    let repo =
+        RedisConversationRepository::new(client.clone(), config).with_command_pool(pool.clone());
+    let old_sid = uuid::Uuid::new_v4().to_string();
+    let new_sid = uuid::Uuid::new_v4().to_string();
+    let make = |physical: &str, created_at, sid: Option<String>| RedisConnectionRecord {
+        tenant_id: "app-a".into(),
+        conversation_id: uuid::Uuid::new_v4().to_string(),
+        gateway_id: "identity-gateway".into(),
+        server_id: "identity-server".into(),
+        device_id: physical.into(),
+        device_platform: "test".into(),
+        connection_id: physical.into(),
+        created_at,
+        last_seen: 1,
+        device_priority: 2,
+        token_version: 0,
+        identity_session_id: sid,
+    };
+    let old = make("physical-old", 1, Some(old_sid.clone()));
+    let new = make("physical-new", 1, Some(new_sid.clone()));
+    let legacy = make("legacy-old", 10, None);
+    let future = make("legacy-later", 101, None);
+    let key = RedisConversationRepository::connection_key("app-a", "identity-user");
+    let mut redis = client.get_multiplexed_async_connection().await.unwrap();
+    for record in [&old, &new, &legacy, &future] {
+        let _: () = redis
+            .hset(
+                &key,
+                &record.conversation_id,
+                serde_json::to_string(record).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    let mut other = old.clone();
+    other.tenant_id = "app-b".into();
+    other.connection_id = "other-tenant".into();
+    let _: () = redis
+        .hset(
+            RedisConversationRepository::connection_key("app-b", "identity-user"),
+            &other.conversation_id,
+            serde_json::to_string(&other).unwrap(),
+        )
+        .await
+        .unwrap();
+    let user = UserId::new("identity-user".into()).unwrap();
+    let originals = vec![old_sid.clone()];
+    // No addressed receiver ACK means deferred delivery, not success. Tombstones
+    // already serialize with admission and the exact durable target is retained.
+    assert!(
+        repo.revoke_identity_sessions(
+            "app-a",
+            &user,
+            &originals,
+            100,
+            "fixed-identity-intent",
+            "owned-key"
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM online_kick_commands WHERE completed_at IS NULL"
+        )
+        .fetch_one(&*pool)
+        .await
+        .unwrap(),
+        1
+    );
+    let mut sub = client.get_async_pubsub().await.unwrap();
+    sub.subscribe("owned:identity-kick").await.unwrap();
+    let receiver_client = client.clone();
+    let (stop, mut shutdown) = tokio::sync::oneshot::channel();
+    let receiver = tokio::spawn(async move {
+        let mut stream = sub.on_message();
+        loop {
+            tokio::select! {
+                _=&mut shutdown=>break,
+                msg=stream.next()=>{
+                    let value:Value=serde_json::from_str(&msg.unwrap().get_payload::<String>().unwrap()).unwrap();
+                    let physical=value["connection_id"].as_str().unwrap();
+                    assert!(matches!(physical,"physical-old"|"legacy-old"),"new/other tenant sessions must never be targeted");
+                    assert_eq!(value["tenant_id"],"app-a");assert_eq!(value["reason"],"TOKEN_REVOKED");
+                    let mut redis=receiver_client.get_multiplexed_async_connection().await.unwrap();
+                    let _:()=redis.set_ex(format!("owned:identity-kick:receipt:{}",value["command_id"].as_str().unwrap()),physical,60).await.unwrap();
+                }
+            }
+        }
+    });
+    assert_eq!(
+        repo.revoke_identity_sessions(
+            "app-a",
+            &user,
+            &originals,
+            100,
+            "fixed-identity-intent",
+            "owned-key"
+        )
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.revoke_identity_sessions(
+            "app-a",
+            &user,
+            &originals,
+            100,
+            "fixed-identity-intent",
+            "owned-key"
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM online_kick_commands")
+            .fetch_one(&*pool)
+            .await
+            .unwrap(),
+        2
+    );
+    let records: HashMap<String, String> = redis.hgetall(&key).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records.contains_key(&new.conversation_id) && records.contains_key(&future.conversation_id)
+    );
+    let other_count: usize = redis
+        .hlen(RedisConversationRepository::connection_key(
+            "app-b",
+            "identity-user",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_count, 1);
+    let evidence: Vec<Value> = sqlx::query_scalar("SELECT payload FROM core_audit_outbox")
+        .fetch_all(&*pool)
+        .await
+        .unwrap();
+    assert_eq!(evidence.len(), 2);
+    for row in evidence {
+        assert_eq!(row["actor_type"], "service");
+        assert_eq!(row["actor_id"], "flare-social-bridge");
+        assert_eq!(row["credential_id"], "internal-key:owned-key");
+        assert_eq!(row["request_id"], "fixed-identity-intent", "owned-key");
+    }
+    let old_id = ConnectionId::from_string(old.conversation_id.clone()).unwrap();
+    assert!(
+        repo.touch_connection("app-a", &old_id, &user)
+            .await
+            .is_err()
+    );
+    assert!(
+        !redis
+            .hexists::<_, _, bool>(&key, old_id.as_str())
+            .await
+            .unwrap(),
+        "retired heartbeat must not reinsert its record"
+    );
+    let new_id = ConnectionId::from_string(new.conversation_id.clone()).unwrap();
+    repo.touch_connection("app-a", &new_id, &user)
+        .await
+        .unwrap();
+    let connection = RedisConversationRepository::connection_from_record(&user, old).unwrap();
+    assert!(
+        repo.admit_connection(
+            &connection,
+            "suspended-old-connect",
+            flare_grpc_proto::signaling::online::DeviceConflictStrategy::Coexist,
+            10
+        )
+        .await
+        .is_err()
+    );
+    let newer = make("newer", 102, Some(uuid::Uuid::new_v4().to_string()));
+    let connection = RedisConversationRepository::connection_from_record(&user, newer).unwrap();
+    repo.admit_connection(
+        &connection,
+        "newer-physical",
+        flare_grpc_proto::signaling::online::DeviceConflictStrategy::Coexist,
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.revoke_identity_sessions(
+            "app-a",
+            &user,
+            &originals,
+            100,
+            "fixed-identity-intent",
+            "owned-key"
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    stop.send(()).unwrap();
+    receiver.await.unwrap();
 }

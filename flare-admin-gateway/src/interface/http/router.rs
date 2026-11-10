@@ -19,8 +19,11 @@ use super::admin_auth_middleware::admin_auth_middleware;
 use super::admin_handler;
 use super::hooks_handler;
 use super::media_handler;
+use super::media_upload_handler;
 use super::ops_handler::{self, AdminCapability, AdminCapabilityDownstream};
+use super::platform_hooks_handler;
 use super::plugin_admin_handler;
+use super::plugin_registry_handler;
 use flare_im_service_kit::clients::AdminGrpcClients;
 
 #[allow(dead_code)]
@@ -42,6 +45,14 @@ use flare_im_service_kit::clients::AdminGrpcClients;
         media_handler::set_object_acl,
         media_handler::list_objects,
         media_handler::describe_bucket,
+        media_upload_handler::upload_policy,
+        media_upload_handler::initiate_upload,
+        media_upload_handler::upload_status,
+        media_upload_handler::presign_parts,
+        media_upload_handler::commit_parts,
+        media_upload_handler::complete_upload,
+        media_upload_handler::abort_upload,
+        media_upload_handler::resolve_media,
         ops_handler::list_conversations,
         ops_handler::get_conversation,
         ops_handler::list_participants,
@@ -55,8 +66,6 @@ use flare_im_service_kit::clients::AdminGrpcClients;
         ops_handler::list_tenant_capabilities,
         ops_handler::set_tenant_capability_switch,
         ops_handler::list_plugins,
-        ops_handler::register_plugin,
-        ops_handler::deregister_plugin,
         hooks_handler::list_hooks,
         hooks_handler::create_hook,
         hooks_handler::get_hook,
@@ -65,13 +74,41 @@ use flare_im_service_kit::clients::AdminGrpcClients;
         hooks_handler::set_hook_status,
         hooks_handler::get_hook_statistics,
         hooks_handler::query_hook_executions,
+        platform_hooks_handler::list_platform_hooks,
+        platform_hooks_handler::create_platform_hook,
+        platform_hooks_handler::list_hook_points,
+        platform_hooks_handler::list_hook_profiles,
+        platform_hooks_handler::test_hook,
+        platform_hooks_handler::get_platform_hook,
+        platform_hooks_handler::update_platform_hook,
+        platform_hooks_handler::delete_platform_hook,
+        platform_hooks_handler::set_platform_hook_status,
+        platform_hooks_handler::get_platform_hook_statistics,
+        platform_hooks_handler::query_platform_hook_executions,
         plugin_admin_handler::query_plugin_admin,
         plugin_admin_handler::dispatch_plugin_admin,
+        plugin_registry_handler::list_versions,
+        plugin_registry_handler::get_version,
+        plugin_registry_handler::register_version,
+        plugin_registry_handler::set_version_state,
+        plugin_registry_handler::list_deployments,
+        plugin_registry_handler::register_deployment,
+        plugin_registry_handler::app_status,
+        plugin_registry_handler::get_config,
+        plugin_registry_handler::put_config,
+        plugin_registry_handler::register_development,
+        plugin_registry_handler::flag_development_app,
     ),
     components(
         schemas(
             plugin_admin_handler::AdminPluginCallHttpRequest,
             plugin_admin_handler::AdminPluginCallHttp,
+            plugin_registry_handler::AdminPluginRegistryHttp,
+            plugin_registry_handler::AdminPluginVersionStateHttpRequest,
+            plugin_registry_handler::AdminPluginDeploymentHttpRequest,
+            plugin_registry_handler::AdminPluginConfigHttpRequest,
+        plugin_registry_handler::AdminPluginDevHttpRequest,
+        plugin_registry_handler::AdminPluginDevAppHttpRequest,
             media_handler::ListObjectsQuery,
             media_handler::AdminMediaObjects,
             media_handler::AdminMediaObject,
@@ -80,6 +117,21 @@ use flare_im_service_kit::clients::AdminGrpcClients;
             media_handler::AdminMediaAclEntry,
             media_handler::AdminMediaAclRequest,
             media_handler::AdminMediaBucketResponse,
+            media_upload_handler::AdminImagePurpose,
+            media_upload_handler::AdminUploadPolicy,
+            media_upload_handler::AdminImageUploadRequest,
+            media_upload_handler::AdminImageUploadSession,
+            media_upload_handler::AdminUploadTransport,
+            media_upload_handler::AdminUploadStatus,
+            media_upload_handler::AdminUploadedPart,
+            media_upload_handler::AdminUploadId,
+            media_upload_handler::AdminPresignPartsRequest,
+            media_upload_handler::AdminPresignedPart,
+            media_upload_handler::AdminPresignedParts,
+            media_upload_handler::AdminCommitPartsRequest,
+            media_upload_handler::AdminCommittedParts,
+            media_upload_handler::AdminUploadedImage,
+            media_upload_handler::AdminMediaAccess,
             super::admin_contract::AdminCapabilitiesResponse,
             super::admin_contract::AdminRequiredHeaders,
             super::admin_contract::AdminEndpointDescriptor,
@@ -139,15 +191,8 @@ use flare_im_service_kit::clients::AdminGrpcClients;
             crate::application::admin_ops::AdminCapabilitySwitchUpdateHttp,
             crate::application::admin_ops::AdminPluginHttp,
             crate::application::admin_ops::AdminPluginsHttp,
-            crate::application::admin_ops::AdminPluginRegisterHttpRequest,
-            crate::application::admin_ops::AdminPluginRegisterHttp,
-            crate::application::admin_ops::AdminPluginDeregisterHttpRequest,
-            crate::application::admin_ops::AdminPluginDeregisterHttp,
             crate::application::admin_hooks::AdminHookTransportHttp,
             crate::application::admin_hooks::AdminHookSelectorHttp,
-            crate::application::admin_hooks::AdminHookRetryPolicyHttp,
-            crate::application::admin_hooks::AdminProtoAnyHttp,
-            crate::application::admin_hooks::AdminHookExtensionBagHttp,
             crate::application::admin_hooks::AdminHookHttp,
             crate::application::admin_hooks::AdminHookDetailHttp,
             crate::application::admin_hooks::AdminHooksPageHttp,
@@ -159,6 +204,13 @@ use flare_im_service_kit::clients::AdminGrpcClients;
             crate::application::admin_hooks::AdminHookStatisticsHttp,
             crate::application::admin_hooks::AdminHookExecutionHttp,
             crate::application::admin_hooks::AdminHookExecutionsPageHttp,
+            crate::application::admin_hooks::AdminHookPointHttp,
+            crate::application::admin_hooks::AdminHookPointsHttp,
+            crate::application::admin_hooks::AdminDeploymentHookHttp,
+            crate::application::admin_hooks::AdminHookProfileHttp,
+            crate::application::admin_hooks::AdminHookProfilesHttp,
+            crate::application::admin_hooks::AdminHookTestHttpRequest,
+            crate::application::admin_hooks::AdminHookTestHttp,
         )
     ),
     tags(
@@ -334,6 +386,38 @@ pub fn create_admin_router(
         .route("/medias/object-acl", post(media_handler::set_object_acl))
         .route("/medias/objects", get(media_handler::list_objects))
         .route("/medias/bucket", get(media_handler::describe_bucket))
+        .route(
+            "/medias/upload-policy",
+            get(media_upload_handler::upload_policy),
+        )
+        .route(
+            "/medias/uploads/initiate",
+            post(media_upload_handler::initiate_upload),
+        )
+        .route(
+            "/medias/uploads/{upload_id}",
+            get(media_upload_handler::upload_status),
+        )
+        .route(
+            "/medias/uploads/presign-parts",
+            post(media_upload_handler::presign_parts),
+        )
+        .route(
+            "/medias/uploads/commit-parts",
+            post(media_upload_handler::commit_parts),
+        )
+        .route(
+            "/medias/uploads/complete",
+            post(media_upload_handler::complete_upload),
+        )
+        .route(
+            "/medias/uploads/abort",
+            post(media_upload_handler::abort_upload),
+        )
+        .route(
+            "/medias/files/{file_id}/url",
+            get(media_upload_handler::resolve_media),
+        )
         .route("/auth/check", get(admin_handler::admin_auth_check))
         .route("/capabilities", get(admin_handler::admin_capabilities))
         .route("/gateway/health", get(admin_handler::admin_gateway_health))
@@ -397,8 +481,6 @@ pub fn create_admin_router(
             put(ops_handler::set_tenant_capability_switch),
         )
         .route("/plugins", get(ops_handler::list_plugins))
-        .route("/plugins/register", post(ops_handler::register_plugin))
-        .route("/plugins/deregister", post(ops_handler::deregister_plugin))
         .route(
             "/hooks",
             get(hooks_handler::list_hooks).post(hooks_handler::create_hook),
@@ -422,12 +504,88 @@ pub fn create_admin_router(
             get(hooks_handler::query_hook_executions),
         )
         .route(
+            "/platform/hooks",
+            get(platform_hooks_handler::list_platform_hooks)
+                .post(platform_hooks_handler::create_platform_hook),
+        )
+        .route(
+            "/platform/hooks/points",
+            get(platform_hooks_handler::list_hook_points),
+        )
+        .route(
+            "/platform/hooks/profiles",
+            get(platform_hooks_handler::list_hook_profiles),
+        )
+        .route(
+            "/platform/hooks/test",
+            post(platform_hooks_handler::test_hook),
+        )
+        .route(
+            "/platform/hooks/{hook_id}",
+            get(platform_hooks_handler::get_platform_hook)
+                .put(platform_hooks_handler::update_platform_hook)
+                .delete(platform_hooks_handler::delete_platform_hook),
+        )
+        .route(
+            "/platform/hooks/{hook_id}/status",
+            put(platform_hooks_handler::set_platform_hook_status),
+        )
+        .route(
+            "/platform/hooks/{hook_id}/statistics",
+            get(platform_hooks_handler::get_platform_hook_statistics),
+        )
+        .route(
+            "/platform/hooks/{hook_id}/executions",
+            get(platform_hooks_handler::query_platform_hook_executions),
+        )
+        .route(
             "/plugin-admin/{plugin_id}/{permission}/query",
             post(plugin_admin_handler::query_plugin_admin),
         )
         .route(
             "/plugin-admin/{plugin_id}/{permission}/dispatch",
             post(plugin_admin_handler::dispatch_plugin_admin),
+        )
+        .route(
+            "/platform/plugin-registry/versions",
+            get(plugin_registry_handler::list_versions)
+                .post(plugin_registry_handler::register_version)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    plugin_registry_handler::MAX_PACKAGE_BYTES,
+                )),
+        )
+        .route(
+            "/platform/plugin-registry/versions/{plugin_id}/{version}",
+            get(plugin_registry_handler::get_version),
+        )
+        .route(
+            "/platform/plugin-registry/versions/{plugin_id}/{version}/state",
+            put(plugin_registry_handler::set_version_state),
+        )
+        .route(
+            "/platform/plugin-registry/deployments",
+            get(plugin_registry_handler::list_deployments)
+                .post(plugin_registry_handler::register_deployment),
+        )
+        .route(
+            "/platform/plugin-registry/dev-apps/{app_id}",
+            put(plugin_registry_handler::flag_development_app),
+        )
+        .route(
+            "/plugin-registry/dev",
+            post(plugin_registry_handler::register_development).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    plugin_registry_handler::MAX_DEV_REGISTRATION_BYTES,
+                ),
+            ),
+        )
+        .route(
+            "/plugin-registry/status",
+            get(plugin_registry_handler::app_status),
+        )
+        .route(
+            "/plugin-registry/bindings/{binding_id}/config",
+            get(plugin_registry_handler::get_config).put(plugin_registry_handler::put_config),
         )
         .layer(axum::Extension(clients))
         .layer(axum::Extension(AdminCapability::new(capability)))

@@ -2,10 +2,12 @@
 
 mod capability_catalog;
 mod hook_integration;
+mod plugin_registry;
 mod tenant_admin;
 mod tenant_versions;
 
 pub use capability_catalog::list_registered_capabilities;
 pub use hook_integration::{HookIntegrationChannelDoc, list_hook_integration_channels};
+pub use plugin_registry::PluginRegistryQueries;
 pub use tenant_admin::{tenant_capability_switches, tenant_runtime};
 pub use tenant_versions::tenant_projection_versions;

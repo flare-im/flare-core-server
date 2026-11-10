@@ -97,6 +97,7 @@ impl ConnectionDomainService {
             .unwrap_or(DeviceConflictStrategy::PlatformExclusive as i32);
         if let Some(connection_metadata) = connection_metadata {
             for key in [
+                "identity_session_id", // authenticated ConnectionIdentity metadata only
                 "app_version",
                 "system_version",
                 "model",

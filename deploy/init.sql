@@ -8,7 +8,7 @@
 --   - common/models.proto    (PinnedMessageInfo, MarkedMessageInfo, EditHistory, Reaction, ThreadInfo)
 --   - common/enums.proto     (DeleteType, MarkType, ReactionAction)
 --   - storage.proto         (StoreMessage, VisibilityStatus)
---   - flare-capability: hook_configs / hook_executions（Hook 引擎）；capability_*（CapabilityService 策略）
+--   - flare-capability: hook_configs / hook_executions（Hook 控制面，运行时在 Message Ingest）；capability_*（CapabilityService 策略）
 -- 数据库: PostgreSQL + TimescaleDB
 -- 维护约定: 生产 DDL 只追加 migrations/*.sql；本文件同步最新开发快照，不用于升级已有数据库。
 
@@ -784,6 +784,7 @@ CREATE TABLE conversations (
     last_message_seq BIGINT,
     member_count INT DEFAULT 0,
     channel_id TEXT NOT NULL DEFAULT '',
+    history_cleared_through_seq BIGINT NOT NULL DEFAULT 0,  -- 0021: everyone's history cutoff
     PRIMARY KEY (tenant_id, conversation_id)
 );
 COMMENT ON TABLE conversations IS '会话元数据（ConversationDetail）';
@@ -829,6 +830,7 @@ CREATE TABLE conversation_participants (
     quit_at TIMESTAMPTZ,
     visible_from_seq BIGINT NOT NULL DEFAULT 0,
     mention_only BOOLEAN NOT NULL DEFAULT FALSE,
+    history_cleared_through_seq BIGINT NOT NULL DEFAULT 0,  -- 0021: personal history cutoff
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (tenant_id, conversation_id, user_id),
@@ -900,6 +902,8 @@ DROP TABLE IF EXISTS media_assets CASCADE;
 CREATE TABLE media_assets (
     tenant_id TEXT NOT NULL,
     owner_id TEXT,
+    owner_kind TEXT NOT NULL DEFAULT 'user' CHECK (owner_kind IN ('user', 'application')),
+    purpose TEXT NOT NULL DEFAULT 'general' CHECK (purpose IN ('general', 'avatar', 'image')),
     file_id TEXT NOT NULL,
     file_name TEXT NOT NULL,
     mime_type TEXT NOT NULL,
@@ -917,6 +921,10 @@ CREATE TABLE media_assets (
     PRIMARY KEY (tenant_id, file_id)
 );
 COMMENT ON TABLE media_assets IS '媒体资产元数据';
+ALTER TABLE media_assets ADD CONSTRAINT media_assets_application_owner
+    CHECK (owner_kind <> 'application' OR (owner_id IS NOT NULL AND owner_id = tenant_id));
+COMMENT ON COLUMN media_assets.owner_kind IS 'Authenticated User owner or explicitly application-owned managed asset';
+COMMENT ON COLUMN media_assets.purpose IS 'Authoritative media purpose, never read from client metadata';
 COMMENT ON COLUMN media_assets.tenant_id IS '租户 ID';
 COMMENT ON COLUMN media_assets.owner_id IS 'Authenticated uploader; NULL legacy private assets require ownership review';
 COMMENT ON COLUMN media_assets.file_id IS '文件唯一标识（租户内唯一）';
@@ -1029,15 +1037,15 @@ CREATE INDEX IF NOT EXISTS idx_ack_archive_message_user_type ON ack_archive_reco
 -- ============================================================================
 -- 10. Hook 引擎 + Capability 策略（flare-capability）
 -- ============================================================================
--- hook_configs 列与 PostgresHookConfigRepository（Rust sqlx::FromRow）一致。
+-- hook_configs 列与 PostgresHookConfigRepository（Rust sqlx::FromRow）和 Message Ingest 的 PostgresHookStore 一致。
 -- capability_* 与 PostgresCapabilityPolicy、CapabilityService gRPC 一致。
 -- FLARE_EXTRACT:BEGIN_HOOK_CAPABILITY（第 9 节边界标记，勿删改此行）
 
 DROP TABLE IF EXISTS hook_executions CASCADE;
+DROP TABLE IF EXISTS hook_deployment_summary CASCADE;
+DROP TABLE IF EXISTS hook_config_versions CASCADE;
 DROP TABLE IF EXISTS hook_configs CASCADE;
-DROP TABLE IF EXISTS capability_plugin_endpoints CASCADE;
 DROP TABLE IF EXISTS capability_audit_log CASCADE;
-DROP TABLE IF EXISTS capability_user_grants CASCADE;
 DROP TABLE IF EXISTS capability_tenant_switches CASCADE;
 DROP TABLE IF EXISTS capability_service_settings CASCADE;
 
@@ -1047,14 +1055,10 @@ CREATE TABLE hook_configs (
     tenant_id TEXT,
     hook_type TEXT NOT NULL,
     name TEXT NOT NULL,
-    version TEXT,
     description TEXT,
     enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    priority INT NOT NULL DEFAULT 100,
-    group_name TEXT,
+    hook_order INT NOT NULL DEFAULT 0,
     timeout_ms BIGINT NOT NULL DEFAULT 1000,
-    max_retries INT NOT NULL DEFAULT 0,
-    error_policy TEXT NOT NULL DEFAULT 'fail_fast',
     require_success BOOLEAN NOT NULL DEFAULT TRUE,
     selector_config JSONB NOT NULL DEFAULT '{}'::jsonb,
     transport_config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -1064,21 +1068,17 @@ CREATE TABLE hook_configs (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(tenant_id, hook_type, name)
 );
-COMMENT ON TABLE hook_configs IS 'Hook 配置表（动态加载，与 flare-capability postgres_config 对齐）';
+COMMENT ON TABLE hook_configs IS 'Hook 配置表（Capability 写入，Message Ingest 热加载）';
 COMMENT ON COLUMN hook_configs.id IS '自增主键';
 COMMENT ON COLUMN hook_configs.hook_id IS '可选外部稳定 ID（UUID 等），与 id 二选一使用';
 COMMENT ON COLUMN hook_configs.tenant_id IS '租户 ID（空=全局）';
-COMMENT ON COLUMN hook_configs.hook_type IS 'Hook 类型（pre_send, post_send, recall 等）';
+COMMENT ON COLUMN hook_configs.hook_type IS 'Hook 类型（pre_send）';
 COMMENT ON COLUMN hook_configs.name IS 'Hook 名称';
-COMMENT ON COLUMN hook_configs.version IS '版本';
 COMMENT ON COLUMN hook_configs.description IS '描述';
 COMMENT ON COLUMN hook_configs.enabled IS '是否启用';
-COMMENT ON COLUMN hook_configs.priority IS '优先级（越小越高）';
-COMMENT ON COLUMN hook_configs.group_name IS '分组（validation/critical/business）';
+COMMENT ON COLUMN hook_configs.hook_order IS '同一来源内的先后（小的先执行）';
 COMMENT ON COLUMN hook_configs.timeout_ms IS '超时（毫秒）';
-COMMENT ON COLUMN hook_configs.max_retries IS '最大重试次数';
-COMMENT ON COLUMN hook_configs.error_policy IS '错误策略（fail_fast, retry, ignore）';
-COMMENT ON COLUMN hook_configs.require_success IS '是否要求成功';
+COMMENT ON COLUMN hook_configs.require_success IS '必需：目标不可用时回可重试的 503；否则跳过';
 COMMENT ON COLUMN hook_configs.selector_config IS '选择器配置（JSON）';
 COMMENT ON COLUMN hook_configs.transport_config IS '传输配置（JSON）';
 COMMENT ON COLUMN hook_configs.metadata IS '元数据（JSON）';
@@ -1086,6 +1086,26 @@ COMMENT ON COLUMN hook_configs.created_by IS '创建者';
 COMMENT ON COLUMN hook_configs.created_at IS '创建时间';
 COMMENT ON COLUMN hook_configs.updated_at IS '更新时间';
 CREATE INDEX IF NOT EXISTS idx_hook_configs_tenant_type ON hook_configs(tenant_id, hook_type, enabled);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hook_configs_platform_name ON hook_configs(hook_type, name) WHERE tenant_id IS NULL;
+
+CREATE TABLE hook_config_versions (
+    scope TEXT PRIMARY KEY,
+    version BIGINT NOT NULL CHECK (version > 0),
+    changed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE hook_config_versions IS 'Hook 配置版本：Capability 写配置时在同一事务里递增，Message Ingest 轮询';
+COMMENT ON COLUMN hook_config_versions.scope IS '应用 ID；平台行为空串';
+COMMENT ON COLUMN hook_config_versions.version IS '这个范围最后一次变更的版本（全局按提交顺序递增）';
+CREATE INDEX IF NOT EXISTS idx_hook_config_versions_version ON hook_config_versions(version);
+
+CREATE TABLE hook_deployment_summary (
+    service TEXT PRIMARY KEY,
+    source TEXT,
+    hooks JSONB NOT NULL DEFAULT '[]'::jsonb,
+    instance_id TEXT,
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+COMMENT ON TABLE hook_deployment_summary IS '部署文件装载的 Hook 摘要：Message Ingest 启动时写，控制面只读展示，不含密钥和头的取值';
 
 CREATE TABLE hook_executions (
     execution_id TEXT PRIMARY KEY,
@@ -1147,22 +1167,7 @@ CREATE TABLE capability_tenant_switches (
 COMMENT ON TABLE capability_tenant_switches IS '租户级能力开关（显式 false 时拒绝 Dispatch）';
 CREATE INDEX IF NOT EXISTS idx_capability_tenant_switches_tenant ON capability_tenant_switches(tenant_id);
 
-CREATE TABLE capability_user_grants (
-    tenant_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    capability_id TEXT NOT NULL,
-    granted_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    expires_at TIMESTAMPTZ,
-    plan_code TEXT,
-    source TEXT,
-    PRIMARY KEY (tenant_id, user_id, capability_id)
-);
-COMMENT ON TABLE capability_user_grants IS '用户能力授权（付费/运营开通；支持 namespace.* 通配）';
-COMMENT ON COLUMN capability_user_grants.expires_at IS '过期时间，NULL 表示长期有效';
-COMMENT ON COLUMN capability_user_grants.user_id IS '用户 ID；特殊值 * 表示该 tenant_id 下任意用户（仅建议开发/内网；生产按用户灌库后应删除通配行）';
-CREATE INDEX IF NOT EXISTS idx_capability_user_grants_tenant_user ON capability_user_grants(tenant_id, user_id);
-
--- 策略变更审计（Grant / Revoke / SetTenantSwitch；Dispatch 高频路径默认不落库）
+-- 策略变更审计（SetTenantSwitch；Dispatch 高频路径默认不落库）
 CREATE TABLE capability_audit_log (
     id BIGSERIAL PRIMARY KEY,
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1193,6 +1198,117 @@ CREATE TABLE IF NOT EXISTS plugin_authorization_snapshots (
  CHECK((snapshot->>'validUntilMs')::bigint=valid_until_ms)
 );
 
+-- 插件注册表：版本、命名空间、素材、部署，以及每个应用的期望、配置和事实。
+-- 换一个没有市场的部署也需要这些，所以归 Core；上架、申请和绑定留在 Social。
+CREATE TABLE IF NOT EXISTS plugin_versions (
+ plugin_id varchar(128) NOT NULL,
+ plugin_version varchar(64) NOT NULL,
+ display_name varchar(160) NOT NULL,
+ publisher_id varchar(192) NOT NULL,
+ -- 发布者签名的原始字节，必须是 text：摘要按字节比较。
+ manifest_json text NOT NULL CHECK(octet_length(manifest_json)<=1048576),
+ manifest_digest text NOT NULL UNIQUE CHECK(manifest_digest ~ '^sha256:[0-9a-f]{64}$'),
+ key_id varchar(128) NOT NULL,
+ signature varchar(128) NOT NULL,
+ kind text NOT NULL CHECK(kind IN('im','business')),
+ readme text,
+ changelog text,
+ published boolean NOT NULL DEFAULT false,
+ revoked boolean NOT NULL DEFAULT false,
+ suspended boolean NOT NULL DEFAULT false,
+ -- 开发版本未签名，所有正式路径都排除它。
+ development boolean NOT NULL DEFAULT false,
+ created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint,
+ updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint,
+ PRIMARY KEY(plugin_id,plugin_version),
+ UNIQUE(plugin_id,plugin_version,manifest_digest),
+ CHECK(NOT (published AND revoked)),
+ CONSTRAINT plugin_versions_development_unpublished CHECK(NOT (development AND published))
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_versions_updated ON plugin_versions(updated_at,plugin_id,plugin_version);
+CREATE TABLE IF NOT EXISTS plugin_namespaces (
+ namespace varchar(192) PRIMARY KEY,
+ plugin_id varchar(128) NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plugin_version_assets (
+ plugin_id varchar(128) NOT NULL,
+ plugin_version varchar(64) NOT NULL,
+ path varchar(256) NOT NULL,
+ digest text NOT NULL CHECK(digest ~ '^sha256:[0-9a-f]{64}$'),
+ media_type varchar(64) NOT NULL,
+ bytes bytea NOT NULL CHECK(octet_length(bytes)<=33554432),
+ PRIMARY KEY(plugin_id,plugin_version,path),
+ FOREIGN KEY(plugin_id,plugin_version) REFERENCES plugin_versions(plugin_id,plugin_version)
+);
+CREATE TABLE IF NOT EXISTS plugin_deployments (
+ deployment_id varchar(128) PRIMARY KEY,
+ plugin_id varchar(128) NOT NULL,
+ plugin_version varchar(64) NOT NULL,
+ manifest_digest text NOT NULL,
+ artifact_digest text NOT NULL CHECK(artifact_digest ~ '^sha256:[0-9a-f]{64}$'),
+ grpc_authority text NOT NULL CHECK(octet_length(grpc_authority)<=512),
+ healthy_until_ms bigint NOT NULL DEFAULT 0,
+ last_error text,
+ created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint,
+ FOREIGN KEY(plugin_id,plugin_version,manifest_digest) REFERENCES plugin_versions(plugin_id,plugin_version,manifest_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_deployments_release ON plugin_deployments(plugin_id,plugin_version,manifest_digest,created_at);
+-- binding_id 是 Social 的绑定 ID，也是 grant_id。一个应用的同一插件可以有多行（升级期间两个版本）。
+CREATE TABLE IF NOT EXISTS plugin_app_states (
+ app_id text NOT NULL CHECK(app_id ~ '^[0-9A-Za-z_-]{1,32}$'),
+ binding_id varchar(128) NOT NULL,
+ plugin_id varchar(128) NOT NULL,
+ plugin_version varchar(64) NOT NULL,
+ manifest_digest text NOT NULL,
+ revision bigint NOT NULL CHECK(revision>0),
+ enabled boolean NOT NULL DEFAULT false,
+ configured boolean NOT NULL DEFAULT false,
+ configuration jsonb NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(configuration)='object' AND octet_length(configuration::text)<=32768),
+ deployment_id varchar(128) REFERENCES plugin_deployments(deployment_id),
+ runtime_revision bigint NOT NULL DEFAULT 0 CHECK(runtime_revision>=0),
+ runtime_configuration_digest text,
+ runtime_enabled boolean NOT NULL DEFAULT false,
+ runtime_healthy_until_ms bigint NOT NULL DEFAULT 0,
+ runtime_error text,
+ runtime_error_detail text,
+ runtime_configuration jsonb CHECK(runtime_configuration IS NULL OR (jsonb_typeof(runtime_configuration)='object' AND octet_length(runtime_configuration::text)<=32768)),
+ runtime_attempts integer NOT NULL DEFAULT 0 CHECK(runtime_attempts>=0),
+ runtime_next_attempt_ms bigint NOT NULL DEFAULT 0,
+ runtime_enabled_digest text,
+ -- 以下来自投影：reconcile 要的期望状态。配置走 plugin_config.put，其余都走投影，所以停用不需要 Core 在线。
+ organization_id varchar(128) NOT NULL DEFAULT '',
+ lifecycle text NOT NULL DEFAULT 'pending' CHECK(lifecycle IN ('pending','installed','uninstalled','revoked','failed')),
+ suspended boolean NOT NULL DEFAULT false,
+ owned boolean NOT NULL DEFAULT false,
+ offline_hold boolean NOT NULL DEFAULT false,
+ export_until_ms bigint,
+ approved jsonb NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(approved)='object'),
+ features jsonb NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(features)='object'),
+ projected_revision bigint NOT NULL DEFAULT 0 CHECK(projected_revision>=0),
+ updated_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint,
+ PRIMARY KEY(app_id,binding_id),
+ FOREIGN KEY(plugin_id,plugin_version,manifest_digest) REFERENCES plugin_versions(plugin_id,plugin_version,manifest_digest)
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_app_states_deployment ON plugin_app_states(deployment_id);
+CREATE INDEX IF NOT EXISTS idx_plugin_app_states_reconcile ON plugin_app_states(updated_at,app_id,binding_id);
+-- 运行时收敛的轮次：同一时刻只有一个副本在跑。
+CREATE TABLE IF NOT EXISTS plugin_reconcile_lease (
+ id integer PRIMARY KEY CHECK(id=1),
+ holder text NOT NULL,
+ until_ms bigint NOT NULL
+);
+-- 标记为开发用途的应用：flare-plugin dev 只对这里的应用生效。
+CREATE TABLE IF NOT EXISTS plugin_dev_apps (
+ app_id text PRIMARY KEY CHECK(app_id ~ '^[0-9A-Za-z_-]{1,32}$'),
+ created_at bigint NOT NULL DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint
+);
+-- 注册表变化的水位。scope 空串是全局（版本状态、部署恢复），否则是应用（配置、事实）。
+-- 解析缓存按它和投影版本探测，撤权和状态变化下一次读取就生效。
+CREATE TABLE IF NOT EXISTS plugin_registry_revisions (
+ scope text PRIMARY KEY,
+ revision bigint NOT NULL DEFAULT 0 CHECK(revision>=0)
+);
+
 -- Shared, leased callback quota; no message, config, credential or payload storage.
 CREATE TABLE capability_plugin_resource_calls (
     tenant_id text NOT NULL CHECK(tenant_id ~ '^[0-9A-Za-z_-]{1,32}$'),
@@ -1205,45 +1321,6 @@ CREATE TABLE capability_plugin_resource_calls (
 );
 CREATE INDEX capability_plugin_resource_calls_expiry ON capability_plugin_resource_calls(tenant_id,expires_at_ms);
 CREATE INDEX capability_plugin_resource_calls_global_expiry ON capability_plugin_resource_calls(expires_at_ms);
-
--- 插件端点登记（RegisterPluginEndpoint；与 migrations/0011 同一结构）：各实例启动载入、登记先写库、
--- 周期重读、超过 TTL 不健康的登记被清理。配置发现的端点不入库。
-CREATE TABLE capability_plugin_endpoints (
-    tenant_id TEXT NOT NULL,
-    plugin_id TEXT NOT NULL,
-    capability_id TEXT NOT NULL,
-    grpc_authority TEXT NOT NULL,
-    labels JSONB NOT NULL DEFAULT '{}'::jsonb,
-    plugin_version TEXT NOT NULL DEFAULT '',
-    api_version TEXT NOT NULL DEFAULT '',
-    manifest_sha256 TEXT NOT NULL DEFAULT '',
-    seat_model TEXT NOT NULL DEFAULT '',
-    declared_operations TEXT[] NOT NULL DEFAULT '{}',
-    unverified BOOLEAN NOT NULL,
-    registered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_healthy_at TIMESTAMPTZ,
-    CONSTRAINT capability_plugin_endpoints_pkey PRIMARY KEY (tenant_id, plugin_id),
-    CONSTRAINT capability_plugin_endpoints_tenant_check
-        CHECK (char_length(tenant_id) BETWEEN 1 AND 256 AND tenant_id <> '*'),
-    CONSTRAINT capability_plugin_endpoints_plugin_check
-        CHECK (char_length(plugin_id) BETWEEN 1 AND 128),
-    CONSTRAINT capability_plugin_endpoints_capability_check
-        CHECK (char_length(capability_id) BETWEEN 1 AND 128),
-    CONSTRAINT capability_plugin_endpoints_authority_check
-        CHECK (char_length(grpc_authority) BETWEEN 1 AND 512),
-    CONSTRAINT capability_plugin_endpoints_labels_check
-        CHECK (jsonb_typeof(labels) = 'object' AND octet_length(labels::text) <= 16384),
-    CONSTRAINT capability_plugin_endpoints_manifest_check
-        CHECK (char_length(plugin_version) <= 64 AND char_length(api_version) <= 64
-               AND char_length(manifest_sha256) <= 128 AND char_length(seat_model) <= 32),
-    CONSTRAINT capability_plugin_endpoints_operations_check
-        CHECK (cardinality(declared_operations) <= 256
-               AND array_position(declared_operations, NULL) IS NULL),
-    CONSTRAINT capability_plugin_endpoints_unverified_check
-        CHECK (unverified = (cardinality(declared_operations) = 0))
-);
-COMMENT ON TABLE capability_plugin_endpoints IS '插件端点登记（RegisterPluginEndpoint）；多实例共享，配置发现的端点不入库';
 
 -- FLARE_EXTRACT:END_HOOK_CAPABILITY（第 9 节边界标记，勿删改此行）
 -- ============================================================================
@@ -1304,3 +1381,29 @@ CREATE TRIGGER trigger_threads_updated_at
 DROP TRIGGER IF EXISTS trigger_thread_participants_updated_at ON thread_participants;
 CREATE TRIGGER trigger_thread_participants_updated_at
     BEFORE UPDATE ON thread_participants FOR EACH ROW EXECUTE PROCEDURE set_updated_at();
+
+-- The grant/configuration activation boundary is durable. Lease renewals and runtime health
+-- updates must not reinterpret old messages or discard an unchanged subscription's backlog.
+ALTER TABLE plugin_app_states ADD COLUMN IF NOT EXISTS event_active_since_ms bigint NOT NULL
+    DEFAULT (extract(epoch FROM clock_timestamp())*1000)::bigint;
+
+CREATE OR REPLACE FUNCTION plugin_event_activation_epoch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.event_active_since_ms := (extract(epoch FROM clock_timestamp())*1000)::bigint;
+    ELSIF ROW(OLD.approved,OLD.lifecycle,OLD.enabled,OLD.suspended,OLD.owned,OLD.offline_hold,
+              OLD.manifest_digest,OLD.configuration,OLD.features)
+       IS DISTINCT FROM
+          ROW(NEW.approved,NEW.lifecycle,NEW.enabled,NEW.suspended,NEW.owned,NEW.offline_hold,
+              NEW.manifest_digest,NEW.configuration,NEW.features) THEN
+        NEW.event_active_since_ms := GREATEST(OLD.event_active_since_ms+1,
+            (extract(epoch FROM clock_timestamp())*1000)::bigint);
+    ELSE
+        NEW.event_active_since_ms := OLD.event_active_since_ms;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS plugin_event_activation_epoch ON plugin_app_states;
+CREATE TRIGGER plugin_event_activation_epoch BEFORE INSERT OR UPDATE ON plugin_app_states
+    FOR EACH ROW EXECUTE FUNCTION plugin_event_activation_epoch();

@@ -13,7 +13,7 @@ use super::postgres_base::PostgresBaseStorage;
 use crate::application::handlers::MessageStorageQueryHandler;
 use crate::application::queries::{GetMessageQuery, QueryMessagesBySeqQuery};
 use crate::domain::model::plugin_card::PLUGIN_CARD_UNBOUND_KEY;
-use crate::domain::model::plugin_card::tests::{card, custom, poll_manifest, snapshot, text};
+use crate::domain::model::plugin_card::tests::{card, custom, poll_manifest, projection, text};
 
 const ENV_DATABASE_URL: &str = "FLARE_STORAGE_TEST_DATABASE_URL";
 
@@ -59,7 +59,19 @@ async fn reads_mark_the_copies_of_a_bound_card_and_only_them() {
     let tenant = format!("pcm{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
     let conversation = format!("2-{tenant}");
     let now = chrono::Utc::now().timestamp_millis();
-    let projection = snapshot(&tenant, now, poll_manifest());
+    let (projection, _) = projection(&tenant, now, poll_manifest());
+    sqlx::query(
+        "INSERT INTO plugin_versions (plugin_id, plugin_version, manifest_digest, manifest_json, \
+         display_name, publisher_id, key_id, signature, kind) \
+         VALUES ($1, $2, $3, $4, 'test', 'test', 'test', 'test', 'im') ON CONFLICT DO NOTHING",
+    )
+    .bind(&projection.plugins[0].grant.plugin_id)
+    .bind(&projection.plugins[0].grant.plugin_version)
+    .bind(projection.plugins[0].manifest_digest())
+    .bind(serde_json::to_string(&poll_manifest()).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO plugin_authorization_snapshots (app_id, version, snapshot, valid_until_ms) \
          VALUES ($1, $2, $3, $4)",

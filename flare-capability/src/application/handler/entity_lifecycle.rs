@@ -186,14 +186,11 @@ impl EntityLifecycleWorker {
             p.grant.plugin_id == task.plugin_id
                 && p.grant.enabled
                 && !p.grant.revoked
-                && now >= p.grant.valid_from_ms
-                && now < p.grant.valid_until_ms
+                && p.grant.in_effect(now)
         }) else {
             return retry("plugin not enabled for the tenant");
         };
-        let Ok(manifest) = projected.manifest() else {
-            return retry("projected plugin manifest unreadable");
-        };
+        let manifest = projected.manifest();
         let Some(operation) = manifest
             .client_extensions
             .contributions

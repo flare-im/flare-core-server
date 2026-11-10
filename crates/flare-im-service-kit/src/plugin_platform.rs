@@ -46,6 +46,8 @@ pub const PLUGIN_CARD_PLATFORM_ONLY: &str = "PLUGIN_CARD_PLATFORM_ONLY";
 pub const PLUGIN_NOT_INSTALLED: &str = "PLUGIN_NOT_INSTALLED";
 /// The plugin is installed but disabled, or its projection lapsed.
 pub const PLUGIN_DISABLED: &str = "PLUGIN_DISABLED";
+/// A feature gating the operation is closed or not published for the application.
+pub const PLUGIN_FEATURE_DISABLED: &str = "PLUGIN_FEATURE_DISABLED";
 /// The caller may not invoke this operation (an admin or lifecycle operation, or one the
 /// installation did not approve).
 pub const PLUGIN_PERMISSION_DENIED: &str = "PLUGIN_PERMISSION_DENIED";
@@ -70,6 +72,7 @@ pub const PLUGIN_REJECTED: &str = "PLUGIN_REJECTED";
 pub const PLATFORM_DENIAL_CODES: &[(&str, u16)] = &[
     (PLUGIN_NOT_INSTALLED, 404),
     (PLUGIN_DISABLED, 403),
+    (PLUGIN_FEATURE_DISABLED, 403),
     (PLUGIN_PERMISSION_DENIED, 403),
     (PLUGIN_UNSUPPORTED_PLATFORM, 403),
     (PLUGIN_CARD_UNBOUND, 409),

@@ -26,6 +26,9 @@ pub struct Connection {
     device_id: DeviceId,
     /// 数据面租户 ID（默认 "0"）；`tenant:sessions:{tenant}` 索引按它维护
     tenant_id: String,
+    /// Authenticated Social session binding; absent only on pre-upgrade/Core-native records.
+    #[serde(default)]
+    identity_session_id: Option<String>,
 
     // === 连接信息 ===
     device_platform: String, // ios/android/web/pc
@@ -77,6 +80,7 @@ impl Connection {
             user_id: params.user_id.clone(),
             device_id: params.device_id.clone(),
             tenant_id: params.tenant_id,
+            identity_session_id: None,
             device_platform: params.device_platform,
             server_id: params.server_id,
             gateway_id: params.gateway_id,
@@ -124,6 +128,7 @@ impl Connection {
             user_id,
             device_id,
             tenant_id,
+            identity_session_id: None,
             device_platform,
             server_id,
             gateway_id,
@@ -304,6 +309,15 @@ impl Connection {
         self.last_heartbeat_at
     }
 
+    pub fn identity_session_id(&self) -> Option<&str> {
+        self.identity_session_id.as_deref()
+    }
+
+    pub fn with_identity_session_id(mut self, sid: Option<String>) -> Self {
+        self.identity_session_id = sid;
+        self
+    }
+
     pub fn created_at(&self) -> DateTime<Utc> {
         self.created_at
     }
@@ -398,6 +412,7 @@ impl Clone for Connection {
             user_id: self.user_id.clone(),
             device_id: self.device_id.clone(),
             tenant_id: self.tenant_id.clone(),
+            identity_session_id: self.identity_session_id.clone(),
             device_platform: self.device_platform.clone(),
             server_id: self.server_id.clone(),
             gateway_id: self.gateway_id.clone(),

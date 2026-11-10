@@ -1,19 +1,16 @@
-# 示例：预置 Hook 配置
+# 示例：部署 Hook
 #
-# 将本文件复制为 config/hooks.toml 后按需启用。
-# 除 Hook 外，也可在同一个文件配置 capability 远程扩展插件发现与健康检查（见文件尾部）。
+# 将本文件复制为 config/hooks.toml 后按需启用。部署文件放必需策略，改了要重启；平台和应用的 Hook
+# 在 hook_configs 里，经控制台配置，立即生效。
 #
-# 本文件同时能被 Message Ingest（flare-im-hooks）与 Capability 服务的加载器解析，两边的字段
-# 都写全（enabled、priority、timeout_ms）。Capability 的 Hook 引擎按 priority 分组：priority
-# >= 100 为 validation 组，拒绝会中断主链；< 100 为 business 组，拒绝与不可达都只记日志、
-# 主链照常继续。所以要拒绝消息或撤回的 Hook（pre_send、recall 且 require_success = true）
-# 用 priority >= 100；旁路观测的 Hook 用 < 100 且 require_success = false。
+# 调用链按来源排：应用 → 平台 → 部署，同来源按 order（小的先执行）。部署 Hook 在最后，看到的是最终
+# 内容。require_success = true 是必需：目标不可用时回可重试的 503；false 是可选：跳过。目标明确
+# 拒绝时都拒绝。
 
 [[pre_send]]
 name = "compliance-text-check"
 enabled = true
-# >= 100：在 Capability 引擎里归 validation 组，拒绝才会中断发送。
-priority = 100
+order = 100
 timeout_ms = 200
 require_success = true
 
@@ -29,53 +26,24 @@ endpoint = "https://hooks.internal.svc:7443"
 [pre_send.metadata]
 risk_level = "strict"
 
-[[post_send]]
-name = "audit-log-sink"
+[[pre_send]]
+name = "audit-text-tagger"
 enabled = true
-priority = 0
-timeout_ms = 1000
+order = 200
+timeout_ms = 100
 require_success = false
 
-[post_send.selector]
+[pre_send.selector]
 tenants = ["0"]
 
-[post_send.transport]
+[pre_send.transport]
 type = "webhook"
-endpoint = "https://audit.example.com/hooks/post_send"
+endpoint = "https://audit.example.com/hooks/pre_send"
 # 签名密钥：不签名就整行删掉；写成空串在加载时报错。
 secret = "replace-me"
 
-[post_send.transport.headers]
+[pre_send.transport.headers]
 X-Service = "flare-im-core"
-
-[[delivery]]
-name = "delivery-metrics"
-enabled = true
-priority = 0
-timeout_ms = 200
-require_success = false
-
-[delivery.selector]
-tenants = ["0"]
-
-[delivery.transport]
-type = "local"
-target = "builtin_delivery_metrics"
-
-[[recall]]
-name = "recall-audit"
-enabled = true
-# recall Hook 可以拒绝撤回：>= 100 归 validation 组，拒绝才生效。
-priority = 100
-timeout_ms = 300
-require_success = true
-
-[recall.selector]
-tenants = ["0"]
-
-[recall.transport]
-type = "grpc"
-endpoint = "https://hooks.internal.svc:7443"
 
 # Capability Runtime is a service configuration, not a HookConfig field.
 # Configure plugin discovery/health checks in config/services/capability.toml.

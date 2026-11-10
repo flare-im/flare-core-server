@@ -56,6 +56,89 @@ impl MediaGrpcHandler {
 
 #[tonic::async_trait]
 impl MediaService for MediaGrpcHandler {
+    async fn get_admin_upload_policy(
+        &self,
+        request: Request<flare_grpc_proto::media::AdminUploadPolicyRequest>,
+    ) -> Result<Response<flare_grpc_proto::media::AdminUploadPolicyResponse>, Status> {
+        let ctx = verified_ctx(&request)?;
+        let purpose = application_purpose(request.into_inner().purpose)?;
+        let policy = self
+            .query_handler
+            .handle_admin_upload_policy(&ctx, purpose)
+            .into_grpc()?;
+        Ok(Response::new(
+            flare_grpc_proto::media::AdminUploadPolicyResponse {
+                tenant_id: upload_tenant(&ctx)?,
+                purpose: purpose as i32,
+                max_bytes: policy.max_bytes,
+                max_pixels: policy.max_pixels,
+                max_dimension: policy.max_dimension,
+                allowed_mime_types: policy.allowed_mime_types,
+            },
+        ))
+    }
+
+    async fn admin_initiate_direct_upload(
+        &self,
+        request: Request<flare_grpc_proto::media::AdminInitiateDirectUploadRequest>,
+    ) -> Result<Response<InitiateDirectUploadResponse>, Status> {
+        let ctx = verified_ctx(&request)?;
+        require_media_admin(&ctx, MEDIAS_WRITE)?;
+        let req = request.into_inner();
+        let purpose = application_purpose(req.purpose)?;
+        let session = self
+            .command_handler
+            .handle_admin_initiate_direct_upload(&ctx, purpose, req)
+            .await
+            .into_grpc()?;
+        Ok(Response::new(to_initiate_direct_upload_response(session)))
+    }
+
+    async fn validate_application_media(
+        &self,
+        request: Request<flare_grpc_proto::media::ValidateApplicationMediaRequest>,
+    ) -> Result<Response<flare_grpc_proto::media::ValidateApplicationMediaResponse>, Status> {
+        let ctx = verified_ctx(&request)?;
+        let req = request.into_inner();
+        let metadata = self
+            .query_handler
+            .handle_validate_application_media(
+                &ctx,
+                &req.file_id,
+                application_purpose(req.purpose)?,
+            )
+            .await
+            .into_grpc()?;
+        Ok(Response::new(
+            flare_grpc_proto::media::ValidateApplicationMediaResponse {
+                file_id: metadata.file_id,
+                purpose: req.purpose,
+                mime_type: metadata.mime_type,
+                size: metadata.file_size,
+            },
+        ))
+    }
+
+    async fn resolve_application_avatar_media(
+        &self,
+        request: Request<flare_grpc_proto::media::ResolveApplicationAvatarMediaRequest>,
+    ) -> Result<Response<GetFileUrlResponse>, Status> {
+        let ctx = verified_ctx(&request)?;
+        let req = request.into_inner();
+        let value = self
+            .query_handler
+            .handle_resolve_application_avatar_media(&ctx, &req.file_id, i64::from(req.expires_in))
+            .await
+            .into_grpc()?;
+        Ok(Response::new(GetFileUrlResponse {
+            url: value.url,
+            cdn_url: value.cdn_url,
+            expires_at: Some(to_proto_timestamp(value.expires_at)),
+            success: true,
+            error_message: String::new(),
+        }))
+    }
+
     type DownloadFileStream = Pin<
         Box<dyn tokio_stream::Stream<Item = Result<DownloadFileChunk, Status>> + Send + 'static>,
     >;
@@ -314,8 +397,19 @@ impl MediaService for MediaGrpcHandler {
         let metadata = self
             .command_handler
             .handle_complete_direct_upload(&ctx, req)
+            .staff_audit(&ctx, "flare-media")
             .await
             .into_grpc()?;
+        if metadata.owner_kind == crate::domain::model::MediaOwnerKind::Application {
+            return Ok(Response::new(UploadFileResponse {
+                file_id: metadata.file_id.clone(),
+                url: String::new(),
+                cdn_url: String::new(),
+                info: Some(to_proto_file_info(&metadata)),
+                success: true,
+                error_message: String::new(),
+            }));
+        }
         let presigned = self
             .query_handler
             .handle_get_file_url(
@@ -697,6 +791,16 @@ fn verified_ctx<T>(request: &Request<T>) -> Result<Ctx, Status> {
         })
         .cloned()
         .ok_or_else(|| Status::unauthenticated("signed context required"))
+}
+
+fn application_purpose(value: i32) -> Result<crate::domain::model::MediaPurpose, Status> {
+    match value {
+        1 => Ok(crate::domain::model::MediaPurpose::Avatar),
+        2 => Ok(crate::domain::model::MediaPurpose::Image),
+        _ => Err(Status::invalid_argument(
+            "application image purpose required",
+        )),
+    }
 }
 
 /// 上传的租户只取签名上下文：缺租户即 `PERMISSION_DENIED`，在读上传流之前拒绝，不再按租户

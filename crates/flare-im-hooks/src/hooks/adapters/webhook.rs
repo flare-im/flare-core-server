@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use super::super::config::HookDefinition;
-use super::super::types::{
-    DeliveryEvent, DeliveryHook, HookOutcome, MessageDraft, MessageRecord, PostSendHook,
-    PreSendDecision, PreSendHook, RecallEvent, RecallHook, pre_send_rejection,
-};
+use super::super::types::{MessageDraft, PreSendDecision, PreSendHook, pre_send_rejection};
 
 #[derive(Clone)]
 pub struct WebhookHookFactory {
@@ -47,54 +44,6 @@ impl WebhookHookFactory {
         headers: HashMap<String, String>,
     ) -> Arc<dyn PreSendHook> {
         Arc::new(WebhookPreSendHook {
-            client: self.client.clone(),
-            endpoint: endpoint.to_string(),
-            secret,
-            headers,
-            static_metadata: def.metadata.clone(),
-        })
-    }
-
-    pub fn build_post_send(
-        &self,
-        def: &HookDefinition,
-        endpoint: &str,
-        secret: Option<String>,
-        headers: HashMap<String, String>,
-    ) -> Arc<dyn PostSendHook> {
-        Arc::new(WebhookPostSendHook {
-            client: self.client.clone(),
-            endpoint: endpoint.to_string(),
-            secret,
-            headers,
-            static_metadata: def.metadata.clone(),
-        })
-    }
-
-    pub fn build_delivery(
-        &self,
-        def: &HookDefinition,
-        endpoint: &str,
-        secret: Option<String>,
-        headers: HashMap<String, String>,
-    ) -> Arc<dyn DeliveryHook> {
-        Arc::new(WebhookDeliveryHook {
-            client: self.client.clone(),
-            endpoint: endpoint.to_string(),
-            secret,
-            headers,
-            static_metadata: def.metadata.clone(),
-        })
-    }
-
-    pub fn build_recall(
-        &self,
-        def: &HookDefinition,
-        endpoint: &str,
-        secret: Option<String>,
-        headers: HashMap<String, String>,
-    ) -> Arc<dyn RecallHook> {
-        Arc::new(WebhookRecallHook {
             client: self.client.clone(),
             endpoint: endpoint.to_string(),
             secret,
@@ -234,9 +183,7 @@ fn signed_request<T: Serialize>(
 /// the signature covers exactly the bytes sent.
 ///
 /// The secret itself never appears in the request. A custom header named like one of
-/// [`RESERVED_WEBHOOK_HEADERS`], or an empty secret, is a `ConfigurationError`. Core's webhook
-/// adapter (Message Ingest and others) and the Capability service's own webhook adapter both
-/// sign here, so both paths follow the same contract.
+/// [`RESERVED_WEBHOOK_HEADERS`], or an empty secret, is a `ConfigurationError`.
 pub fn sign_webhook_request(
     request_builder: reqwest::RequestBuilder,
     secret: Option<&str>,
@@ -630,167 +577,6 @@ impl PreSendHook for WebhookPreSendHook {
     }
 }
 
-#[derive(Serialize)]
-struct PostSendWebhookRequest {
-    context: WebhookContextPayload,
-    record: MessageRecord,
-    draft: WebhookDraftPayload,
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Clone)]
-struct WebhookPostSendHook {
-    client: Client,
-    endpoint: String,
-    secret: Option<String>,
-    headers: HashMap<String, String>,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl PostSendHook for WebhookPostSendHook {
-    async fn handle(&self, ctx: &Ctx, record: &MessageRecord, draft: &MessageDraft) -> HookOutcome {
-        let context = match webhook_context(ctx) {
-            Ok(context) => context,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-        let request_body = PostSendWebhookRequest {
-            context,
-            record: record.clone(),
-            draft: WebhookDraftPayload::from(draft),
-            metadata: self.static_metadata.clone(),
-        };
-
-        let builder = self.client.post(&self.endpoint);
-        let builder = match signed_request(builder, &self.secret, &self.headers, &request_body) {
-            Ok(builder) => builder,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-        match builder.send().await {
-            Ok(resp) if resp.status().is_success() => HookOutcome::Completed,
-            Ok(resp) => {
-                let err =
-                    ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook post-send failed")
-                        .details(resp.status().to_string())
-                        .build_error();
-                HookOutcome::Failed(err)
-            }
-            Err(err) => {
-                let err =
-                    ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook post-send failed")
-                        .details(err.to_string())
-                        .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct DeliveryWebhookRequest {
-    context: WebhookContextPayload,
-    event: DeliveryEvent,
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Clone)]
-struct WebhookDeliveryHook {
-    client: Client,
-    endpoint: String,
-    secret: Option<String>,
-    headers: HashMap<String, String>,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl DeliveryHook for WebhookDeliveryHook {
-    async fn handle(&self, ctx: &Ctx, event: &DeliveryEvent) -> HookOutcome {
-        let context = match webhook_context(ctx) {
-            Ok(context) => context,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-        let request_body = DeliveryWebhookRequest {
-            context,
-            event: event.clone(),
-            metadata: self.static_metadata.clone(),
-        };
-        let builder = self.client.post(&self.endpoint);
-        let builder = match signed_request(builder, &self.secret, &self.headers, &request_body) {
-            Ok(builder) => builder,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-        match builder.send().await {
-            Ok(resp) if resp.status().is_success() => HookOutcome::Completed,
-            Ok(resp) => {
-                let err =
-                    ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook delivery failed")
-                        .details(resp.status().to_string())
-                        .build_error();
-                HookOutcome::Failed(err)
-            }
-            Err(err) => {
-                let err =
-                    ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook delivery failed")
-                        .details(err.to_string())
-                        .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct RecallWebhookRequest {
-    context: WebhookContextPayload,
-    event: RecallEvent,
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Clone)]
-struct WebhookRecallHook {
-    client: Client,
-    endpoint: String,
-    secret: Option<String>,
-    headers: HashMap<String, String>,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl RecallHook for WebhookRecallHook {
-    async fn handle(&self, ctx: &Ctx, event: &RecallEvent) -> HookOutcome {
-        let context = match webhook_context(ctx) {
-            Ok(context) => context,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-        let request_body = RecallWebhookRequest {
-            context,
-            event: event.clone(),
-            metadata: self.static_metadata.clone(),
-        };
-        let builder = self.client.post(&self.endpoint);
-        let builder = match signed_request(builder, &self.secret, &self.headers, &request_body) {
-            Ok(builder) => builder,
-            Err(error) => return HookOutcome::Failed(error),
-        };
-
-        match builder.send().await {
-            Ok(resp) if resp.status().is_success() => HookOutcome::Completed,
-            Ok(resp) => {
-                let err = ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook recall failed")
-                    .details(resp.status().to_string())
-                    .build_error();
-                HookOutcome::Failed(err)
-            }
-            Err(err) => {
-                let err = ErrorBuilder::new(ErrorCode::ServiceUnavailable, "webhook recall failed")
-                    .details(err.to_string())
-                    .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tenant_tests {
     use super::*;
@@ -822,7 +608,6 @@ mod tenant_tests {
             Some("secret".into()),
             HashMap::new(),
         );
-        let post_send = factory.build_post_send(&definition, &endpoint, None, HashMap::new());
         let bounded = Duration::from_secs(5);
 
         for ctx in [Context::root(), Context::root().with_tenant_id(" ")] {
@@ -837,23 +622,6 @@ mod tenant_tests {
                 }
                 PreSendDecision::Continue => panic!("pre-send without a tenant was allowed"),
             }
-            let record = MessageRecord {
-                message_id: "m1".into(),
-                client_message_id: None,
-                conversation_id: "c1".into(),
-                sender_id: "u1".into(),
-                conversation_type: None,
-                message_type: None,
-                persisted_at: SystemTime::now(),
-                metadata: HashMap::new(),
-            };
-            let outcome = tokio::time::timeout(bounded, post_send.handle(&ctx, &record, &draft))
-                .await
-                .expect("post-send hung");
-            assert!(matches!(
-                outcome,
-                HookOutcome::Failed(error) if error.code() == Some(ErrorCode::InvalidParameter)
-            ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(

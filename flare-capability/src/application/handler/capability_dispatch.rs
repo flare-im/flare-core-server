@@ -31,20 +31,21 @@ pub async fn dispatch_capability_command(
     plugin_routes: &Arc<PluginRouteBook>,
     policy: &Arc<dyn CapabilityPolicyBackend>,
     plugin_timeout: Duration,
-    _plugin_health_stale: Duration,
     req: &CapabilityDispatchCommand,
 ) -> Result<CapabilityDispatchResult> {
     let tenant = require_dispatch_tenant(req)?;
-    let user = req.user_id.clone().ok_or_else(|| {
-        crate::domain::capability::CapabilityError::PolicyDenied("user_id required".into())
-    })?;
+    if req.user_id.is_none() {
+        return Err(crate::domain::capability::CapabilityError::PolicyDenied(
+            "user_id required".into(),
+        ));
+    }
 
-    // 插件声明不能选择或降低宿主授权策略。所有调用都检查租户开关和用户
-    // operation 权限；平台审批投影将通过独立插件授权端口叠加，不能替代此检查。
+    // 插件声明不能选择或降低宿主授权策略。内建路由要有打开的租户开关，缺开关即拒；
+    // 远端插件调用按授权快照判定。
     for route in registry.dispatch_routes().await {
         if route.matches(&req.capability_id) {
             policy
-                .ensure_dispatch_allowed(&tenant, &user, &req.capability_id)
+                .ensure_tenant_capability_enabled(&tenant, &req.capability_id)
                 .await?;
             tracing::trace!(
                 capability_id = %req.capability_id,
@@ -65,14 +66,13 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use chrono::{DateTime, Utc};
     use flare_core_base::context::Ctx;
     use flare_server_core::Context;
 
     use super::dispatch_capability_command;
     use crate::domain::capability::{
         CapabilityDispatchCommand, CapabilityDispatchResult, CapabilityDispatchRoute,
-        CapabilityError, CapabilityPolicyBackend, Result, UserCapabilityGrant,
+        CapabilityError, CapabilityPolicyBackend, Result,
     };
 
     use crate::infrastructure::capability::{CapabilityExtensionRegistry, PluginRouteBook};
@@ -85,25 +85,8 @@ mod tests {
         async fn ensure_not_suspended(&self, _t: &str, _c: &str) -> Result<()> {
             Ok(())
         }
-        async fn ensure_dispatch_allowed(&self, _t: &str, _u: &str, _c: &str) -> Result<()> {
+        async fn ensure_tenant_capability_enabled(&self, _t: &str, _c: &str) -> Result<()> {
             Ok(())
-        }
-        async fn list_user_grants(&self, _t: &str, _u: &str) -> Result<Vec<UserCapabilityGrant>> {
-            Ok(vec![])
-        }
-        async fn grant_user_capability(
-            &self,
-            _t: &str,
-            _u: &str,
-            _c: &str,
-            _expires_at: Option<DateTime<Utc>>,
-            _plan_code: Option<String>,
-            _source: Option<String>,
-        ) -> Result<()> {
-            unimplemented!("本用例不涉及授权变更")
-        }
-        async fn revoke_user_capability(&self, _t: &str, _u: &str, _c: &str) -> Result<()> {
-            unimplemented!("本用例不涉及授权变更")
         }
         async fn set_tenant_capability(&self, _t: &str, _c: &str, _e: bool) -> Result<()> {
             unimplemented!("本用例不涉及租户开关")
@@ -165,7 +148,6 @@ mod tests {
             &routes,
             &policy,
             Duration::from_millis(50),
-            Duration::from_secs(30),
             &cmd(capability_id),
         )
         .await
@@ -252,30 +234,9 @@ mod tests {
         async fn ensure_not_suspended(&self, _t: &str, _c: &str) -> Result<()> {
             Ok(())
         }
-        async fn ensure_dispatch_allowed(&self, tenant: &str, _u: &str, _c: &str) -> Result<()> {
-            self.tenants.lock().unwrap().push(tenant.to_string());
-            Ok(())
-        }
         async fn ensure_tenant_capability_enabled(&self, tenant: &str, _c: &str) -> Result<()> {
             self.tenants.lock().unwrap().push(tenant.to_string());
             Ok(())
-        }
-        async fn list_user_grants(&self, _t: &str, _u: &str) -> Result<Vec<UserCapabilityGrant>> {
-            Ok(vec![])
-        }
-        async fn grant_user_capability(
-            &self,
-            _t: &str,
-            _u: &str,
-            _c: &str,
-            _expires_at: Option<DateTime<Utc>>,
-            _plan_code: Option<String>,
-            _source: Option<String>,
-        ) -> Result<()> {
-            unimplemented!("本用例不涉及授权变更")
-        }
-        async fn revoke_user_capability(&self, _t: &str, _u: &str, _c: &str) -> Result<()> {
-            unimplemented!("本用例不涉及授权变更")
         }
         async fn set_tenant_capability(&self, _t: &str, _c: &str, _e: bool) -> Result<()> {
             unimplemented!("本用例不涉及租户开关")
@@ -301,7 +262,6 @@ mod tests {
                 &routes,
                 &policy,
                 Duration::from_millis(50),
-                Duration::from_secs(30),
                 &req,
             )
             .await

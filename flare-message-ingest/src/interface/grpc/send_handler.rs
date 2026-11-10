@@ -601,14 +601,12 @@ mod tests {
         );
     }
 
-    /// 必需的 PreSend Hook 超时，不论先到的是 Hook 自身的超时还是扩展编排器的超时，经本服务的
+    /// 必需的 PreSend Hook 超时，不论先到的是 Hook 自身的超时还是总时限，经本服务的
     /// 错误转换都回 `UNAVAILABLE`：网关据此回可重试的 503 `SERVICE_UNAVAILABLE`，与 Hook 不可达相同。
     /// 以前分别是 `DEADLINE_EXCEEDED` 与 `UNKNOWN`，网关都回 500 `MESSAGE_SEND_FAILED`。
     #[tokio::test]
     async fn required_pre_send_hook_timeouts_answer_unavailable() {
-        use crate::application::extension::{
-            ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting, ExtensionRuntimePolicy,
-        };
+        use crate::application::extension::{ExtensionOrchestrator, ExtensionRouting};
         use crate::domain::service::HookExecutionService;
         use flare_im_contracts::Ctx;
         use flare_im_hooks::hooks::{
@@ -627,30 +625,32 @@ mod tests {
         }
 
         let cases = [
-            ("hook timeout first", Duration::from_millis(5), 60_000),
-            ("orchestrator timeout first", Duration::from_secs(60), 5),
+            (
+                "hook timeout first",
+                Duration::from_millis(5),
+                Duration::from_secs(60),
+            ),
+            (
+                "budget first",
+                Duration::from_secs(60),
+                Duration::from_millis(5),
+            ),
         ];
-        for (case, hook_timeout, orchestrator_timeout_ms) in cases {
+        for (case, hook_timeout, budget) in cases {
             let registry = HookRegistry::new();
-            registry
-                .register_pre_send(
-                    HookMetadata::default()
-                        .with_name("hanging-policy")
-                        .with_require_success(true)
-                        .with_timeout(hook_timeout),
-                    HookSelector::default(),
-                    Arc::new(HangingPreSend),
-                )
-                .await;
+            registry.register_pre_send(
+                HookMetadata::default()
+                    .with_name("hanging-policy")
+                    .with_require_success(true)
+                    .with_timeout(hook_timeout),
+                HookSelector::default(),
+                Arc::new(HangingPreSend),
+            );
             let orchestrator = ExtensionOrchestrator::new(
                 Arc::new(HookExecutionService::new(
-                    Arc::new(HookDispatcher::new(registry)),
+                    Arc::new(HookDispatcher::new(registry).with_budget(budget)),
                     None,
                 )),
-                ExtensionPolicy::new(false).with_runtime(
-                    ExtensionRuntimePolicy::new(orchestrator_timeout_ms, 0),
-                    ExtensionRuntimePolicy::new(1_000, 0),
-                ),
                 ExtensionRouting::default(),
             );
             let ctx: Ctx = Arc::new(

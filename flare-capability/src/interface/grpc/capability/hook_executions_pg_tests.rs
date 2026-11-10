@@ -1,5 +1,5 @@
-//! 真库：Hook 执行证据写进 `hook_executions`（源 DDL 0015 的结构），`hook_config.get_statistics` 与
-//! `hook_config.query_executions` 经 Administer 读回，按签名租户与 Hook 限定，计数按采样权重加权；
+//! 真库：`hook_executions` 里的执行证据（Ingest 写入，这里用同样的语句造行），`hook_config.get_statistics`
+//! 与 `hook_config.query_executions` 经 Administer 读回，按签名租户与 Hook 限定，计数按采样权重加权；
 //! 保留期清理分批删最旧的行。
 //!
 //! 需要 `FLARE_TENANT_TEST_DATABASE_URL`（用 `deploy/init.sql` 或 `migrations/` 初始化的库）。用例标了
@@ -12,39 +12,27 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use flare_grpc_proto::capability::{
-    CreateHookConfigRequest, CreateHookConfigResponse, GenericRequest, GenericResponse,
-    GetHookStatisticsRequest, GetHookStatisticsResponse, HookSelector, HookStatistics,
-    HookTransport, QueryHookExecutionsRequest, QueryHookExecutionsResponse,
+    GenericRequest, GetHookStatisticsRequest, GetHookStatisticsResponse, HookStatistics,
+    QueryHookExecutionsRequest, QueryHookExecutionsResponse,
 };
-use flare_im_hooks::PreSendDecision;
+use flare_im_hooks::hooks::execution::{
+    HOOK_TIMEOUT_CODE, HookExecutionOutcome, HookExecutionRecord,
+};
 use flare_proto::common::{Pagination, TimeRange};
-use flare_server_core::SignedActorType;
 use prost::Message;
 use sqlx::PgPool;
-use tokio::sync::oneshot;
 
 use super::administer::{HookAdministrator, dispatch_hook_administer};
-use crate::application::handler::{HookCommandHandler, HookQueryHandler};
-use crate::composition::hook_registry::CoreHookRegistry;
+use crate::application::handler::HookQueryHandler;
 use crate::domain::model::{
-    HOOK_CIRCUIT_OPEN_CODE, HOOK_TIMEOUT_CODE, HookExecutionFilter, HookExecutionOutcome,
-    HookExecutionRecord, HookExecutionScope, HookExecutionTimeRange,
+    HOOK_CIRCUIT_OPEN_CODE, HookConfigItem, HookExecutionFilter, HookExecutionScope,
+    HookExecutionTimeRange, HookSelectorConfig, HookTransportConfig,
 };
 use crate::domain::repository::HookExecutionRepository;
-use crate::domain::service::{HookCircuitPolicy, HookExecutionGuard, HookOrchestrationService};
-use crate::infrastructure::adapters::HookAdapterFactory;
-use crate::infrastructure::capability::CapabilityExtensionRegistry;
-use crate::infrastructure::config::{ConfigLoaderItem, ConfigWatcher, DatabaseConfigLoader};
-use crate::infrastructure::hook_execution::{
-    HookExecutionBuffer, HookExecutionBufferSettings, HookExecutionMetrics, run_writer,
-};
 use crate::infrastructure::persistence::{
     PostgresHookConfigRepository, PostgresHookExecutionRepository,
 };
-use crate::interface::grpc::hooks::test_support::{
-    WebhookReceiver, cell_keys, ingest_pre_send, serve_hook_plugin, signed_ctx,
-};
-use crate::interface::grpc::{HookServiceServer, ImHookPluginServer};
+use crate::interface::grpc::HookServiceServer;
 
 const ENV_DATABASE_URL: &str = "FLARE_TENANT_TEST_DATABASE_URL";
 
@@ -128,9 +116,9 @@ fn record(
     HookExecutionRecord {
         execution_id: uuid::Uuid::new_v4().to_string(),
         tenant_id: tenant.into(),
+        hook_id: format!("pre_send:{name}"),
         hook_type: "pre_send".into(),
         hook_name: name.into(),
-        hook_version: Some("v7".into()),
         message_id: Some(message_id.into()),
         request_id: Some("req-r75a".into()),
         trace_id: None,
@@ -141,20 +129,55 @@ fn record(
     }
 }
 
+/// 造行：与 Ingest 写的列相同。写入路径本身在 `flare-message-ingest`。
+async fn insert(pool: &PgPool, records: &[HookExecutionRecord]) -> u64 {
+    let mut written = 0;
+    for record in records {
+        written += sqlx::query(
+            "INSERT INTO hook_executions (
+                 execution_id, hook_id, hook_name, hook_type, tenant_id, message_id, request_id,
+                 trace_id, success, latency_ms, error_code, error_message, executed_at,
+                 sample_weight)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+             ON CONFLICT (execution_id) DO NOTHING",
+        )
+        .bind(&record.execution_id)
+        .bind(record.hook_id())
+        .bind(&record.hook_name)
+        .bind(&record.hook_type)
+        .bind(&record.tenant_id)
+        .bind(&record.message_id)
+        .bind(&record.request_id)
+        .bind(&record.trace_id)
+        .bind(record.outcome.answered())
+        .bind(record.latency_ms())
+        .bind(record.outcome.error_code())
+        .bind(record.outcome.error_message())
+        .bind(chrono::DateTime::<chrono::Utc>::from(record.executed_at))
+        .bind(i32::try_from(record.sample_weight).unwrap())
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected();
+    }
+    written
+}
+
 fn scope(tenant: &str, name: &str) -> HookExecutionScope {
     HookExecutionScope {
-        tenant_id: tenant.into(),
+        tenant_id: Some(tenant.into()),
         hook_type: "pre_send".into(),
         hook_name: name.into(),
+        hook_id: format!("pre_send:{name}"),
     }
 }
 
-/// 一批写入一条语句；统计按租户与 Hook 限定、按 `sample_weight` 加权（失败、拒绝、成功、熔断短路
+/// 统计按租户与 Hook 限定、按 `sample_weight` 加权（失败、拒绝、成功、熔断短路
 /// 各自计数，耗时不含熔断短路，p99 加权）；查询从新到旧、按消息号与只看成功过滤；别的租户同名
 /// Hook 的行不进统计也查不到。
 #[tokio::test]
 #[ignore = "requires FLARE_TENANT_TEST_DATABASE_URL pointing at a database initialised with deploy/init.sql or migrations/"]
-async fn the_repository_writes_batches_and_reads_weighted_tenant_scoped_statistics() {
+async fn the_repository_reads_weighted_tenant_scoped_statistics() {
     let url = database_url();
     let run = run_id();
     let (tenant, other) = (format!("r75a-{run}"), format!("r75a-o-{run}"));
@@ -163,7 +186,8 @@ async fn the_repository_writes_batches_and_reads_weighted_tenant_scoped_statisti
         tenants: vec![tenant.clone(), other.clone()],
         name_pattern: None,
     };
-    let repository = PostgresHookExecutionRepository::new(pool(&url).await);
+    let pool = pool(&url).await;
+    let repository = PostgresHookExecutionRepository::new(Arc::clone(&pool));
     let base = SystemTime::now() - Duration::from_secs(60);
     let at = |seconds: u64| base + Duration::from_secs(seconds);
     let rejected = HookExecutionOutcome::Rejected {
@@ -244,9 +268,9 @@ async fn the_repository_writes_batches_and_reads_weighted_tenant_scoped_statisti
             "m9",
         ),
     ];
-    assert_eq!(repository.insert_batch(&records).await.unwrap(), 9);
+    assert_eq!(insert(&pool, &records).await, 9);
     // 同一批重放（写入任务不会这样做，主键冲突只跳过）不产生重复行。
-    assert_eq!(repository.insert_batch(&records[..2]).await.unwrap(), 0);
+    assert_eq!(insert(&pool, &records[..2]).await, 0);
 
     let range = HookExecutionTimeRange {
         from: base,
@@ -367,7 +391,7 @@ async fn the_retention_sweep_deletes_only_expired_rows_in_batches() {
         SystemTime::now(),
         "fresh",
     ));
-    repository.insert_batch(&records).await.unwrap();
+    insert(&pool, &records).await;
     let cutoff = year_2000 + Duration::from_secs(366 * 86_400);
     // 一批至多 limit 行：修复前删除写成 `IN (SELECT .. LIMIT .. FOR UPDATE)`，规划器做成每个外层行
     // 重扫一次的半连接，一条语句删光了全部过期行。
@@ -424,34 +448,36 @@ fn generic(operation: &str, type_name: &str, value: Vec<u8>) -> GenericRequest {
     }
 }
 
-fn create(tenant: &str, name: &str, endpoint: &str) -> GenericRequest {
-    let request = CreateHookConfigRequest {
+/// 应用 Hook 经 Administer 建不出来（H3），直接写行。
+async fn seed(
+    repository: &PostgresHookConfigRepository,
+    tenant: &str,
+    name: &str,
+    endpoint: &str,
+) -> String {
+    let item = HookConfigItem {
         name: name.into(),
-        hook_type: "pre_send".into(),
-        tenant_id: tenant.into(),
-        priority: 900,
-        transport: Some(HookTransport {
-            r#type: "webhook".into(),
-            endpoint: endpoint.into(),
-            timeout_ms: 2000,
-            ..Default::default()
-        }),
-        selector: Some(HookSelector {
+        description: None,
+        enabled: true,
+        order: 900,
+        timeout_ms: 2000,
+        require_success: true,
+        selector: HookSelectorConfig {
             tenants: vec![tenant.into()],
             ..Default::default()
-        }),
-        ..Default::default()
+        },
+        transport: HookTransportConfig::Webhook {
+            endpoint: endpoint.into(),
+            secret: None,
+            headers: Default::default(),
+        },
+        metadata: Default::default(),
     };
-    generic("create", "CreateHookConfigRequest", request.encode_to_vec())
-}
-
-fn created_id(response: GenericResponse) -> String {
-    assert!(response.ok, "{response:?}");
-    CreateHookConfigResponse::decode(response.payload.unwrap().value.as_slice())
+    repository
+        .save(Some(tenant), "pre_send", &item, None)
+        .await
         .unwrap()
-        .config
-        .unwrap()
-        .hook_id
+        .to_string()
 }
 
 async fn statistics(
@@ -518,19 +544,11 @@ async fn executions(
     QueryHookExecutionsResponse::decode(response.payload.unwrap().value.as_slice()).unwrap()
 }
 
-async fn closed_port_url() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    format!("http://{address}/hook")
-}
-
-/// 端到端：两个租户各经 Administer 登记一条同名 PreSend Webhook（A 的放行，B 的连不上），按
-/// Message Ingest 的方式发 PreSend；执行守卫按 (租户, Hook) 熔断，记录经缓冲批量写库；员工经
-/// Administer 读到的统计与执行记录只是本租户这条 Hook 的，读别的租户的 Hook 被拒。
+/// 两个租户各经 Administer 登记一条同名 PreSend Hook，执行记录写在各自名下；员工经 Administer 读到的
+/// 统计与执行记录只是本租户这条 Hook 的，读别的租户的 Hook 被拒。
 #[tokio::test]
 #[ignore = "requires FLARE_TENANT_TEST_DATABASE_URL pointing at a database initialised with deploy/init.sql or migrations/"]
-async fn administer_reads_the_executions_recorded_from_hook_plugin_calls() {
+async fn administer_reads_the_recorded_executions_of_its_own_tenant() {
     let url = database_url();
     let run = run_id();
     let (tenant_a, tenant_b) = (format!("r75a-a{run}"), format!("r75a-b{run}"));
@@ -541,166 +559,95 @@ async fn administer_reads_the_executions_recorded_from_hook_plugin_calls() {
         name_pattern: Some(format!("r75a-%{run}")),
     };
     let config_repository = Arc::new(PostgresHookConfigRepository::new(&url).await.unwrap());
-    let execution_repository: Arc<dyn HookExecutionRepository> = Arc::new(
-        PostgresHookExecutionRepository::new(config_repository.connection_pool()),
-    );
-    let watcher = Arc::new(ConfigWatcher::new(
-        vec![Arc::new(ConfigLoaderItem::Database(
-            DatabaseConfigLoader::new(Arc::clone(&config_repository), None),
-        ))],
-        Duration::from_secs(3600),
-    ));
-    watcher.start().await.unwrap();
-    let registry = Arc::new(CoreHookRegistry::new(Arc::clone(&watcher)));
-    let governance = HookServiceServer::new(Arc::clone(&config_repository), Arc::clone(&registry))
-        .with_executions(Arc::new(HookQueryHandler::new(Arc::clone(
-            &execution_repository,
-        ))));
-
-    // 记录全量（采样 1/1），攒满 1 条即写；熔断阈值 2。
-    let buffer = Arc::new(HookExecutionBuffer::new(
-        HookExecutionBufferSettings {
-            capacity: 1_000,
-            batch_size: 1,
-            sample_every: 1,
-        },
-        Arc::new(HookExecutionMetrics::new()),
-    ));
-    let (stop_writer, writer_shutdown) = oneshot::channel();
-    let writer = tokio::spawn(run_writer(
-        Arc::clone(&buffer),
-        Arc::clone(&execution_repository),
-        Duration::from_millis(50),
-        writer_shutdown,
-    ));
-    let guard = Arc::new(HookExecutionGuard::new(
-        HookCircuitPolicy {
-            enabled: true,
-            failure_threshold: 2,
-            failure_window: Duration::from_secs(30),
-            open_for: Duration::from_secs(600),
-        },
-        buffer.clone(),
-    ));
-    let keys = cell_keys(75);
-    let endpoint = serve_hook_plugin(
-        ImHookPluginServer::new(
-            Arc::new(HookCommandHandler::new(Arc::new(HookOrchestrationService))),
-            Arc::clone(&registry),
-            Arc::new(HookAdapterFactory::new()),
-            CapabilityExtensionRegistry::new(),
-            Some(keys.verifier.clone()),
-        )
-        .with_execution_guard(guard),
-    )
-    .await;
-
-    let receiver = WebhookReceiver::start().await;
-    let hook_a = created_id(
-        dispatch_hook_administer(
-            &governance,
-            create(&tenant_a, &name, &receiver.url("/a")),
-            &employee(&tenant_a),
-        )
-        .await
-        .unwrap()
-        .into_inner(),
-    );
-    let hook_b = created_id(
-        dispatch_hook_administer(
-            &governance,
-            create(&tenant_b, &name, &closed_port_url().await),
-            &employee(&tenant_b),
-        )
-        .await
-        .unwrap()
-        .into_inner(),
+    let pool = config_repository.connection_pool();
+    let execution_repository: Arc<dyn HookExecutionRepository> =
+        Arc::new(PostgresHookExecutionRepository::new(Arc::clone(&pool)));
+    let governance = HookServiceServer::new(Arc::clone(&config_repository)).with_executions(
+        Arc::new(HookQueryHandler::new(Arc::clone(&execution_repository))),
     );
 
-    for i in 0..2 {
-        let ctx = signed_ctx(&keys, SignedActorType::User, "u-r75a", &tenant_a);
-        match ingest_pre_send(&endpoint, &ctx, &format!("{run}-a{i}")).await {
-            PreSendDecision::Continue => {}
-            PreSendDecision::Reject { error } => panic!("tenant A rejected: {error}"),
-        }
-    }
-    for i in 0..3 {
-        let ctx = signed_ctx(&keys, SignedActorType::User, "u-r75a", &tenant_b);
-        match ingest_pre_send(&endpoint, &ctx, &format!("{run}-b{i}")).await {
-            PreSendDecision::Reject { error } => assert_eq!(
-                error.code(),
-                Some(flare_server_core::error::ErrorCode::ServiceUnavailable),
-                "{error}"
-            ),
-            PreSendDecision::Continue => panic!("tenant B's required hook is unreachable"),
-        }
-    }
-    assert_eq!(receiver.count(), 2, "only A's hook reaches the receiver");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let (stats_a, stats_b) = loop {
-        let a = statistics(&governance, &tenant_a, &hook_a).await.unwrap();
-        let b = statistics(&governance, &tenant_b, &hook_b).await.unwrap();
-        if a.total_executions == 2 && b.total_executions == 3 {
-            break (a, b);
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "rows not written: {a:?} {b:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert_eq!(stats_a.hook_id, hook_a);
-    assert_eq!((stats_a.success_count, stats_a.failure_count), (2, 0));
-    assert_eq!((stats_b.success_count, stats_b.failure_count), (0, 3));
-    assert_eq!(stats_b.circuit_break_count, 1);
-    assert_eq!(
-        stats_b.error_count_by_code.get(HOOK_CIRCUIT_OPEN_CODE),
-        Some(&1)
-    );
-    assert_eq!(
-        stats_b.error_count_by_code.values().sum::<i64>(),
-        3,
-        "{stats_b:?}"
-    );
-
-    let page = executions(&governance, &tenant_a, &hook_a, "", false, 1).await;
-    assert_eq!(page.executions.len(), 1);
-    assert!(page.pagination.as_ref().unwrap().has_more);
-    assert_eq!(
-        page.executions[0].message_id,
-        format!("{run}-a1"),
-        "newest first"
-    );
-    assert_eq!(page.executions[0].hook_id, hook_a);
-    assert!(page.executions[0].success);
-    let page = executions(
-        &governance,
+    let hook_a = seed(
+        &config_repository,
         &tenant_a,
-        &hook_a,
-        &format!("{run}-a0"),
-        false,
-        10,
+        &name,
+        "https://a.example.com/hook",
     )
     .await;
-    assert_eq!(page.executions.len(), 1);
-    assert!(!page.pagination.unwrap().has_more);
-    let page = executions(&governance, &tenant_b, &hook_b, "", true, 10).await;
-    assert!(page.executions.is_empty(), "B has no successful execution");
-    let page = executions(&governance, &tenant_b, &hook_b, "", false, 10).await;
-    assert_eq!(page.executions.len(), 3);
-    assert!(
-        page.executions
-            .iter()
-            .all(|e| !e.success && !e.error_code.is_empty())
+    let hook_b = seed(
+        &config_repository,
+        &tenant_b,
+        &name,
+        "https://b.example.com/hook",
+    )
+    .await;
+
+    let now = SystemTime::now();
+    let a_failed = HookExecutionOutcome::Failed {
+        code: "SERVICE_UNAVAILABLE",
+    };
+    // Ingest 记的 Hook 身份是行号。第四行属于先前删掉的同名 Hook（另一个行号）：重建的 Hook 不继承它。
+    let of = |mut record: HookExecutionRecord, hook_id: &str| {
+        record.hook_id = hook_id.to_string();
+        record
+    };
+    insert(
+        &pool,
+        &[
+            of(
+                record(
+                    &tenant_a,
+                    &name,
+                    HookExecutionOutcome::Allowed,
+                    10,
+                    1,
+                    now,
+                    &format!("{run}-a0"),
+                ),
+                &hook_a,
+            ),
+            of(
+                record(&tenant_a, &name, a_failed, 20, 1, now, &format!("{run}-a1")),
+                &hook_a,
+            ),
+            of(
+                record(
+                    &tenant_b,
+                    &name,
+                    HookExecutionOutcome::TimedOut,
+                    30,
+                    1,
+                    now,
+                    &format!("{run}-b0"),
+                ),
+                &hook_b,
+            ),
+            of(
+                record(
+                    &tenant_a,
+                    &name,
+                    HookExecutionOutcome::CircuitOpen,
+                    0,
+                    5,
+                    now,
+                    &format!("{run}-old"),
+                ),
+                &format!("{hook_a}0"),
+            ),
+        ],
+    )
+    .await;
+
+    let stats = statistics(&governance, &tenant_a, &hook_a).await.unwrap();
+    assert_eq!(stats.total_executions, 2);
+    assert_eq!(stats.success_count, 1);
+    assert_eq!(stats.failure_count, 1);
+    assert_eq!(stats.circuit_break_count, 0, "the deleted predecessor's rows stay its own");
+    assert_eq!(
+        stats.error_count_by_code,
+        HashMap::from([("SERVICE_UNAVAILABLE".to_string(), 1)])
     );
-    assert!(
-        page.executions
-            .iter()
-            .all(|e| !e.error_message.contains("127.0.0.1")),
-        "no downstream error text: {:?}",
-        page.executions
-    );
+    let page = executions(&governance, &tenant_a, &hook_a, "", false, 10).await;
+    assert_eq!(page.executions.len(), 2);
 
     // 时间超出 9999 年末（换算时间戳会 panic 的值）：两个读接口都回 INVALID_ARGUMENT。
     let huge = TimeRange {
@@ -752,9 +699,10 @@ async fn administer_reads_the_executions_recorded_from_hook_plugin_calls() {
     let rows = HookQueryHandler::new(Arc::clone(&execution_repository))
         .executions(&HookExecutionFilter {
             scope: HookExecutionScope {
-                tenant_id: tenant_b.clone(),
+                tenant_id: Some(tenant_b.clone()),
                 hook_type: "pre_send".into(),
                 hook_name: name.clone(),
+                hook_id: hook_b.clone(),
             },
             range: HookExecutionTimeRange {
                 from: SystemTime::UNIX_EPOCH,
@@ -767,8 +715,4 @@ async fn administer_reads_the_executions_recorded_from_hook_plugin_calls() {
         .await
         .unwrap();
     assert!(rows.is_empty());
-
-    stop_writer.send(()).unwrap();
-    writer.await.unwrap();
-    assert!(buffer.is_empty());
 }

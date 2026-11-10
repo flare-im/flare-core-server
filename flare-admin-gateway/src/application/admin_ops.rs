@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use flare_grpc_proto::capability::{
     CapabilityDescriptor, GetTenantRuntimeResponse, ListCapabilitiesResponse,
     ListRegisteredPluginsResponse, ListTenantCapabilitySwitchesResponse,
-    RegisterPluginEndpointRequest, RegisteredPluginInstance, TenantCapabilitySwitch,
+    RegisteredPluginInstance, TenantCapabilitySwitch,
 };
 use flare_grpc_proto::control::{TenantQuota, TenantStatus};
 use flare_grpc_proto::conversation::{
@@ -251,40 +251,6 @@ pub struct AdminCapabilitySwitchUpdateHttp {
     pub message: String,
 }
 
-/// 登记插件实例：`tenant_id` 与 `request_id` 不由调用方给，取自 Staff 上下文。
-#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
-pub struct AdminPluginRegisterHttpRequest {
-    pub plugin_id: String,
-    pub capability_id: String,
-    pub grpc_authority: String,
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-    pub plugin_version: String,
-    pub api_version: String,
-    pub manifest_sha256: String,
-    pub declared_operations: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct AdminPluginRegisterHttp {
-    pub tenant_id: String,
-    pub plugin_id: String,
-    pub accepted: bool,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct AdminPluginDeregisterHttpRequest {
-    pub plugin_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct AdminPluginDeregisterHttp {
-    pub tenant_id: String,
-    pub plugin_id: String,
-    pub accepted: bool,
-}
-
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AdminPluginHttp {
     pub plugin_id: String,
@@ -317,80 +283,6 @@ pub struct AdminPageLimitError {
 pub struct AdminArgError {
     pub code: &'static str,
     pub message: String,
-}
-
-/// 插件标识：1 到 128 个 ASCII 字母、数字或 `_ - . :`。与 Capability 登记时的规则
-/// （`flare-capability` 的 `is_plugin_identifier`）相同，这里提前拒绝，不让不合规的值进审计日志或转发。
-fn is_plugin_identifier(value: &str) -> bool {
-    (1..=128).contains(&value.len())
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
-}
-
-/// 登记插件的 proto 请求：三个必填字段去空白后非空；`plugin_id`、`capability_id` 与
-/// `declared_operations` 的每一项须是插件标识（[`is_plugin_identifier`]），错误里不带取值；其余原样。
-/// 租户与请求号来自 Staff 上下文。
-pub fn register_plugin_request(
-    tenant_id: &str,
-    request_id: &str,
-    request: AdminPluginRegisterHttpRequest,
-) -> Result<RegisterPluginEndpointRequest, AdminArgError> {
-    let required = |value: &str, name: &str| -> Result<String, AdminArgError> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err(AdminArgError {
-                code: "ADMIN_PLUGIN_FIELD_REQUIRED",
-                message: format!("{name} is required"),
-            });
-        }
-        Ok(value.to_string())
-    };
-    let invalid = |name: &str| AdminArgError {
-        code: "ADMIN_PLUGIN_FIELD_INVALID",
-        message: format!("{name} must be 1 to 128 ASCII letters, digits or _ - . :"),
-    };
-    let identifier = |value: &str, name: &str| -> Result<String, AdminArgError> {
-        let value = required(value, name)?;
-        if is_plugin_identifier(&value) {
-            Ok(value)
-        } else {
-            Err(invalid(name))
-        }
-    };
-    let plugin_id = identifier(&request.plugin_id, "plugin_id")?;
-    let capability_id = identifier(&request.capability_id, "capability_id")?;
-    let grpc_authority = required(&request.grpc_authority, "grpc_authority")?;
-    flare_plugin_protocol::registration::validate_declaration(
-        &request.plugin_version,
-        &request.api_version,
-        &request.manifest_sha256,
-        &request.declared_operations,
-        &capability_id,
-    )
-    .map_err(|message| AdminArgError {
-        code: "ADMIN_PLUGIN_FIELD_INVALID",
-        message: message.to_owned(),
-    })?;
-    if !request
-        .declared_operations
-        .iter()
-        .all(|op| is_plugin_identifier(op))
-    {
-        return Err(invalid("each declared_operations entry"));
-    }
-    Ok(RegisterPluginEndpointRequest {
-        tenant_id: tenant_id.to_string(),
-        plugin_id,
-        capability_id,
-        grpc_authority,
-        labels: request.labels,
-        request_id: request_id.to_string(),
-        plugin_version: request.plugin_version,
-        api_version: request.api_version,
-        manifest_sha256: request.manifest_sha256,
-        declared_operations: request.declared_operations,
-    })
 }
 
 fn capability_descriptor_http(descriptor: CapabilityDescriptor) -> AdminCapabilityDescriptorHttp {
@@ -762,105 +654,6 @@ mod tests {
         assert!(!presence.online);
         assert!(presence.devices.is_empty());
         assert_eq!(presence.last_seen_at, None);
-    }
-
-    #[test]
-    fn plugin_registration_takes_tenant_and_request_id_from_the_staff_context() {
-        let proto = register_plugin_request(
-            "tenant-a",
-            "req-9",
-            AdminPluginRegisterHttpRequest {
-                plugin_id: " plugin-a ".into(),
-                capability_id: "example.poll".into(),
-                grpc_authority: "http://plugin:9".into(),
-                declared_operations: vec!["example.poll".into()],
-                plugin_version: "1.0.0".into(),
-                api_version: "1.0".into(),
-                manifest_sha256: "a".repeat(64),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(proto.tenant_id, "tenant-a");
-        assert_eq!(proto.request_id, "req-9");
-        assert_eq!(proto.plugin_id, "plugin-a");
-        for (plugin_id, capability_id, authority) in [
-            ("", "example.poll", "http://plugin:9"),
-            ("plugin-a", " ", "http://plugin:9"),
-            ("plugin-a", "example.poll", ""),
-        ] {
-            let error = register_plugin_request(
-                "tenant-a",
-                "req-9",
-                AdminPluginRegisterHttpRequest {
-                    plugin_id: plugin_id.into(),
-                    capability_id: capability_id.into(),
-                    grpc_authority: authority.into(),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-            assert_eq!(error.code, "ADMIN_PLUGIN_FIELD_REQUIRED");
-        }
-    }
-
-    #[test]
-    fn plugin_registration_requires_identifiers() {
-        let request = |plugin_id: &str, capability_id: &str, operations: &[&str]| {
-            AdminPluginRegisterHttpRequest {
-                plugin_id: plugin_id.into(),
-                capability_id: capability_id.into(),
-                grpc_authority: "http://plugin:9".into(),
-                declared_operations: operations.iter().map(|op| op.to_string()).collect(),
-                plugin_version: "1.0.0".into(),
-                api_version: "1.0".into(),
-                manifest_sha256: "a".repeat(64),
-                ..Default::default()
-            }
-        };
-        let accepted = register_plugin_request(
-            "tenant-a",
-            "req-9",
-            request(
-                "flare-moments",
-                "social.moments.feed",
-                &["social.moments.feed", "ns:op_1-2"],
-            ),
-        )
-        .unwrap();
-        assert_eq!(accepted.capability_id, "social.moments.feed");
-        let long = "p".repeat(129);
-        for (invalid, field) in [
-            (
-                request("p1\nWARN forged line", "example.poll", &[]),
-                "plugin_id",
-            ),
-            (request("plugin a", "example.poll", &[]), "plugin_id"),
-            (request(&long, "example.poll", &[]), "plugin_id"),
-            (
-                request("plugin-a", "example.poll\r\nWARN x", &[]),
-                "capability_id",
-            ),
-            (request("plugin-a", "example/poll", &[]), "capability_id"),
-            (request("插件", "example.poll", &[]), "plugin_id"),
-            (
-                request(
-                    "plugin-a",
-                    "example.poll",
-                    &["example.poll", "example.poll\nWARN x"],
-                ),
-                "declared_operations",
-            ),
-            (
-                request("plugin-a", "example.poll", &["example.poll", ""]),
-                "declared_operations",
-            ),
-        ] {
-            let error = register_plugin_request("tenant-a", "req-9", invalid).unwrap_err();
-            assert_eq!(error.code, "ADMIN_PLUGIN_FIELD_INVALID");
-            assert!(error.message.contains(field), "{}", error.message);
-            assert!(!error.message.contains("WARN"), "{}", error.message);
-        }
     }
 
     #[test]

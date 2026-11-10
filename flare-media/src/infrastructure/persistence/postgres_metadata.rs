@@ -10,13 +10,13 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{FromRow, PgPool, Row};
 
 use crate::domain::model::{
-    FileAccessType, MediaAssetStatus, MediaFileMetadata, MediaReference,
-    STORAGE_BUCKET_METADATA_KEY, STORAGE_PATH_METADATA_KEY,
+    FileAccessType, MediaAssetStatus, MediaFileMetadata, MediaOwnerKind, MediaPurpose,
+    MediaReference, STORAGE_BUCKET_METADATA_KEY, STORAGE_PATH_METADATA_KEY,
 };
 use crate::domain::repository::{MediaMetadataStore, MediaReferenceStore, OrphanAssetClaim};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
-const MEDIA_ASSET_COLUMNS: &str = "owner_id, file_id, file_name, mime_type, file_size, url, \
+const MEDIA_ASSET_COLUMNS: &str = "owner_id, owner_kind, purpose, file_id, file_name, mime_type, file_size, url, \
      cdn_url, md5, sha256, metadata, uploaded_at, reference_count, status, grace_expires_at, \
      access_type";
 
@@ -35,6 +35,8 @@ mod source_audit_tests;
 #[derive(Debug, FromRow)]
 struct MediaAssetRow {
     owner_id: Option<String>,
+    owner_kind: String,
+    purpose: String,
     file_id: String,
     file_name: String,
     mime_type: String,
@@ -87,6 +89,18 @@ impl TryFrom<MediaAssetRow> for MediaFileMetadata {
 
         Ok(MediaFileMetadata {
             owner_id: row.owner_id,
+            owner_kind: row.owner_kind.parse::<MediaOwnerKind>().map_err(|_| {
+                flare_server_core::flare_err!(
+                    ErrorCode::DeserializationError,
+                    "invalid media owner kind"
+                )
+            })?,
+            purpose: row.purpose.parse::<MediaPurpose>().map_err(|_| {
+                flare_server_core::flare_err!(
+                    ErrorCode::DeserializationError,
+                    "invalid media purpose"
+                )
+            })?,
             file_id: row.file_id,
             file_name: row.file_name,
             mime_type: row.mime_type,
@@ -335,7 +349,13 @@ impl MediaMetadataStore for PostgresMetadataStore {
         let metadata_json = Self::metadata_to_json(&metadata.metadata)?;
 
         let tenant_id = crate::domain::service::require_tenant(ctx)?;
-
+        let mut tx = self.pool().begin().await.map_err(|err| {
+            map_infra_error(
+                err,
+                ErrorCode::DatabaseError,
+                "media metadata transaction unavailable",
+            )
+        })?;
         sqlx::query(
             r#"
             INSERT INTO media_assets (
@@ -354,9 +374,11 @@ impl MediaMetadataStore for PostgresMetadataStore {
                 status,
                 grace_expires_at,
                 access_type,
-                owner_id
+                owner_id,
+                owner_kind,
+                purpose
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (tenant_id, file_id) DO UPDATE SET
                 file_name = EXCLUDED.file_name,
                 mime_type = EXCLUDED.mime_type,
@@ -389,7 +411,9 @@ impl MediaMetadataStore for PostgresMetadataStore {
         .bind(metadata.grace_expires_at)
         .bind(MediaAssetRow::access_type_to_str(metadata.access_type))
         .bind(&metadata.owner_id)
-        .execute(self.pool())
+        .bind(metadata.owner_kind.as_str())
+        .bind(metadata.purpose.as_str())
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             map_infra_error(
@@ -398,7 +422,28 @@ impl MediaMetadataStore for PostgresMetadataStore {
                 "failed to persist media metadata",
             )
         })?;
-
+        flare_im_service_kit::audit_effects::durable::record(
+            &mut tx,
+            tenant_id,
+            "media_assets",
+            &metadata.file_id,
+            "save",
+        )
+        .await
+        .map_err(|err| {
+            map_infra_error(
+                err,
+                ErrorCode::DatabaseError,
+                "media source audit transaction unavailable",
+            )
+        })?;
+        tx.commit().await.map_err(|err| {
+            map_infra_error(
+                err,
+                ErrorCode::DatabaseError,
+                "media metadata commit unavailable",
+            )
+        })?;
         Ok(())
     }
 
@@ -412,6 +457,8 @@ impl MediaMetadataStore for PostgresMetadataStore {
             r#"
             SELECT
                 owner_id,
+                owner_kind,
+                purpose,
                 file_id,
                 file_name,
                 mime_type,
@@ -454,6 +501,8 @@ impl MediaMetadataStore for PostgresMetadataStore {
             r#"
             SELECT
                 owner_id,
+                owner_kind,
+                purpose,
                 file_id,
                 file_name,
                 mime_type,
@@ -538,6 +587,8 @@ impl MediaMetadataStore for PostgresMetadataStore {
             r#"
             SELECT
                 owner_id,
+                owner_kind,
+                purpose,
                 file_id,
                 file_name,
                 mime_type,

@@ -1,31 +1,22 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::Ctx;
 use async_trait::async_trait;
 use flare_grpc_proto::capability::hook_plugin_client::HookPluginClient;
 use flare_grpc_proto::{
-    GenericRequest, ProtoDeliveryHookRequest, ProtoDeliveryHookResponse, ProtoHookDeliveryEvent,
-    ProtoHookInvocationContext, ProtoHookMessageDraft, ProtoHookMessageRecord,
-    ProtoHookRecallEvent, ProtoPostSendHookRequest, ProtoPostSendHookResponse,
-    ProtoPreSendHookRequest, ProtoPreSendHookResponse, ProtoRecallHookRequest,
-    ProtoRecallHookResponse,
+    GenericRequest, ProtoHookInvocationContext, ProtoHookMessageDraft, ProtoPreSendHookRequest,
+    ProtoPreSendHookResponse,
 };
-use flare_proto::common::Message as ProtoStorageMessage;
 use flare_server_core::error::{ErrorBuilder, ErrorCode, Result};
 use flare_server_core::grpc::client::set_signed_context_token;
 use flare_server_core::grpc::middleware::signed_context::VerifiedContext;
 use prost::Message;
-use prost_types::Timestamp;
 use tonic::transport::Channel;
 
 use crate::discovery::{invalidate_static_channel_on_transport_failure, resolve_grpc_channel};
 
-use super::super::types::{
-    DeliveryEvent, DeliveryHook, HookOutcome, MessageDraft, MessageRecord, PostSendHook,
-    PreSendDecision, PreSendHook, RecallEvent, RecallHook, pre_send_rejection,
-};
+use super::super::types::{MessageDraft, PreSendDecision, PreSendHook, pre_send_rejection};
 
 #[derive(Clone)]
 pub struct GrpcHookFactory;
@@ -52,9 +43,8 @@ async fn hook_plugin_call<Mres: Message + Default>(
             "hook identity context mismatch",
         ));
     }
-    if operation == "flare.hook.v1.pre_send"
-        && (claims.actor_type != flare_server_core::auth::SignedActorType::User
-            || ctx.user_id() != Some(claims.actor_id.as_str()))
+    if claims.actor_type != flare_server_core::auth::SignedActorType::User
+        || ctx.user_id() != Some(claims.actor_id.as_str())
     {
         return Err(tonic::Status::permission_denied(
             "pre-send hook requires signed user",
@@ -100,39 +90,47 @@ impl GrpcHookFactory {
             static_metadata: metadata,
         })
     }
+}
 
-    pub fn build_post_send(
-        &self,
-        metadata: HashMap<String, String>,
-        grpc_endpoint: String,
-    ) -> Arc<dyn PostSendHook> {
-        Arc::new(GrpcPostSendHook {
-            grpc_endpoint,
-            static_metadata: metadata,
-        })
+/// 测试调用的结果：`Ok` 是目标的回答，`Err` 是调用失败。
+pub(in crate::hooks) async fn test_pre_send(
+    endpoint: &str,
+    static_metadata: &HashMap<String, String>,
+    ctx: &Ctx,
+    draft: &MessageDraft,
+) -> std::result::Result<ProtoPreSendHookResponse, tonic::Status> {
+    let channel = hook_plugin_channel(endpoint)
+        .await
+        .map_err(|_| tonic::Status::unavailable("hook gRPC channel resolve failed"))?;
+    let mut client = HookPluginClient::new(channel);
+    let any = prost_types::Any {
+        type_url: "type.googleapis.com/flare.capability.v1.PreSendHookRequest".to_string(),
+        value: ProtoPreSendHookRequest {
+            context: Some(build_context(ctx, static_metadata)),
+            draft: Some(build_draft(draft)),
+        }
+        .encode_to_vec(),
+    };
+    // 不带签名上下文：发送路径转发的是发送者的身份，这里没有发送者；管理员的 Staff 上下文也不能发给
+    // 一个还没保存的目标。校验身份的目标回 UNAUTHENTICATED，调用方算作「通了，要身份」。
+    let envelope = client
+        .call(tonic::Request::new(GenericRequest {
+            operation: "flare.hook.v1.pre_send".to_string(),
+            metadata: static_metadata.clone(),
+            payload: Some(any),
+            request_id: ctx.request_id().to_string(),
+        }))
+        .await
+        .inspect_err(|status| forget_channel_on_transport_failure(endpoint, status))?
+        .into_inner();
+    if !envelope.ok {
+        return Err(tonic::Status::internal("hook answered an error envelope"));
     }
-
-    pub fn build_delivery(
-        &self,
-        metadata: HashMap<String, String>,
-        grpc_endpoint: String,
-    ) -> Arc<dyn DeliveryHook> {
-        Arc::new(GrpcDeliveryHook {
-            grpc_endpoint,
-            static_metadata: metadata,
-        })
-    }
-
-    pub fn build_recall(
-        &self,
-        metadata: HashMap<String, String>,
-        grpc_endpoint: String,
-    ) -> Arc<dyn RecallHook> {
-        Arc::new(GrpcRecallHook {
-            grpc_endpoint,
-            static_metadata: metadata,
-        })
-    }
+    let payload = envelope
+        .payload
+        .ok_or_else(|| tonic::Status::internal("empty HookPlugin response payload"))?;
+    ProtoPreSendHookResponse::decode(payload.value.as_slice())
+        .map_err(|_| tonic::Status::internal("undecodable HookPlugin response"))
 }
 
 impl Default for GrpcHookFactory {
@@ -234,170 +232,10 @@ impl PreSendHook for GrpcPreSendHook {
     }
 }
 
-#[derive(Clone)]
-struct GrpcPostSendHook {
-    grpc_endpoint: String,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl PostSendHook for GrpcPostSendHook {
-    async fn handle(&self, ctx: &Ctx, record: &MessageRecord, draft: &MessageDraft) -> HookOutcome {
-        let channel = match hook_plugin_channel(&self.grpc_endpoint).await {
-            Ok(ch) => ch,
-            Err(err) => return HookOutcome::Failed(err),
-        };
-        let mut client = HookPluginClient::new(channel);
-        let request = ProtoPostSendHookRequest {
-            context: Some(build_context(ctx, &self.static_metadata)),
-            record: Some(build_record(record)),
-            draft: Some(build_draft(draft)),
-        };
-
-        match hook_plugin_call::<ProtoPostSendHookResponse>(
-            &mut client,
-            ctx,
-            "flare.hook.v1.post_send",
-            "type.googleapis.com/flare.capability.v1.PostSendHookRequest",
-            &request,
-            &self.static_metadata,
-        )
-        .await
-        {
-            Ok(inner) => {
-                if inner.success {
-                    HookOutcome::Completed
-                } else {
-                    HookOutcome::Failed(
-                        ErrorBuilder::new(
-                            ErrorCode::OperationFailed,
-                            "post-send hook reported failure",
-                        )
-                        .build_error(),
-                    )
-                }
-            }
-            Err(status) => {
-                forget_channel_on_transport_failure(&self.grpc_endpoint, &status);
-                let err = ErrorBuilder::new(ErrorCode::ServiceUnavailable, "post-send hook failed")
-                    .details(status.to_string())
-                    .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct GrpcDeliveryHook {
-    grpc_endpoint: String,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl DeliveryHook for GrpcDeliveryHook {
-    async fn handle(&self, ctx: &Ctx, event: &DeliveryEvent) -> HookOutcome {
-        let channel = match hook_plugin_channel(&self.grpc_endpoint).await {
-            Ok(ch) => ch,
-            Err(err) => return HookOutcome::Failed(err),
-        };
-        let mut client = HookPluginClient::new(channel);
-        let request = ProtoDeliveryHookRequest {
-            context: Some(build_context(ctx, &self.static_metadata)),
-            event: Some(build_delivery_event(event)),
-        };
-
-        match hook_plugin_call::<ProtoDeliveryHookResponse>(
-            &mut client,
-            ctx,
-            "flare.hook.v1.delivery",
-            "type.googleapis.com/flare.capability.v1.DeliveryHookRequest",
-            &request,
-            &self.static_metadata,
-        )
-        .await
-        {
-            Ok(inner) => {
-                if inner.success {
-                    HookOutcome::Completed
-                } else {
-                    HookOutcome::Failed(
-                        ErrorBuilder::new(
-                            ErrorCode::OperationFailed,
-                            "delivery hook reported failure",
-                        )
-                        .build_error(),
-                    )
-                }
-            }
-            Err(status) => {
-                forget_channel_on_transport_failure(&self.grpc_endpoint, &status);
-                let err = ErrorBuilder::new(ErrorCode::ServiceUnavailable, "delivery hook failed")
-                    .details(status.to_string())
-                    .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct GrpcRecallHook {
-    grpc_endpoint: String,
-    static_metadata: HashMap<String, String>,
-}
-
-#[async_trait]
-impl RecallHook for GrpcRecallHook {
-    async fn handle(&self, ctx: &Ctx, event: &RecallEvent) -> HookOutcome {
-        let channel = match hook_plugin_channel(&self.grpc_endpoint).await {
-            Ok(ch) => ch,
-            Err(err) => return HookOutcome::Failed(err),
-        };
-        let mut client = HookPluginClient::new(channel);
-        let request = ProtoRecallHookRequest {
-            context: Some(build_context(ctx, &self.static_metadata)),
-            event: Some(build_recall_event(event)),
-        };
-
-        match hook_plugin_call::<ProtoRecallHookResponse>(
-            &mut client,
-            ctx,
-            "flare.hook.v1.recall",
-            "type.googleapis.com/flare.capability.v1.RecallHookRequest",
-            &request,
-            &self.static_metadata,
-        )
-        .await
-        {
-            Ok(inner) => {
-                if inner.allow {
-                    HookOutcome::Completed
-                } else {
-                    HookOutcome::Failed(
-                        ErrorBuilder::new(ErrorCode::OperationFailed, "recall hook rejected")
-                            .build_error(),
-                    )
-                }
-            }
-            Err(status) => {
-                forget_channel_on_transport_failure(&self.grpc_endpoint, &status);
-                let err = ErrorBuilder::new(ErrorCode::ServiceUnavailable, "recall hook failed")
-                    .details(status.to_string())
-                    .build_error();
-                HookOutcome::Failed(err)
-            }
-        }
-    }
-}
-
 fn build_context(
     ctx: &Ctx,
     static_metadata: &HashMap<String, String>,
 ) -> ProtoHookInvocationContext {
-    // 从 Context 中提取 Hook 特定的数据
-    // 注意：这里需要访问 HookContextData，但它在 flare-capability 服务 crate 中
-    // 为了简化，我们使用 Context 的基本字段
     use crate::hooks::hook_context_data::get_hook_context_data;
 
     let hook_data = get_hook_context_data(ctx).cloned().unwrap_or_default();
@@ -471,121 +309,8 @@ fn apply_draft(target: &mut MessageDraft, source: ProtoHookMessageDraft) {
     target.metadata = source.metadata;
 }
 
-fn conversation_type_label_to_proto(value: &str) -> i32 {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "single" => flare_proto::common::ConversationType::Single as i32,
-        "group" => flare_proto::common::ConversationType::Group as i32,
-        "ai" => flare_proto::common::ConversationType::Ai as i32,
-        "system" => flare_proto::common::ConversationType::System as i32,
-        "customer" => flare_proto::common::ConversationType::Customer as i32,
-        "temp" => flare_proto::common::ConversationType::Temp as i32,
-        "channel" => flare_proto::common::ConversationType::Channel as i32,
-        "broadcast" => flare_proto::common::ConversationType::Broadcast as i32,
-        _ => flare_proto::common::ConversationType::Unspecified as i32,
-    }
-}
-
-fn message_type_label_to_proto(value: &str) -> i32 {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "text" => flare_proto::common::MessageType::Text as i32,
-        "image" => flare_proto::common::MessageType::Image as i32,
-        "video" => flare_proto::common::MessageType::Video as i32,
-        "audio" => flare_proto::common::MessageType::Audio as i32,
-        "file" => flare_proto::common::MessageType::File as i32,
-        "location" => flare_proto::common::MessageType::Location as i32,
-        "card" => flare_proto::common::MessageType::Card as i32,
-        "sticker" => flare_proto::common::MessageType::Sticker as i32,
-        "emoji" => flare_proto::common::MessageType::Emoji as i32,
-        "link_card" => flare_proto::common::MessageType::LinkCard as i32,
-        "forward" => flare_proto::common::MessageType::Forward as i32,
-        "thread" => flare_proto::common::MessageType::Thread as i32,
-        "quote" => flare_proto::common::MessageType::Quote as i32,
-        "app_card" => flare_proto::common::MessageType::AppCard as i32,
-        "rich_text" => flare_proto::common::MessageType::RichText as i32,
-        "image_group" => flare_proto::common::MessageType::ImageGroup as i32,
-        "system" => flare_proto::common::MessageType::System as i32,
-        "notification" => flare_proto::common::MessageType::Notification as i32,
-        "custom" => flare_proto::common::MessageType::Custom as i32,
-        "placeholder" => flare_proto::common::MessageType::Placeholder as i32,
-        _ => flare_proto::common::MessageType::Unspecified as i32,
-    }
-}
-
-fn build_record(record: &MessageRecord) -> ProtoHookMessageRecord {
-    let persisted_ts = system_time_to_timestamp(record.persisted_at);
-
-    let mut message = ProtoStorageMessage {
-        server_id: record.message_id.clone(),
-        conversation_id: record.conversation_id.clone(),
-        sender_id: record.sender_id.clone(),
-        conversation_type: record
-            .conversation_type
-            .as_deref()
-            .map(conversation_type_label_to_proto)
-            .unwrap_or(flare_proto::common::ConversationType::Unspecified as i32),
-        created_at: persisted_ts
-            .seconds
-            .saturating_mul(1000)
-            .saturating_add((persisted_ts.nanos as i64) / 1_000_000),
-        message_type: record
-            .message_type
-            .as_deref()
-            .map(message_type_label_to_proto)
-            .unwrap_or(flare_proto::common::MessageType::Unspecified as i32),
-        ..Default::default()
-    };
-    if message.client_msg_id.is_empty()
-        && let Some(client_id) = record.client_message_id.as_ref()
-    {
-        message.client_msg_id = client_id.clone();
-    }
-
-    ProtoHookMessageRecord {
-        message: Some(message),
-        persisted_at: Some(persisted_ts),
-        metadata: record.metadata.clone(),
-        server_seq: 0,
-        extension_bag: None,
-    }
-}
-
-fn build_delivery_event(event: &DeliveryEvent) -> ProtoHookDeliveryEvent {
-    ProtoHookDeliveryEvent {
-        message_id: event.message_id.clone(),
-        user_id: event.user_id.clone(),
-        channel: event.channel.clone(),
-        delivered_at: Some(system_time_to_timestamp(event.delivered_at)),
-        metadata: event.metadata.clone(),
-        device_id: String::new(),
-        extension_bag: None,
-    }
-}
-
-fn build_recall_event(event: &RecallEvent) -> ProtoHookRecallEvent {
-    ProtoHookRecallEvent {
-        message_id: event.message_id.clone(),
-        operator_id: event.operator_id.clone(),
-        recalled_at: Some(system_time_to_timestamp(event.recalled_at)),
-        metadata: event.metadata.clone(),
-        recall_scope: String::new(),
-        extension_bag: None,
-    }
-}
-
-fn system_time_to_timestamp(time: SystemTime) -> Timestamp {
-    let duration = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
-    Timestamp {
-        seconds: duration.as_secs() as i64,
-        nanos: duration.subsec_nanos() as i32,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{conversation_type_label_to_proto, message_type_label_to_proto};
-
     /// `allow=false` 是策略拒绝：带进程内标记，错误码、原因与说明（客户端看到的）同以前；
     /// 调用失败（扩展不可用）不带标记。
     #[test]
@@ -647,45 +372,5 @@ mod tests {
             assert_eq!(detail.reason, "pre-send hook rejected");
             assert_eq!(detail.message, "allow=false");
         }
-    }
-
-    #[test]
-    fn conversation_type_label_to_proto_accepts_only_canonical_names() {
-        assert_eq!(
-            conversation_type_label_to_proto("single"),
-            flare_proto::common::ConversationType::Single as i32
-        );
-        assert_eq!(
-            conversation_type_label_to_proto("broadcast"),
-            flare_proto::common::ConversationType::Broadcast as i32
-        );
-        assert_eq!(
-            conversation_type_label_to_proto("1"),
-            flare_proto::common::ConversationType::Unspecified as i32
-        );
-        assert_eq!(
-            conversation_type_label_to_proto("conversation_type_single"),
-            flare_proto::common::ConversationType::Unspecified as i32
-        );
-    }
-
-    #[test]
-    fn message_type_label_to_proto_accepts_only_canonical_names() {
-        assert_eq!(
-            message_type_label_to_proto("text"),
-            flare_proto::common::MessageType::Text as i32
-        );
-        assert_eq!(
-            message_type_label_to_proto("image_group"),
-            flare_proto::common::MessageType::ImageGroup as i32
-        );
-        assert_eq!(
-            message_type_label_to_proto("message_type_text"),
-            flare_proto::common::MessageType::Unspecified as i32
-        );
-        assert_eq!(
-            message_type_label_to_proto("attachment"),
-            flare_proto::common::MessageType::Unspecified as i32
-        );
     }
 }

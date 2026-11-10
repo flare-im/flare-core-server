@@ -345,7 +345,6 @@ impl MessageIngestHandler {
     /// 8. 写入最终消息 WAL
     /// 9. 推送消息
     /// 10. broker 接受后清理 WAL
-    /// 11. 执行 PostSend Hook
     // The command carries the message body; never let `#[instrument]` record it.
     #[instrument(skip_all, fields(
         request_id = %ctx.request_id(),
@@ -660,26 +659,25 @@ impl MessageIngestHandler {
             .is_some()
             .then(|| message.clone());
         let conversation_id = message.conversation_id.clone();
-        let mut hook_context = self
+        let hook_context = self
             .measure_stage(
                 "pre_send_hook",
                 self.extension_orchestrator
                     .execute_pre_send(ctx, message, execute_user_pre_send),
             )
             .await?;
-        hook_context.message = after_pre_send(hook_context.message, card_post, &conversation_id)?;
+        let message = after_pre_send(hook_context.message, card_post, &conversation_id)?;
 
         // PreSend Hook 可以整体改写 attributes：改出别的租户声明即拒绝。落库租户只认消息头，
         // 但带着别的租户声明的消息不该再往下游走。
-        ensure_tenant_attributes_match(&hook_context.message, &tenant_id)?;
+        ensure_tenant_attributes_match(&message, &tenant_id)?;
 
         // 3. 准备消息提交。此阶段只填充默认值/server_id/timeline，不分配 seq；
         // seq 在 ensure/decorate 成功后再分配，减少失败路径制造会话序列空洞。
         let mut submission = self
             .measure_stage(
                 "prepare",
-                self.message_ingest_service
-                    .prepare_submission(hook_context.message),
+                self.message_ingest_service.prepare_submission(message),
             )
             .await?;
 
@@ -801,26 +799,6 @@ impl MessageIngestHandler {
                 .await;
         } else {
             self.observe_skipped_stage("wal_cleanup");
-        }
-
-        // 11. 执行 PostSend Hook（经统一扩展编排器）
-        if let Err(error) = self
-            .measure_stage(
-                "post_send_hook",
-                self.extension_orchestrator.execute_post_send(
-                    ctx,
-                    &submission,
-                    &hook_context.hook_context,
-                ),
-            )
-            .await
-        {
-            tracing::warn!(
-                message_id = %submission.message_id,
-                conversation_id = %submission.message.conversation_id,
-                error = %error,
-                "Post-send hook failed after message acceptance; preserving send outcome"
-            );
         }
 
         Ok(outcome)

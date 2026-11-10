@@ -113,9 +113,8 @@ flowchart TB
 - **`HttpHookTokenValidator`** —— 把 token POST 到你自己的接口，
   这是接入自有用户体系的入口。
 
-业务规则同理，9 个 Hook 扩展点都在 `crates/flare-im-hooks`：
-PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction /
-ConversationLifecycle / ConversationMember / GetConversationParticipants。
+业务规则同理：`message.pre_send` Hook 在消息落库之前放行、拒绝或改写，运行时在
+`crates/flare-im-hooks`。
 
 这与 Sendbird / Twilio Conversations 的「自带身份」模型一致，区别是
 Flare 可自托管、协议与核心可审计。边界详情见 [GOVERNANCE.md](.github/GOVERNANCE.md)。
@@ -164,7 +163,7 @@ flowchart LR
 | `flare-signaling/gateway` | 客户端长连接接入、上行 frame 转发、下行推送、连接质量。 |
 | `flare-signaling/route` | 上行帧路由：消息转 ingest、事件转 orchestrator，ACK 与数据帧分线转发，含会话流控；下行推送不经过它。 |
 | `flare-signaling/online` | 在线状态、设备连接、presence 查询。 |
-| `flare-message-ingest` | 上行消息发送入口，负责发送校验、Pre/PostSend Hook、seq、WAL、会话确保与写入主消息流。 |
+| `flare-message-ingest` | 上行消息发送入口，负责发送校验、PreSend Hook、seq、WAL、会话确保与写入主消息流。 |
 | `flare-orchestrator` | 主消息流 fanout、消息操作事件执行、RTC/capability 事件 enrich。 |
 | `flare-sync-orchestrator` | 基于 conversation seq/event stream 的同步编排。 |
 | `flare-storage/writer` | 消费存储 topic，完成幂等、归档、事件流、热缓存、ledger、ACK。 |
@@ -173,7 +172,7 @@ flowchart LR
 | `flare-push/server` | 消费推送 topic，区分在线/离线推送任务。 |
 | `flare-push/worker` | 执行离线推送任务和重试。 |
 | `flare-push/proxy` | 推送代理与边界适配。 |
-| `flare-capability` | Hook、能力发现、授权、RTC/SFU 等扩展能力。 |
+| `flare-capability` | Hook 控制面、能力发现、授权、RTC/SFU 等扩展能力。 |
 | `flare-im-capability-core` | 能力/插件共享契约：dispatch DTO、guard/resolver/RTC 端口、extension operation handler；不包含服务运行时。 |
 | `flare-media` | 上传、对象存储、媒体处理、引用计数。 |
 
@@ -306,7 +305,7 @@ make stop   # 停止全部 Core 服务
 |---|---|
 | **五分钟跑起来** | [QUICKSTART](https://github.com/flare-im/flare-core-server/blob/main/docs/QUICKSTART.md) —— 起服务、手签 token、调通接口，**不需要自建用户体系** |
 | 接入自己的用户系统 | 实现 `TokenValidator`（`CoreJwtTokenValidator` 本地验签 / `HttpHookTokenValidator` 调你的接口） |
-| 加自己的业务规则 | `flare-im-hooks` 的 9 个扩展点：PreSend / PostSend / Delivery / Recall / MessageRead / MessageReaction / ConversationLifecycle / ConversationMember / GetConversationParticipants |
+| 加自己的业务规则 | `message.pre_send` Hook，见 [Hook 合同](docs/HOOK-PLUGIN-CONTRACT.md) |
 | 做界面 | [`@flare-im/vue-ui`](https://www.npmjs.com/package/@flare-im/vue-ui) —— 107 个组件，四端一致的契约 |
 | 报安全问题 | [SECURITY.md](.github/SECURITY.md)，**请勿开公开 issue** |
 

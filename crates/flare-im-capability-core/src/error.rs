@@ -1,45 +1,12 @@
-//! Capability contract errors and guard decisions.
+//! Capability contract errors.
 
 use flare_core_base::error::{ErrorBuilder, ErrorCode, FlareError};
-use serde_json::Value;
 use std::fmt;
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GuardRejection {
-    pub guard_id: String,
-    pub code: String,
-    pub message: String,
-    pub tenant_id: Option<String>,
-    pub ext: Value,
-}
-
-impl GuardRejection {
-    pub fn new(
-        guard_id: impl Into<String>,
-        code: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            guard_id: guard_id.into(),
-            code: code.into(),
-            message: message.into(),
-            tenant_id: None,
-            ext: Value::Null,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum GuardDecision {
-    Allow,
-    Reject(GuardRejection),
-}
 
 #[derive(Debug)]
 pub enum CapabilityError {
     NotRegistered(String),
     Timeout(String),
-    Rejected(Box<GuardRejection>),
     NotSupported(String),
     PolicyDenied(String),
     /// A plugin platform refusal (plugin platform v2 §4): `code` is a platform code such as
@@ -77,12 +44,6 @@ impl CapabilityError {
                 FlareError::localized(ErrorCode::HttpNotFound, msg)
             }
             CapabilityError::Timeout(msg) => FlareError::timeout(msg),
-            CapabilityError::Rejected(rejection) => {
-                let rejection = *rejection;
-                ErrorBuilder::new(ErrorCode::PermissionDenied, rejection.code)
-                    .details(rejection.message)
-                    .build_error()
-            }
             CapabilityError::NotSupported(msg) => {
                 FlareError::localized(ErrorCode::OperationNotSupported, msg)
             }
@@ -111,7 +72,6 @@ impl fmt::Display for CapabilityError {
         match self {
             CapabilityError::NotRegistered(msg) => write!(f, "capability not registered: {msg}"),
             CapabilityError::Timeout(msg) => write!(f, "capability timeout: {msg}"),
-            CapabilityError::Rejected(rejection) => write!(f, "guard rejected: {rejection:?}"),
             CapabilityError::NotSupported(msg) => write!(f, "operation not supported: {msg}"),
             CapabilityError::PolicyDenied(msg) => write!(f, "policy denied: {msg}"),
             CapabilityError::Plugin { code, message } => write!(f, "{code}: {message}"),

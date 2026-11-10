@@ -275,6 +275,25 @@ impl Authenticator for AuthHandler {
                     user_metadata.insert(METADATA_KEY_DEVICE_ID.to_string(), device_id);
                 }
 
+                // Only the authenticated provider response may establish a Social sid.
+                // CONNECT/device metadata is never consulted for this binding.
+                if principal
+                    .metadata
+                    .get("identity_issuer")
+                    .map(String::as_str)
+                    == Some("flare-social-identity")
+                {
+                    let sid = principal
+                        .metadata
+                        .get("identity_session_id")
+                        .filter(|sid| uuid::Uuid::parse_str(sid).is_ok());
+                    let Some(sid) = sid else {
+                        return Ok(AuthResult::failure(
+                            AUTH_FAILURE_MSG_TOKEN_INVALID.to_string(),
+                        ));
+                    };
+                    user_metadata.insert("identity_session_id".into(), sid.clone());
+                }
                 let access_serial = self.latest_access_serial(&tenant_id, device_info).await;
                 debug!( connection_id = %connection_id,user_id = %user_id,tenant_id = %tenant_id,"Token 验证成功，租户ID已设置");
                 // 关键：已验证的租户总是存在（令牌没带就用默认租户）。flare-core 用它给设备冲突
@@ -863,5 +882,63 @@ mod tests {
                 error()
             );
         }
+    }
+    #[tokio::test]
+    async fn social_session_binding_comes_only_from_the_verified_provider() {
+        let sid = uuid::Uuid::new_v4().to_string();
+        let mut authenticated = principal(Some("device-a"));
+        authenticated
+            .metadata
+            .insert("identity_issuer".into(), "flare-social-identity".into());
+        authenticated
+            .metadata
+            .insert("identity_session_id".into(), sid.clone());
+        let mut device = DeviceInfo::new("device-a".into(), DevicePlatform::Web);
+        device.metadata.insert(
+            "identity_session_id".into(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let result = handler(
+            Some(authenticated),
+            TenantRuntimeCache::disabled(),
+            TenantAccessPolicy::Lenient,
+        )
+        .authenticate("token", "connection", Some(&device), None)
+        .await
+        .unwrap();
+        assert!(result.authenticated);
+        assert_eq!(
+            result.user_metadata.unwrap().get("identity_session_id"),
+            Some(&sid)
+        );
+        let result = handler(
+            Some(principal(Some("device-a"))),
+            TenantRuntimeCache::disabled(),
+            TenantAccessPolicy::Lenient,
+        )
+        .authenticate("token", "connection", Some(&device), None)
+        .await
+        .unwrap();
+        assert!(
+            !result
+                .user_metadata
+                .unwrap()
+                .contains_key("identity_session_id")
+        );
+        let mut malformed = principal(Some("device-a"));
+        malformed
+            .metadata
+            .insert("identity_issuer".into(), "flare-social-identity".into());
+        assert!(
+            !handler(
+                Some(malformed),
+                TenantRuntimeCache::disabled(),
+                TenantAccessPolicy::Lenient
+            )
+            .authenticate("token", "connection", Some(&device), None)
+            .await
+            .unwrap()
+            .authenticated
+        );
     }
 }

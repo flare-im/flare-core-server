@@ -2,14 +2,10 @@
 //! running services, broker, HTTP/gRPC transport or full-stack acceptance is implied.
 use super::{CapabilityGrpcServer, CapabilityInvocationMetrics};
 use crate::{
-    composition::hook_registry::CoreHookRegistry,
     infrastructure::{
         capability::{CapabilityExtensionRegistry, PluginRouteBook},
-        config::{CapabilityRuntimeConfig, ConfigLoaderItem, ConfigWatcher, DatabaseConfigLoader},
-        persistence::{
-            PostgresCapabilityPolicy, PostgresHookConfigRepository,
-            PostgresPluginEndpointRepository,
-        },
+        config::CapabilityRuntimeConfig,
+        persistence::{PostgresCapabilityPolicy, PostgresHookConfigRepository},
     },
     interface::grpc::HookServiceServer,
 };
@@ -21,6 +17,7 @@ use flare_grpc_proto::capability::{capability_service_server::CapabilityService,
 use flare_im_service_kit::audit_effects::durable::{EvidencePublisher, StaffAudit, drain_one};
 use flare_server_core::{
     SignedActorType, SignedContextIdentity, SignedContextSigner, SignedContextVerifier,
+    auth::core_admin::{PLATFORM_SCOPE_TENANT, permission::HOOKS_PLATFORM_WRITE},
     context::{Context, Ctx},
 };
 use prost::Message;
@@ -88,8 +85,8 @@ fn hook(operation: &str, body: impl Message) -> GenericRequest {
 fn create(name: &str) -> GenericRequest {
     hook(
         "create",
+        // Application hooks cannot be created yet; the owner path is exercised on platform hooks.
         CreateHookConfigRequest {
-            tenant_id: "app-a".into(),
             name: name.into(),
             hook_type: "pre_send".into(),
             transport: Some(HookTransport {
@@ -101,24 +98,6 @@ fn create(name: &str) -> GenericRequest {
             ..Default::default()
         },
     )
-}
-fn grant(user: &str) -> GrantUserCapabilityRequest {
-    GrantUserCapabilityRequest {
-        tenant_id: "app-a".into(),
-        user_id: user.into(),
-        capability_id: "example.poll".into(),
-        ..Default::default()
-    }
-}
-fn plugin(name: &str) -> RegisterPluginEndpointRequest {
-    RegisterPluginEndpointRequest {
-        tenant_id: "app-a".into(),
-        plugin_id: name.into(),
-        capability_id: "example.poll".into(),
-        grpc_authority: "http://127.0.0.1:9".into(),
-        declared_operations: vec!["example.poll".into()],
-        ..Default::default()
-    }
 }
 async fn database<F, Fut>(work: F)
 where
@@ -155,12 +134,19 @@ where
             .execute(&*run)
             .await
             .unwrap();
-        for ddl in [
-            include_str!("../../../../../migrations/0011_20261009_plugin_endpoints.sql"),
-            include_str!("../../../../../migrations/0012_20261015_core_audit_outbox.sql"),
-        ] {
-            sqlx::raw_sql(ddl).execute(&*run).await.unwrap();
-        }
+        sqlx::raw_sql(include_str!(
+            "../../../../../migrations/0012_20261015_core_audit_outbox.sql"
+        ))
+        .execute(&*run)
+        .await
+        .unwrap();
+        // 0024 gives hook_configs its current shape and the scope versions the repository bumps.
+        sqlx::raw_sql(include_str!(
+            "../../../../../migrations/0024_20261107_hook_runtime_unification.sql"
+        ))
+        .execute(&*run)
+        .await
+        .unwrap();
         work(run, url).await;
     })
     .await;
@@ -176,25 +162,12 @@ where
 }
 async fn server(pool: Arc<PgPool>, url: &str) -> CapabilityGrpcServer {
     let repository = Arc::new(PostgresHookConfigRepository::new(url).await.unwrap());
-    let watcher = Arc::new(ConfigWatcher::new(
-        vec![Arc::new(ConfigLoaderItem::Database(
-            DatabaseConfigLoader::new(repository.clone(), None),
-        ))],
-        Duration::from_secs(3600),
-    ));
-    watcher.reload().await.unwrap();
-    let governance = Arc::new(HookServiceServer::new(
-        repository,
-        Arc::new(CoreHookRegistry::new(watcher)),
-    ));
+    let governance = Arc::new(HookServiceServer::new(repository));
     let runtime = CapabilityRuntimeConfig {
         max_payload_json_bytes: 1024,
         dispatch_timeout: Duration::from_secs(1),
         dispatch_max_per_minute: None,
-        plugin_health_check_interval: Duration::from_secs(3600),
         plugin_call_timeout: Duration::from_millis(10),
-        plugin_route_refresh_interval: Duration::from_secs(3600),
-        plugin_route_ttl: Duration::from_secs(86400),
     };
     let (_, verifier) = keys();
     CapabilityGrpcServer::new(
@@ -205,9 +178,7 @@ async fn server(pool: Arc<PgPool>, url: &str) -> CapabilityGrpcServer {
         None,
         Arc::new(CapabilityInvocationMetrics::default()),
         Some(governance),
-        Arc::new(PluginRouteBook::with_store(Arc::new(
-            PostgresPluginEndpointRepository::new(pool),
-        ))),
+        Arc::new(PluginRouteBook::new()),
         Some(verifier.clone()),
         Some(verifier),
     )
@@ -225,9 +196,7 @@ async fn facts(pool: &PgPool) -> Vec<String> {
     let mut rows = vec![];
     for table in [
         "hook_configs",
-        "capability_user_grants",
         "capability_tenant_switches",
-        "capability_plugin_endpoints",
         "core_audit_outbox",
     ] {
         rows.push(sqlx::query_scalar(&format!("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb)::text FROM {table} t")).fetch_one(pool).await.unwrap());
@@ -261,10 +230,8 @@ async fn atomic_failure<T, E>(pool: &PgPool, work: impl Future<Output = Result<T
 async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_back() {
     database(|pool, url| async move {
         let server = server(pool.clone(), &url).await;
-        // Let the empty route-book health pass finish; no real plugin server is contacted.
-        tokio::task::yield_now().await;
         let created = server
-            .administer(request(create("first"), "app-a", "core:hooks:write"))
+            .administer(request(create("first"), PLATFORM_SCOPE_TENANT, HOOKS_PLATFORM_WRITE))
             .await
             .unwrap()
             .into_inner();
@@ -276,7 +243,7 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
             .hook_id;
         atomic_failure(
             &pool,
-            server.administer(request(create("rejected"), "app-a", "core:hooks:write")),
+            server.administer(request(create("rejected"), PLATFORM_SCOPE_TENANT, HOOKS_PLATFORM_WRITE)),
         )
         .await;
         let update = || {
@@ -289,8 +256,8 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
                         ..Default::default()
                     },
                 ),
-                "app-a",
-                "core:hooks:write",
+                PLATFORM_SCOPE_TENANT,
+                HOOKS_PLATFORM_WRITE,
             )
         };
         atomic_failure(&pool, server.administer(update())).await;
@@ -310,8 +277,8 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
                         enabled: false,
                     },
                 ),
-                "app-a",
-                "core:hooks:write",
+                PLATFORM_SCOPE_TENANT,
+                HOOKS_PLATFORM_WRITE,
             )
         };
         atomic_failure(&pool, server.administer(status())).await;
@@ -347,38 +314,13 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
                         hook_id: id.clone(),
                     },
                 ),
-                "app-a",
-                "core:hooks:write",
+                PLATFORM_SCOPE_TENANT,
+                HOOKS_PLATFORM_WRITE,
             )
         };
         atomic_failure(&pool, server.administer(remove())).await;
         server.administer(remove()).await.unwrap();
 
-        atomic_failure(
-            &pool,
-            server.grant_user_capability(request(grant("u1"), "app-a", "core:capabilities:write")),
-        )
-        .await;
-        server
-            .grant_user_capability(request(grant("u1"), "app-a", "core:capabilities:write"))
-            .await
-            .unwrap();
-        let revoke = || {
-            request(
-                RevokeUserCapabilityRequest {
-                    tenant_id: "app-a".into(),
-                    user_id: "u1".into(),
-                    capability_id: "example.poll".into(),
-                },
-                "app-a",
-                "core:capabilities:write",
-            )
-        };
-        atomic_failure(&pool, server.revoke_user_capability(revoke())).await;
-        server.revoke_user_capability(revoke()).await.unwrap();
-        let count = effects(&pool).await.len();
-        server.revoke_user_capability(revoke()).await.unwrap();
-        assert_eq!(effects(&pool).await.len(), count);
         let switch = || {
             request(
                 SetTenantCapabilitySwitchRequest {
@@ -392,85 +334,22 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
         };
         atomic_failure(&pool, server.set_tenant_capability_switch(switch())).await;
         server.set_tenant_capability_switch(switch()).await.unwrap();
-        atomic_failure(
-            &pool,
-            server.register_plugin_endpoint(request(plugin("p1"), "app-a", "core:plugins:write")),
-        )
-        .await;
-        let list = || {
-            request(
-                ListRegisteredPluginsRequest {
-                    tenant_id: "app-a".into(),
-                    ..Default::default()
-                },
-                "app-a",
-                "core:plugins:read",
-            )
-        };
-        assert!(
-            server
-                .list_registered_plugins(list())
-                .await
-                .unwrap()
-                .into_inner()
-                .instances
-                .is_empty(),
-            "failed source transaction cannot enter the route book"
-        );
-        server
-            .register_plugin_endpoint(request(plugin("p1"), "app-a", "core:plugins:write"))
-            .await
-            .unwrap();
-        let deregister = || {
-            request(
-                DeregisterPluginEndpointRequest {
-                    tenant_id: "app-a".into(),
-                    plugin_id: "p1".into(),
-                    ..Default::default()
-                },
-                "app-a",
-                "core:plugins:write",
-            )
-        };
-        atomic_failure(&pool, server.deregister_plugin_endpoint(deregister())).await;
-        assert_eq!(
-            server
-                .list_registered_plugins(list())
-                .await
-                .unwrap()
-                .into_inner()
-                .instances
-                .len(),
-            1,
-            "failed delete cannot remove the in-memory route"
-        );
-        server
-            .deregister_plugin_endpoint(deregister())
-            .await
-            .unwrap();
-        let count = effects(&pool).await.len();
-        server
-            .deregister_plugin_endpoint(deregister())
-            .await
-            .unwrap();
-        assert_eq!(effects(&pool).await.len(), count);
 
         let rows = effects(&pool).await;
-        assert_eq!(rows.len(), 9);
+        assert_eq!(rows.len(), 5);
         for row in rows {
             assert_eq!(row["request_id"], "signed-owner-request");
             assert_eq!(row["actor_id"], "employee");
             assert_eq!(row["actor_type"], "staff");
-            assert_eq!(row["scope"], "app-a");
             assert_eq!(row["source"], "flare-capability");
             assert_eq!(row["outcome"], "committed");
-            let expected = match row["aggregate"].as_str().unwrap() {
-                "hook_config" => "core:hooks:write",
-                "plugin_endpoint" => "core:plugins:write",
-                "capability_grant" | "capability_switch" => "core:capabilities:write",
+            let (scope, permission) = match row["aggregate"].as_str().unwrap() {
+                "hook_config" => (PLATFORM_SCOPE_TENANT, HOOKS_PLATFORM_WRITE),
+                "capability_switch" => ("app-a", "core:capabilities:write"),
                 _ => panic!("unexpected owner aggregate"),
             };
-            assert_eq!(row["permission"], expected);
+            assert_eq!(row["scope"], scope);
+            assert_eq!(row["permission"], permission);
             for field in [
                 "body",
                 "headers",
@@ -483,15 +362,15 @@ async fn normal_staff_rpc_writes_commit_source_evidence_and_tail_failures_roll_b
                 assert!(row.get(field).is_none());
             }
         }
-        // A post-commit runtime reload failure must not erase evidence of the committed fact.
+        // Capability only writes configuration; Message Ingest loads it (and rejects a bad row
+        // there). A row the runtime cannot read is still a committed fact with its evidence.
         // Deliberately corrupt this private fixture's selector inside the source insert.
         sqlx::raw_sql("CREATE FUNCTION broken_selector() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.selector_config = '{\"tenants\":5}'::jsonb; RETURN NEW; END $$; CREATE TRIGGER broken_selector BEFORE INSERT ON hook_configs FOR EACH ROW EXECUTE FUNCTION broken_selector()")
             .execute(&*pool).await.unwrap();
-        let reload = server.administer(request(create("reload-error"), "app-a", "core:hooks:write")).await.unwrap_err();
-        assert_eq!(reload.code(), Code::Internal);
-        let committed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM hook_configs WHERE tenant_id='app-a' AND name='reload-error')").fetch_one(&*pool).await.unwrap();
+        server.administer(request(create("reload-error"), PLATFORM_SCOPE_TENANT, HOOKS_PLATFORM_WRITE)).await.unwrap();
+        let committed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM hook_configs WHERE tenant_id IS NULL AND name='reload-error')").fetch_one(&*pool).await.unwrap();
         assert!(committed);
-        assert_eq!(effects(&pool).await.len(), 10);
+        assert_eq!(effects(&pool).await.len(), 6, "the five writes above and this one");
     })
     .await;
 }

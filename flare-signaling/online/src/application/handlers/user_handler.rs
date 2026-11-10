@@ -48,6 +48,20 @@ impl<R: ConversationRepository + Send + Sync> OnlineUserHandler<R> {
         self.inner.list_user_devices(tenant_id, request).await
     }
 
+    pub async fn revoke_identity_sessions(
+        &self,
+        tenant: &str,
+        user: &str,
+        sessions: &[String],
+        cutoff_ms: i64,
+        request_id: &str,
+        signing_key_id: &str,
+    ) -> Result<u32> {
+        self.inner
+            .revoke_identity_sessions(tenant, user, sessions, cutoff_ms, request_id, signing_key_id)
+            .await
+    }
+
     pub async fn kick_device(
         &self,
         request: KickDeviceRequest,

@@ -7,25 +7,29 @@ apart (each described only its own side of the boundary).
 
 ## Send-time hooks live in `flare-message-ingest`
 
-`flare-message-ingest` owns message send-time hooks.
+`flare-message-ingest` owns message send-time hooks. There is one runtime, `flare-im-hooks`,
+embedded in Ingest: the call chain, adapters, circuit breakers, time limits and execution evidence.
 
-Extension phases:
+The one hook point is `message.pre_send`: it validates or rewrites the message draft before the
+command enters the durable pipeline. Hooks are synchronous interception only; observing what
+happened belongs to events.
 
-- `pre_send`: validates or mutates the message draft before the command enters
-  the durable pipeline.
-- `post_send`: observes the accepted message after it is published to the main
-  queue.
+Two configuration sources feed the chain, which runs application, platform, then deployment hooks:
+
+- the deployment file, required policy, loaded at startup and fatal when broken;
+- `hook_configs`, platform and application hooks, hot-loaded from PostgreSQL about once a second.
 
 Runtime controls:
 
 - tenant allowlist
 - message type allowlist
-- pre-send timeout and retry
-- post-send timeout, retry, and fail-open / fail-closed mode
+- total pre-send budget, shared by the steps of the chain
+- per-hook timeout, required flag and selector
 
-`flare-capability` may be injected as a HookPlugin target for send-time policy
-work. RTC / media signaling must use realtime / capability packet routing and
-plugin services instead of durable `Event` enrichment.
+`flare-capability` is the control plane only: configuration, validation, statistics, queries and
+retention. It does not run hooks, so a Capability outage does not affect sending. RTC / media
+signaling must use realtime / capability packet routing and plugin services instead of durable
+`Event` enrichment.
 
 ## `flare-orchestrator` is deterministic and does not run hooks
 

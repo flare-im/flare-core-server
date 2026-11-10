@@ -10,7 +10,7 @@ pub struct HookIntegrationChannelDoc {
     pub summary: &'static str,
 }
 
-/// 返回当前版本支持的三种出站集成通道说明。
+/// 返回当前版本支持的两种出站目标说明。
 #[must_use]
 pub fn list_hook_integration_channels() -> Vec<HookIntegrationChannelDoc> {
     vec![
@@ -22,12 +22,7 @@ pub fn list_hook_integration_channels() -> Vec<HookIntegrationChannelDoc> {
         HookIntegrationChannelDoc {
             surface: HookTransportSurface::WebhookHook,
             slug: "webhook",
-            summary: "HTTP Webhook；JSON 载荷与签名头由 WebhookHookAdapter 约定。",
-        },
-        HookIntegrationChannelDoc {
-            surface: HookTransportSurface::LocalExtension,
-            slug: "local",
-            summary: "进程内扩展插件（Local target），不经网络，适合同进程宿主注册。",
+            summary: "HTTP Webhook；JSON 载荷与签名头见 Hook 合同。",
         },
     ]
 }

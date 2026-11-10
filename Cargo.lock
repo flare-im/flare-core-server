@@ -1642,13 +1642,13 @@ dependencies = [
 name = "flare-capability"
 version = "1.0.3"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "async-trait",
  "base64",
  "chrono",
  "dashmap",
  "ed25519-dalek",
- "etcd-client",
  "flare-core-base",
  "flare-core-runtime",
  "flare-grpc-proto",
@@ -1664,23 +1664,19 @@ dependencies = [
  "flare-storage-writer",
  "futures-util",
  "hex",
- "hmac 0.12.1",
  "once_cell",
  "prometheus",
  "prost",
  "prost-types",
- "rand 0.8.7",
  "redis 0.32.7",
- "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-test",
- "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -1824,7 +1820,7 @@ dependencies = [
 name = "flare-core-initialize"
 version = "1.0.3"
 dependencies = [
- "anyhow",
+ "flare-server-core",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -2022,6 +2018,7 @@ dependencies = [
 name = "flare-im-hooks"
 version = "1.0.3"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "flare-core-base",
@@ -2033,8 +2030,10 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "once_cell",
+ "prometheus",
  "prost",
  "prost-types",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",
@@ -2043,6 +2042,7 @@ dependencies = [
  "toml",
  "tonic",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2239,7 +2239,6 @@ dependencies = [
  "flare-core-runtime",
  "flare-grpc-proto",
  "flare-im-contracts",
- "flare-im-hooks",
  "flare-im-message-pipeline",
  "flare-im-seq",
  "flare-im-service-kit",
@@ -2274,6 +2273,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "zip",
 ]
 
 [[package]]
@@ -3664,6 +3664,18 @@ dependencies = [
  "security-framework 2.11.1",
  "security-framework-sys",
  "tempfile",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.10.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -6323,6 +6335,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6664,7 +6682,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7107,6 +7125,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zip"
+version = "9.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f17fbc870bfac28c6228aed7d6e6df352e26bf7015c4313727e16a7a01ce5e"
+dependencies = [
+ "crc32fast",
+ "getrandom 0.4.3",
+ "indexmap",
+ "libc",
+ "memchr",
+ "nix",
+ "typed-path",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

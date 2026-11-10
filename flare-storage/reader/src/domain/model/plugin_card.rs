@@ -16,13 +16,14 @@
 //!
 //! The key is server-owned: any stored value (a sender could have preset it before Ingest stripped
 //! it) is removed first. Cost per page: nothing for a page without APP_CARD plugin cards; otherwise
-//! one indexed lookup of the bindings naming those messages, and the tenant's parsed projection
+//! one indexed lookup of the bindings naming those messages, and the tenant's projection rules
 //! (cached per version) only when one of them has no binding.
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use flare_im_capability_core::plugin::PluginManifest;
 use flare_im_capability_core::plugin::manifest::{UiContribution, UiContributionKind};
-use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
+use flare_im_capability_core::plugin::runtime::PluginProjection;
 use flare_im_capability_core::plugin::ui::PluginMessage;
 use flare_proto::common::MessageContent;
 use flare_proto::common::message_content::Content;
@@ -105,34 +106,38 @@ pub struct EntityRules {
 }
 
 impl EntityRules {
-    pub fn from_snapshot(snapshot: &PluginRuntimeSnapshot, now_ms: i64) -> Self {
+    /// `manifests` holds the projection's manifests by digest; a plugin without one is skipped.
+    pub fn from_projection(
+        projection: &PluginProjection,
+        manifests: &HashMap<String, Arc<PluginManifest>>,
+        now_ms: i64,
+    ) -> Self {
         let mut contributions = HashMap::new();
-        for projected in &snapshot.plugins {
+        for projected in &projection.plugins {
             let grant = &projected.grant;
             if !grant.enabled
                 || grant.revoked
-                || now_ms < grant.valid_from_ms
-                || now_ms >= grant.valid_until_ms
+                || !grant.in_effect(now_ms)
             {
                 continue;
             }
-            let Ok(manifest) = projected.manifest() else {
+            let Some(manifest) = manifests.get(projected.manifest_digest()) else {
                 continue;
             };
-            for contribution in manifest.client_extensions.contributions {
+            for contribution in &manifest.client_extensions.contributions {
                 if contribution.kind == UiContributionKind::MessageContent
                     && contribution.entity_path.is_some()
                 {
                     contributions.insert(
                         (manifest.plugin_id.clone(), contribution.id.clone()),
-                        contribution,
+                        contribution.clone(),
                     );
                 }
             }
         }
         Self {
-            version: snapshot.version,
-            valid_until_ms: snapshot.valid_until_ms,
+            version: projection.version,
+            valid_until_ms: projection.valid_until_ms,
             contributions,
         }
     }

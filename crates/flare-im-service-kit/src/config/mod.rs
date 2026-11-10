@@ -541,6 +541,16 @@ pub struct MediaServiceConfig {
     /// 最大分块大小（字节）
     #[serde(default)]
     pub max_chunk_size_bytes: Option<i64>,
+    #[serde(default)]
+    pub admin_image_upload_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub admin_image_upload_max_pixels: Option<u64>,
+    #[serde(default)]
+    pub admin_image_upload_max_dimension: Option<u32>,
+    #[serde(default)]
+    pub admin_image_upload_allowed_mime_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub application_media_validators: Vec<String>,
 }
 
 /// 推送服务器服务配置

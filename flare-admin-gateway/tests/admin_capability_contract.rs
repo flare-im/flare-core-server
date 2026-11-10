@@ -70,43 +70,6 @@ async fn every_capability_route_requires_the_signed_route_permission() {
 }
 
 #[tokio::test]
-async fn plugin_registration_is_platform_staff_only() {
-    let h = harness(true).await;
-    for (path, body) in [
-        (
-            "/api/v1/admin/plugins/register",
-            r#"{"plugin_id":"plugin-c","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#,
-        ),
-        (
-            "/api/v1/admin/plugins/deregister",
-            r#"{"plugin_id":"plugin-c"}"#,
-        ),
-    ] {
-        // Organization staff with the right code: refused by scope.
-        let org = h
-            .gateway
-            .staff_token(EMPLOYEE, TENANT, "core:plugins:write");
-        let (status, answer) = send(
-            &h.router,
-            request_with_body("POST", path, Some(&org), WRITE_HEADERS, Some(body)),
-        )
-        .await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {answer}");
-        assert_eq!(reason(&answer), "ADMIN_SCOPE_DENIED", "{path}");
-        // Platform staff pass.
-        let platform = h
-            .gateway
-            .platform_staff_token(EMPLOYEE, TENANT, "core:plugins:write");
-        let (status, answer) = send(
-            &h.router,
-            request_with_body("POST", path, Some(&platform), WRITE_HEADERS, Some(body)),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{path}: {answer}");
-    }
-}
-
-#[tokio::test]
 async fn capability_catalog_shape() {
     let h = harness(true).await;
     let (status, body) = send(
@@ -223,141 +186,18 @@ async fn tenant_capability_switch_targets_the_signed_application() {
     assert!(!body.to_string().contains("leak-marker-77"));
 }
 
-#[tokio::test]
-async fn plugin_register_and_deregister_shapes_and_requests() {
-    let h = harness(true).await;
-    let (status, body) = send(
-        &h.router,
-        admin_request_with_body(
-            "POST",
-            "/api/v1/admin/plugins/register",
-            &h.gateway,
-            Some(
-                r#"{"plugin_id":"plugin-c","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#,
-            ),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let data = &body["data"];
-    assert_eq!(
-        keys(data),
-        sorted(&["tenant_id", "plugin_id", "accepted", "message"])
-    );
-    assert_eq!(data["accepted"], true);
-    assert_eq!(data["tenant_id"], TENANT);
-    let call = &h.recorder.calls()[0];
-    assert_eq!(call.method, "RegisterPluginEndpoint");
-    // 租户与请求号来自签名，不来自请求体。
-    assert_eq!(
-        call.request,
-        format!(
-            "tenant_id={TENANT} plugin_id=plugin-c capability_id=example.poll grpc_authority=http://plugin:9 request_id=req-staff-1 declared=example.poll"
-        )
-    );
-
-    // 必填字段缺失：400，不调用下游。
-    h.recorder.clear();
-    let (status, body) = send(
-        &h.router,
-        admin_request_with_body(
-            "POST",
-            "/api/v1/admin/plugins/register",
-            &h.gateway,
-            Some(r#"{"plugin_id":"plugin-c","capability_id":"","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":[""]}"#),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(reason(&body), "ADMIN_PLUGIN_FIELD_REQUIRED");
-    assert!(h.recorder.calls().is_empty());
-
-    // 标识不合规（换行、空白、斜杠、声明里的非标识）：400，不调用下游，也不回显取值。
-    for request in [
-        r#"{"plugin_id":"plugin-c\nWARN forged","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#,
-        r#"{"plugin_id":"plugin c","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#,
-        r#"{"plugin_id":"plugin-c","capability_id":"example/poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example/poll"]}"#,
-        r#"{"plugin_id":"plugin-c","capability_id":"example.poll","grpc_authority":"http://plugin:9","declared_operations":["example.poll","example.poll\r\nWARN forged"],"plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
-    ] {
-        let (status, body) = send(
-            &h.router,
-            admin_request_with_body(
-                "POST",
-                "/api/v1/admin/plugins/register",
-                &h.gateway,
-                Some(request),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(reason(&body), "ADMIN_PLUGIN_FIELD_INVALID");
-        assert!(!body.to_string().contains("forged"), "{body}");
-        assert!(h.recorder.calls().is_empty());
-    }
-
-    // 下游拒绝（替身对 `denied` 回 PERMISSION_DENIED）：403，不回显文案。
-    let (status, body) = send(
-        &h.router,
-        admin_request_with_body(
-            "POST",
-            "/api/v1/admin/plugins/register",
-            &h.gateway,
-            Some(r#"{"plugin_id":"denied","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    assert!(!body.to_string().contains("id-secret-1"), "{body}");
-
-    h.recorder.clear();
-    let (status, body) = send(
-        &h.router,
-        admin_request_with_body(
-            "POST",
-            "/api/v1/admin/plugins/deregister",
-            &h.gateway,
-            Some(r#"{"plugin_id":"plugin-unknown"}"#),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        keys(&body["data"]),
-        sorted(&["tenant_id", "plugin_id", "accepted"])
-    );
-    assert_eq!(body["data"]["accepted"], false);
-    assert_eq!(
-        h.recorder.calls()[0].request,
-        format!("tenant_id={TENANT} plugin_id=plugin-unknown request_id=req-staff-1")
-    );
-    let (status, body) = send(
-        &h.router,
-        admin_request_with_body(
-            "POST",
-            "/api/v1/admin/plugins/deregister",
-            &h.gateway,
-            Some(r#"{"plugin_id":" "}"#),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(reason(&body), "ADMIN_PLUGIN_FIELD_REQUIRED");
-}
-
 const HOOK_FIELDS: &[&str] = &[
     "hook_id",
     "name",
     "hook_type",
     "tenant_id",
-    "priority",
+    "order",
+    "required",
     "enabled",
     "transport",
     "selector",
-    "retry_policy",
     "created_at",
     "updated_at",
-    "hook_points",
-    "config_extensions",
 ];
 
 #[tokio::test]
@@ -379,10 +219,8 @@ async fn hook_list_create_get_update_shapes_and_requests() {
     assert_eq!(data["total"], 2);
     let hook = &data["hooks"][0];
     assert_eq!(keys(hook), sorted(HOOK_FIELDS));
-    assert_eq!(
-        hook["hook_points"],
-        serde_json::json!(["HOOK_POINT_MESSAGE_PRE_SEND"])
-    );
+    assert_eq!(hook["order"], 10);
+    assert_eq!(hook["required"], true);
     assert_eq!(hook["created_at"], 1_700_000_000_000_i64);
     // webhook 密钥不出网关。
     assert_eq!(hook["transport"]["secret_configured"], true);
@@ -395,7 +233,7 @@ async fn hook_list_create_get_update_shapes_and_requests() {
         format!("list tenant_id={TENANT} hook_type=message_pre_send enabled_only=true limit=20")
     );
 
-    // 创建：租户来自签名，请求体里的 tenant_id 忽略；密钥只进不出。
+    // 应用 Hook 建不出来：给明确的错误，不到 Capability。
     h.recorder.clear();
     let (status, body) = send(
         &h.router,
@@ -403,8 +241,24 @@ async fn hook_list_create_get_update_shapes_and_requests() {
             "POST",
             "/api/v1/admin/hooks",
             &h.gateway,
+            Some(r#"{"name":"dlp","hook_type":"pre_send"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(reason(&body), "ADMIN_HOOK_APPLICATION_UNAVAILABLE");
+    assert!(h.recorder.calls().is_empty());
+
+    // 创建平台 Hook：范围来自路由，请求体里的 tenant_id 忽略；密钥只进不出。
+    h.recorder.clear();
+    let (status, body) = send(
+        &h.router,
+        admin_request_with_body(
+            "POST",
+            "/api/v1/admin/platform/hooks",
+            &h.gateway,
             Some(
-                r#"{"name":"dlp","hook_type":"message_pre_send","tenant_id":"tenant-z","priority":10,"transport":{"type":"webhook","endpoint":"https://hooks.example/dlp","secret":"s3cret"},"hook_points":["HOOK_POINT_MESSAGE_PRE_SEND"]}"#,
+                r#"{"name":"dlp","hook_type":"pre_send","tenant_id":"tenant-z","order":10,"required":false,"transport":{"type":"webhook","endpoint":"https://hooks.example/dlp","secret":"s3cret"}}"#,
             ),
         ),
     )
@@ -416,24 +270,23 @@ async fn hook_list_create_get_update_shapes_and_requests() {
     assert!(!body.to_string().contains("s3cret"), "{body}");
     assert_eq!(
         h.recorder.calls()[0].request,
-        format!(
-            "create tenant_id={TENANT} name=dlp hook_type=message_pre_send priority=10 secret_set=true"
-        )
+        "create tenant_id= name=dlp hook_type=pre_send order=10 required=false secret_set=true"
     );
     for (invalid, expected_reason) in [
         (
-            r#"{"name":"","hook_type":"message_pre_send"}"#,
+            r#"{"name":"","hook_type":"pre_send"}"#,
             "ADMIN_HOOK_NAME_REQUIRED",
-        ),
-        (
-            r#"{"name":"dlp","hook_type":"message_pre_send","hook_points":["pre_send"]}"#,
-            "ADMIN_HOOK_POINT_INVALID",
         ),
         (r#"{"name":"dlp"}"#, "ADMIN_INVALID_JSON_BODY"),
     ] {
         let (status, body) = send(
             &h.router,
-            admin_request_with_body("POST", "/api/v1/admin/hooks", &h.gateway, Some(invalid)),
+            admin_request_with_body(
+                "POST",
+                "/api/v1/admin/platform/hooks",
+                &h.gateway,
+                Some(invalid),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}: {body}");
@@ -468,7 +321,7 @@ async fn hook_list_create_get_update_shapes_and_requests() {
             "PUT",
             "/api/v1/admin/hooks/7",
             &h.gateway,
-            Some(r#"{"name":"dlp-2","priority":20}"#),
+            Some(r#"{"name":"dlp-2","order":20,"required":false}"#),
         ),
     )
     .await;
@@ -476,8 +329,77 @@ async fn hook_list_create_get_update_shapes_and_requests() {
     assert_eq!(body["data"]["hook"]["name"], "dlp-2");
     assert_eq!(
         h.recorder.calls()[0].request,
-        "update hook_id=7 name=dlp-2 priority=20"
+        "update hook_id=7 name=dlp-2 order=Some(20) required=Some(false)"
     );
+}
+
+#[tokio::test]
+async fn platform_hook_catalog_profiles_and_test_call() {
+    let h = harness(true).await;
+    let (status, body) = send(
+        &h.router,
+        admin_request("GET", "/api/v1/admin/platform/hooks?limit=20", &h.gateway),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        h.recorder.calls()[0].request,
+        "list tenant_id= hook_type= enabled_only=false limit=20"
+    );
+
+    let (status, body) = send(
+        &h.router,
+        admin_request("GET", "/api/v1/admin/platform/hooks/points", &h.gateway),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["points"][0]["id"], "message.pre_send");
+    assert_eq!(body["data"]["points"][0]["hook_type"], "pre_send");
+
+    let (status, body) = send(
+        &h.router,
+        admin_request("GET", "/api/v1/admin/platform/hooks/profiles", &h.gateway),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let profile = &body["data"]["profiles"][0];
+    assert_eq!(profile["service"], "message-ingest");
+    assert_eq!(profile["hooks"][0]["name"], "social");
+    assert_eq!(profile["hooks"][0]["target_type"], "grpc");
+
+    h.recorder.clear();
+    let (status, body) = send(
+        &h.router,
+        admin_request_with_body(
+            "POST",
+            "/api/v1/admin/platform/hooks/test",
+            &h.gateway,
+            Some(
+                r#"{"hook_type":"pre_send","transport":{"type":"webhook","endpoint":"https://hooks.example/t","timeout_ms":500}}"#,
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["outcome"], "allowed");
+    assert_eq!(body["data"]["latency_ms"], 12);
+    assert_eq!(
+        h.recorder.calls()[0].request,
+        "test hook_id= endpoint=https://hooks.example/t"
+    );
+
+    let (status, body) = send(
+        &h.router,
+        admin_request_with_body(
+            "POST",
+            "/api/v1/admin/platform/hooks/test",
+            &h.gateway,
+            Some("{}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(reason(&body), "ADMIN_HOOK_TARGET_REQUIRED");
 }
 
 #[tokio::test]

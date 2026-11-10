@@ -1,16 +1,16 @@
 //! Hook 治理路由（`/hooks/**`）：经 Capability 的 `CapabilityService.Administer`
 //! （`flare.extension.v1.hook_config.*`）读写 Hook 配置、查看统计与执行记录。
 //!
-//! 只经 `admin_auth_middleware` 可达，租户只取自 Staff 上下文：创建与列表请求的 `tenant_id`
-//! 由网关填入；按 hook_id 的操作由 Capability 先核对该配置属于签名里的租户。读要求
-//! `core:hooks:read`，写要求 `core:hooks:write`，Capability 按 operation 复核。写操作成功后发
-//! `flare.audit.effect.v1`（聚合 `hook_config`）。
+//! 只经 `admin_auth_middleware` 可达，租户只取自 Staff 上下文：列表请求的 `tenant_id` 由网关
+//! 填入；按 hook_id 的操作由 Capability 先核对该配置属于签名里的租户。读要求 `core:hooks:read`，
+//! 写要求 `core:hooks:write`，Capability 按 operation 复核。写操作成功后发 `flare.audit.effect.v1`
+//! （聚合 `hook_config`）。应用 Hook 现在建不出来，要等部署能出网（H3）；平台 Hook 见
+//! [`super::platform_hooks_handler`]。
 use axum::{Json, extract::Extension, http::HeaderMap};
 use flare_grpc_proto::capability::{
-    CreateHookConfigResponse, DeleteHookConfigRequest, DeleteHookConfigResponse, GenericResponse,
-    GetHookConfigRequest, GetHookConfigResponse, GetHookStatisticsResponse,
-    ListHookConfigsResponse, QueryHookExecutionsResponse, SetHookStatusResponse,
-    UpdateHookConfigResponse,
+    DeleteHookConfigRequest, DeleteHookConfigResponse, GenericResponse, GetHookConfigRequest,
+    GetHookConfigResponse, GetHookStatisticsResponse, ListHookConfigsResponse,
+    QueryHookExecutionsResponse, SetHookStatusResponse, UpdateHookConfigResponse,
 };
 use flare_im_service_kit::clients::{AdminGrpcClients, CapabilityAdminClientWrapper};
 use flare_server_core::{
@@ -30,9 +30,9 @@ use crate::application::admin_hooks::{
     AdminHookExecutionsPageHttp, AdminHookExecutionsQuery, AdminHookListQuery,
     AdminHookStatisticsHttp, AdminHookStatisticsQuery, AdminHookStatusHttp,
     AdminHookStatusHttpRequest, AdminHookUpdateHttpRequest, AdminHooksPageHttp,
-    build_create_request, build_executions_request, build_list_request, build_statistics_request,
-    build_status_request, build_update_request, delete_http, executions_page_http, hook_http,
-    hooks_page_http, operation, statistics_http, status_http,
+    build_executions_request, build_list_request, build_statistics_request, build_status_request,
+    build_update_request, delete_http, executions_page_http, hook_http, hooks_page_http, operation,
+    statistics_http, status_http,
 };
 
 /// `GenericResponse` 不是成功，或载荷缺失、解不开：Capability 的治理服务没有给出它承诺的
@@ -59,7 +59,7 @@ fn decode_payload<R: Message + Default>(
     })
 }
 
-async fn administer<P: Message, R: Message + Default>(
+pub(super) async fn administer<P: Message, R: Message + Default>(
     clients: &AdminGrpcClients,
     client: &mut CapabilityAdminClientWrapper,
     staff: &VerifiedStaffContext,
@@ -75,7 +75,7 @@ async fn administer<P: Message, R: Message + Default>(
     decode_payload(response, failure_reason)
 }
 
-fn bad_request(code: &'static str, message: String) -> HttpApiError {
+pub(super) fn bad_request(code: &'static str, message: String) -> HttpApiError {
     HttpApiError::bad_request(code, message)
 }
 
@@ -134,49 +134,18 @@ pub async fn list_hooks(
         ("x-request-id" = Option<String>, Header, description = "Required unless idempotency-key is present"),
     ),
     responses(
-        (status = 200, description = "The hook was created in the staff application", body = ApiResponse<AdminHookDetailHttp>),
-        (status = 400, description = "Blank name (ADMIN_HOOK_NAME_REQUIRED) or hook_type (ADMIN_HOOK_TYPE_REQUIRED), an unknown hook point (ADMIN_HOOK_POINT_INVALID), an extension that is not base64 (ADMIN_HOOK_EXTENSION_INVALID), or Capability refused an argument (BAD_REQUEST)"),
+        (status = 400, description = "Application hooks need an egress switch this deployment does not have (ADMIN_HOOK_APPLICATION_UNAVAILABLE)"),
         (status = 401, description = "Staff context is missing or invalid"),
-        (status = 403, description = "Signed permission is not core:hooks:write (ADMIN_PERMISSION_DENIED), audit reason / idempotency header missing (FORBIDDEN), or Capability refused the application (FORBIDDEN)"),
-        (status = 500, description = "Capability downstream failed or hook governance is disabled there (ADMIN_HOOK_CREATE_FAILED); its error text is not returned"),
-        (status = 502, description = "Capability downstream refused the forwarded staff context as unauthenticated, a deployment error (ADMIN_UPSTREAM_REJECTED_ASSERTION)"),
-        (status = 503, description = "Capability downstream is disabled (ADMIN_CAPABILITY_DISABLED) or unavailable (ADMIN_UPSTREAM_UNAVAILABLE)"),
-        (status = 504, description = "Capability downstream did not answer in time (ADMIN_UPSTREAM_TIMEOUT)"),
+        (status = 403, description = "Signed permission is not core:hooks:write (ADMIN_PERMISSION_DENIED), or audit reason / idempotency header missing (FORBIDDEN)"),
     ),
 )]
 pub async fn create_hook(
-    headers: HeaderMap,
-    Extension(clients): Extension<Arc<AdminGrpcClients>>,
-    Extension(capability): Extension<AdminCapability>,
-    Extension(staff): Extension<VerifiedStaffContext>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    AdminJson(request): AdminJson<AdminHookCreateHttpRequest>,
+    AdminJson(_): AdminJson<AdminHookCreateHttpRequest>,
 ) -> Result<Json<ApiResponse<AdminHookDetailHttp>>> {
-    let tenant_id = verified_tenant(&principal)?;
-    let proto = build_create_request(&tenant_id, request)
-        .map_err(|err| bad_request(err.code, err.message))?;
-    audit_write(
-        "hooks.create",
-        &principal,
-        &headers,
-        &AuditTarget::id(&proto.name),
-    );
-    let mut client = capability.client().await?;
-    let response: CreateHookConfigResponse = administer(
-        &clients,
-        &mut client,
-        &staff,
-        operation::CREATE,
-        "CreateHookConfigRequest",
-        &proto,
-        "ADMIN_HOOK_CREATE_FAILED",
-    )
-    .await?;
-    let config = response
-        .config
-        .ok_or_else(|| HttpApiError::internal("ADMIN_HOOK_CREATE_FAILED", ""))?;
-    let hook = hook_http(config);
-    Ok(Json(ApiResponse::success(AdminHookDetailHttp { hook })))
+    Err(bad_request(
+        "ADMIN_HOOK_APPLICATION_UNAVAILABLE",
+        "application hooks need outbound validation, an egress switch and quotas, which this deployment does not have; platform hooks are not affected".to_string(),
+    ))
 }
 
 #[utoipa::path(
@@ -234,7 +203,7 @@ pub async fn get_hook(
     ),
     responses(
         (status = 200, description = "The hook configuration after the update", body = ApiResponse<AdminHookDetailHttp>),
-        (status = 400, description = "An unknown hook point (ADMIN_HOOK_POINT_INVALID), an extension that is not base64 (ADMIN_HOOK_EXTENSION_INVALID), or Capability refused an argument (BAD_REQUEST)"),
+        (status = 400, description = "Capability refused an argument (BAD_REQUEST)"),
         (status = 401, description = "Staff context is missing or invalid"),
         (status = 403, description = "Signed permission is not core:hooks:write (ADMIN_PERMISSION_DENIED), audit reason / idempotency header missing (FORBIDDEN), or the hook belongs to another application (FORBIDDEN)"),
         (status = 404, description = "No such hook (NOT_FOUND)"),
@@ -255,8 +224,7 @@ pub async fn update_hook(
     AdminPath(hook_id): AdminPath<String>,
     AdminJson(request): AdminJson<AdminHookUpdateHttpRequest>,
 ) -> Result<Json<ApiResponse<AdminHookDetailHttp>>> {
-    let proto = build_update_request(&hook_id, request)
-        .map_err(|err| bad_request(err.code, err.message))?;
+    let proto = build_update_request(&hook_id, request);
     audit_write(
         "hooks.update",
         &principal,

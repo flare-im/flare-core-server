@@ -12,6 +12,7 @@ use aws_sdk_s3::types::{
 };
 use chrono::{Datelike, Utc};
 use flare_server_core::error::{ErrorCode, Result, map_infra_error};
+use tokio::io::AsyncReadExt;
 
 use crate::config::settings::normalize_optional_url;
 use crate::domain::model::{ObjectStat, UploadContext, UploadedPartRecord};
@@ -383,6 +384,68 @@ fn extract_extension(file_name: &str) -> Option<String> {
 
 #[async_trait::async_trait]
 impl MediaObjectRepository for S3ObjectStore {
+    async fn put_validated_object(
+        &self,
+        object_path: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(object_path)
+            .content_type(mime_type)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .map_err(|err| {
+                map_infra_error(
+                    err,
+                    ErrorCode::NetworkError,
+                    "failed to write validated image object",
+                )
+            })?;
+        Ok(())
+    }
+    async fn read_object_bounded(&self, object_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let object = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object_path)
+            .send()
+            .await
+            .map_err(|err| {
+                map_infra_error(err, ErrorCode::NetworkError, "failed to read image object")
+            })?;
+        if object
+            .content_length()
+            .is_some_and(|size| size < 0 || size as u64 > max_bytes)
+        {
+            return Err(flare_server_core::flare_err!(
+                ErrorCode::InvalidParameter,
+                "image exceeds upload limit"
+            ));
+        }
+        let mut bytes = Vec::new();
+        object
+            .body
+            .into_async_read()
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|err| {
+                map_infra_error(err, ErrorCode::NetworkError, "failed to read image bytes")
+            })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(flare_server_core::flare_err!(
+                ErrorCode::InvalidParameter,
+                "image exceeds upload limit"
+            ));
+        }
+        Ok(bytes)
+    }
+
     async fn put_object(&self, context: &UploadContext<'_>) -> Result<String> {
         let key = self.build_object_key(context);
         tracing::trace!(

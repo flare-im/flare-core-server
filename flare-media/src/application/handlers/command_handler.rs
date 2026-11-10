@@ -37,6 +37,23 @@ pub struct ProcessedMediaResult {
 }
 
 impl MediaCommandHandler {
+    pub async fn handle_admin_initiate_direct_upload(
+        &self,
+        ctx: &Context,
+        purpose: crate::domain::model::MediaPurpose,
+        request: flare_grpc_proto::media::AdminInitiateDirectUploadRequest,
+    ) -> Result<DirectUploadSessionState> {
+        self.domain_service
+            .initiate_admin_direct_upload(
+                ctx,
+                purpose,
+                &request.file_name,
+                &request.mime_type,
+                request.file_size,
+            )
+            .await
+    }
+
     pub fn new(domain_service: Arc<MediaService>) -> Self {
         Self {
             domain_service,

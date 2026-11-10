@@ -135,6 +135,8 @@ fn file(file_id: &str) -> FileInfo {
         bucket: "media".to_string(),
         object_key: format!("{TENANT}/2026/{file_id}.png"),
         tenant: TENANT.to_string(),
+        owner_kind: 1,
+        purpose: 0,
     }
 }
 
@@ -162,6 +164,58 @@ impl MediaFake {
 
 #[tonic::async_trait]
 impl MediaService for MediaFake {
+    async fn get_admin_upload_policy(
+        &self,
+        request: GrpcRequest<AdminUploadPolicyRequest>,
+    ) -> Result<GrpcResponse<AdminUploadPolicyResponse>, Status> {
+        self.recorder.record(
+            "GetAdminUploadPolicy",
+            &request,
+            format!("purpose={}", request.get_ref().purpose),
+        );
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(AdminUploadPolicyResponse {
+            tenant_id: TENANT.into(),
+            purpose: request.get_ref().purpose,
+            max_bytes: 8 * 1024 * 1024,
+            max_pixels: 16_777_216,
+            max_dimension: 8192,
+            allowed_mime_types: vec!["image/png".into()],
+        }))
+    }
+    async fn admin_initiate_direct_upload(
+        &self,
+        request: GrpcRequest<AdminInitiateDirectUploadRequest>,
+    ) -> Result<GrpcResponse<InitiateDirectUploadResponse>, Status> {
+        self.recorder.record(
+            "AdminInitiateDirectUpload",
+            &request,
+            request.get_ref().file_name.clone(),
+        );
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(InitiateDirectUploadResponse {
+            upload_id: "upload-1".into(),
+            file_id: "image-1".into(),
+            transport_kind: 1,
+            part_size: request.get_ref().file_size,
+            total_parts: 1,
+            upload_url: "https://storage.invalid/upload?signature=private".into(),
+            success: true,
+            ..Default::default()
+        }))
+    }
+    async fn validate_application_media(
+        &self,
+        _: GrpcRequest<ValidateApplicationMediaRequest>,
+    ) -> Result<GrpcResponse<ValidateApplicationMediaResponse>, Status> {
+        Err(Status::permission_denied("validator service required"))
+    }
+    async fn resolve_application_avatar_media(
+        &self,
+        _: GrpcRequest<ResolveApplicationAvatarMediaRequest>,
+    ) -> Result<GrpcResponse<GetFileUrlResponse>, Status> {
+        Err(Status::permission_denied("validator service required"))
+    }
     async fn cleanup_orphaned_assets(
         &self,
         request: GrpcRequest<CleanupOrphanedAssetsRequest>,
@@ -285,33 +339,75 @@ impl MediaService for MediaFake {
     }
     async fn get_direct_upload_status(
         &self,
-        _: GrpcRequest<GetDirectUploadStatusRequest>,
+        request: GrpcRequest<GetDirectUploadStatusRequest>,
     ) -> Result<GrpcResponse<GetDirectUploadStatusResponse>, Status> {
-        unimplemented()
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(GetDirectUploadStatusResponse {
+            upload_id: request.get_ref().upload_id.clone(),
+            file_id: "image-1".into(),
+            transport_kind: 1,
+            total_parts: 1,
+            success: true,
+            ..Default::default()
+        }))
     }
     async fn presign_direct_upload_parts(
         &self,
-        _: GrpcRequest<PresignDirectUploadPartsRequest>,
+        request: GrpcRequest<PresignDirectUploadPartsRequest>,
     ) -> Result<GrpcResponse<PresignDirectUploadPartsResponse>, Status> {
-        unimplemented()
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(PresignDirectUploadPartsResponse {
+            parts: vec![],
+            success: true,
+            error_message: String::new(),
+        }))
     }
     async fn commit_direct_upload_parts(
         &self,
-        _: GrpcRequest<CommitDirectUploadPartsRequest>,
+        request: GrpcRequest<CommitDirectUploadPartsRequest>,
     ) -> Result<GrpcResponse<CommitDirectUploadPartsResponse>, Status> {
-        unimplemented()
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(CommitDirectUploadPartsResponse {
+            committed_parts: request
+                .get_ref()
+                .parts
+                .iter()
+                .map(|p| p.part_number)
+                .collect(),
+            uploaded_size: 2048,
+            success: true,
+            error_message: String::new(),
+        }))
     }
     async fn complete_direct_upload(
         &self,
-        _: GrpcRequest<CompleteDirectUploadRequest>,
+        request: GrpcRequest<CompleteDirectUploadRequest>,
     ) -> Result<GrpcResponse<UploadFileResponse>, Status> {
-        unimplemented()
+        self.recorder.record(
+            "CompleteDirectUpload",
+            &request,
+            request.get_ref().upload_id.clone(),
+        );
+        self.gate(&request, "core:medias:write")?;
+        let mut info = file("image-1");
+        info.owner_kind = 2;
+        info.purpose = 1;
+        Ok(GrpcResponse::new(UploadFileResponse {
+            file_id: info.file_id.clone(),
+            info: Some(info),
+            success: true,
+            ..Default::default()
+        }))
     }
     async fn abort_direct_upload(
         &self,
-        _: GrpcRequest<AbortDirectUploadRequest>,
+        request: GrpcRequest<AbortDirectUploadRequest>,
     ) -> Result<GrpcResponse<AbortMultipartUploadResponse>, Status> {
-        unimplemented()
+        self.gate(&request, "core:medias:write")?;
+        Ok(GrpcResponse::new(AbortMultipartUploadResponse {
+            success: true,
+            error_message: String::new(),
+        }))
     }
     async fn create_reference(
         &self,
@@ -333,9 +429,14 @@ impl MediaService for MediaFake {
     }
     async fn get_file_url(
         &self,
-        _: GrpcRequest<GetFileUrlRequest>,
+        request: GrpcRequest<GetFileUrlRequest>,
     ) -> Result<GrpcResponse<GetFileUrlResponse>, Status> {
-        unimplemented()
+        self.gate(&request, "core:medias:read")?;
+        Ok(GrpcResponse::new(GetFileUrlResponse {
+            url: "https://storage.invalid/image?signature=temporary".into(),
+            success: true,
+            ..Default::default()
+        }))
     }
     async fn get_file_info(
         &self,

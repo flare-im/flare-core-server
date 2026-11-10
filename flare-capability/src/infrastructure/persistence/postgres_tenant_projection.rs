@@ -44,20 +44,16 @@ impl LocalCredentialReader for PostgresTenantProjectionRepository {
 impl TenantProjectionRepository for PostgresTenantProjectionRepository {
     async fn replace_plugins(
         &self,
-        snapshot: &flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot,
+        projection: &flare_im_capability_core::plugin::runtime::PluginProjection,
     ) -> Result<TenantProjectionOutcome> {
-        super::postgres_plugin_authorization::PostgresPluginAuthorization {
-            pool: self.pool.clone(),
-        }
-        .replace(snapshot)
-        .await
+        super::postgres_plugin_authorization::PostgresPluginAuthorization::new(self.pool.clone())
+            .replace(projection)
+            .await
     }
     async fn plugin_versions(&self, app_ids: &[String]) -> Result<Vec<(String, u64)>> {
-        super::postgres_plugin_authorization::PostgresPluginAuthorization {
-            pool: self.pool.clone(),
-        }
-        .versions(app_ids)
-        .await
+        super::postgres_plugin_authorization::PostgresPluginAuthorization::new(self.pool.clone())
+            .versions(app_ids)
+            .await
     }
     async fn replace_credentials(&self, p: &CredentialSnapshot) -> Result<TenantProjectionOutcome> {
         // Never surface SQL row/detail text (it can contain credential material).

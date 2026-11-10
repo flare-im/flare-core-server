@@ -153,7 +153,9 @@ mod tests {
             head_tail_sha256: None,
             full_sha256: None,
             total_parts: None,
-            user_id: "owner".to_string(),
+            actor_id: "owner".to_string(),
+            actor_kind: Default::default(),
+            purpose: Default::default(),
             namespace: None,
             business_tag: None,
             trace_id: None,
@@ -167,6 +169,27 @@ mod tests {
     }
 
     /// 修复前内存兜底存储永不过期：过期会话仍能续传、完成，且从不释放。
+    #[test]
+    fn historical_user_sessions_decode_without_changing_their_principal() {
+        let original = session("old", Utc::now());
+        let mut json = serde_json::to_value(&original).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        let actor = fields.remove("actor_id").unwrap();
+        fields.insert("user_id".into(), actor);
+        fields.remove("actor_kind");
+        fields.remove("purpose");
+        let decoded: UploadSession = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.actor_id, "owner");
+        assert_eq!(
+            decoded.actor_kind,
+            crate::domain::model::UploadActorKind::User
+        );
+        assert_eq!(decoded.purpose, crate::domain::model::MediaPurpose::General);
+        let encoded = serde_json::to_value(decoded).unwrap();
+        assert_eq!(encoded["actor_id"], "owner");
+        assert!(encoded.get("user_id").is_none());
+    }
+
     #[tokio::test]
     async fn expired_sessions_are_hidden_and_claimed_once_per_lease() {
         let store = MemoryUploadSessionStore::new();

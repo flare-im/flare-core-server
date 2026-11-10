@@ -30,6 +30,9 @@ use std::{future::Future, path::PathBuf, time::Duration};
 use tonic::transport::Channel;
 use tonic::{Code, Request};
 
+#[path = "admin_upload_pg_tests.rs"]
+mod admin_upload_pg_tests;
+
 fn keys() -> (SignedContextSigner, SignedContextVerifier) {
     let key = SigningKey::from_bytes(&[93; 32]);
     let private = key.to_pkcs8_pem(Default::default()).unwrap();
@@ -121,6 +124,12 @@ where
             1,
         );
         sqlx::raw_sql(&schema).execute(&*run).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../migrations/0029_20261109_application_media_ownership.sql"
+        ))
+        .execute(&*run)
+        .await
+        .unwrap();
         sqlx::raw_sql(include_str!(
             "../../../../migrations/0012_20261015_core_audit_outbox.sql"
         ))
@@ -406,6 +415,37 @@ fn signed<T>(
     flare_server_core::set_signed_context_token(&mut r, &keys().0.sign(&identity).unwrap())
         .unwrap();
     r
+}
+
+#[tokio::test]
+#[ignore = "requires explicit owned-test FLARE_FUNCTIONAL_PG_ADMIN_URL"]
+async fn application_media_ownership_and_source_audit_commit_atomically() {
+    database(|pool, _root| async move {
+        use crate::domain::model::{MediaOwnerKind, MediaPurpose};
+        let store = PostgresMetadataStore { pool: pool.clone() };
+        let carrier = request("app-a", "core:medias:write", false);
+        let verified = flare_im_service_kit::staff_context::verify_staff_metadata(carrier.metadata(), &keys().1, "core:medias:write").unwrap();
+        let ctx = verified.ctx;
+        let mut asset = MediaFileMetadata { file_id: "application-avatar".into(), owner_id: Some("app-a".into()), owner_kind: MediaOwnerKind::Application, purpose: MediaPurpose::Avatar, mime_type: "image/png".into(), file_size: 123, ..Default::default() };
+        store.save_metadata(&ctx, &asset).staff_audit(&ctx, "flare-media").await.unwrap();
+        let saved = store.load_metadata(&ctx, &asset.file_id).await.unwrap().unwrap();
+        assert_eq!(saved.owner_kind, MediaOwnerKind::Application);
+        assert_eq!(saved.owner_id.as_deref(), Some("app-a"));
+        assert_eq!(saved.purpose, MediaPurpose::Avatar);
+        assert!(store.load_metadata(&Context::root().with_tenant_id("app-b"), &asset.file_id).await.unwrap().is_none());
+        assert_eq!(effects(&pool).await.len(), 1);
+        // A failed audit tail rolls back the metadata INSERT in the same transaction.
+        sqlx::query("ALTER TABLE core_audit_outbox ADD CONSTRAINT reject_image_audit CHECK (false) NOT VALID").execute(&*pool).await.unwrap();
+        asset.file_id = "must-rollback".into();
+        assert!(store.save_metadata(&ctx, &asset).staff_audit(&ctx, "flare-media").await.is_err());
+        assert!(store.load_metadata(&ctx, &asset.file_id).await.unwrap().is_none());
+        assert_eq!(effects(&pool).await.len(), 1);
+        sqlx::query("ALTER TABLE core_audit_outbox DROP CONSTRAINT reject_image_audit").execute(&*pool).await.unwrap();
+        // Database ownership prevents an application asset being assigned to another app.
+        asset.owner_id = Some("app-b".into());
+        assert!(store.save_metadata(&ctx, &asset).staff_audit(&ctx, "flare-media").await.is_err());
+        assert!(store.load_metadata(&ctx, &asset.file_id).await.unwrap().is_none());
+    }).await;
 }
 
 #[tokio::test]

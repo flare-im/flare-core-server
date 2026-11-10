@@ -236,7 +236,7 @@ Admin API 必须先以 typed HTTP proxy 落地，再按需要暴露 gRPC facade�
 | 会话管理 | `/api/v1/admin/conversations` | `ApiGatewayAdminService.GetConversationDetail/ManageParticipants` | `ConversationReadService` / `ConversationManageService` |
 | 媒体管理 | `/api/v1/admin/media` | `ApiGatewayAdminService.GetFileInfo/DeleteFile` | `MediaService` |
 | 在线设备 | `/api/v1/admin/presence` | `ApiGatewayAdminService.ListUserDevices/KickDevice` | `OnlineService` |
-| 能力插件 | `/api/v1/admin/capabilities` | `ApiGatewayAdminService.ListCapabilities/GrantUserCapability` | `CapabilityService` |
+| 能力插件 | `/api/v1/admin/capabilities` | `ApiGatewayAdminService.ListCapabilities` | `CapabilityService` |
 
 ## 10. Rust 实现要求
 

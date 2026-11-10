@@ -5,6 +5,7 @@ use crate::{
     infrastructure::capability::InMemoryCapabilityGrants,
 };
 use flare_im_capability_core::plugin::{
+    PluginManifest,
     authorization::TenantPluginGrant,
     invocation::{PluginCallClaims, PluginCallSigner},
     runtime::*,
@@ -24,8 +25,10 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
-        Ok(Some(self.0.lock().unwrap().clone()).filter(|s| s.tenant_id == tenant))
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
+        Ok(Some(self.0.lock().unwrap().clone())
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
 struct Budget(AtomicUsize);
@@ -86,7 +89,7 @@ fn fixture() -> (
     PluginCallClaims,
     Arc<InMemoryCapabilityGrants>,
 ) {
-    let raw=serde_json::to_string(&json!({"manifestVersion":1,"pluginId":"example.resource","version":"0.1.0","apiVersion":"1.0","displayName":"Resource fixture","publisher":{"publisherId":"fixture","displayName":"Fixture"},"runtime":{"kind":"grpc","service":"flare.capability.v1.ExtensionPlugin","protocol":"flare.capability.v1"},"capabilities":[{"id":"example.resource","operations":[{"id":"run","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"permissionIds":["example.resource.read"],"hostCapabilities":["im.conversation.read"],"timeoutMs":1000,"idempotent":true}]}],"permissions":[{"id":"example.resource.read","description":"Read bound resource","riskLevel":"high","dataScopes":["im.conversation.read"]}],"artifact":{"digest":format!("sha256:{}","a".repeat(64)),"signatureRef":"fixture"}})).unwrap();
+    let raw=serde_json::to_string(&json!({"manifestVersion":1,"pluginId":"example.resource","version":"0.1.0","apiVersion":"1.0","displayName":"Resource fixture","publisher":{"publisherId":"fixture","displayName":"Fixture"},"runtime":{"kind":"grpc","service":"flare.capability.v1.ExtensionPlugin","protocol":"flare.capability.v1"},"capabilities":[{"id":"example.resource","operations":[{"id":"run","inputSchema":{"type":"object"},"outputSchema":{"type":"object"},"permissionIds":["example.resource.read"],"hostCapabilities":["im.conversation.read"],"timeoutMs":1000,"idempotent":true}]}],"permissions":[{"id":"example.resource.read","description":"Read bound resource","riskLevel":"high","dataScopes":["im.conversation.read"]}],"features":[{"id":"run","label":{"en-US":"Run"},"gates":{"operations":["example.resource.run"]}}],"artifact":{"digest":format!("sha256:{}","a".repeat(64)),"signatureRef":"fixture"}})).unwrap();
     let digest = digest_bytes(raw.as_bytes());
     let now = chrono::Utc::now().timestamp_millis();
     let config = configuration_digest(&json!({})).unwrap();
@@ -96,34 +99,39 @@ fn fixture() -> (
         version: 1,
         issued_at_ms: now,
         valid_until_ms: now + 60000,
-        plugins: vec![ProjectedPlugin {
-            grant: TenantPluginGrant {
-                grant_id: "grant-1".into(),
-                revision: 2,
-                tenant_id: "201".into(),
-                plugin_id: "example.resource".into(),
-                plugin_version: "0.1.0".into(),
-                manifest_digest: digest.clone(),
-                approved_operations: ["example.resource.run".into()].into(),
-                approved_permissions: ["example.resource.read".into()].into(),
-                approved_data_scopes: ["im.conversation.read".into()].into(),
-                enabled: true,
-                revoked: false,
-                valid_from_ms: now,
-                valid_until_ms: now + 60000,
-            },
-            manifest_json: raw,
-            deployment: PluginDeployment {
-                deployment_id: "deploy-1".into(),
-                plugin_id: "example.resource".into(),
-                plugin_version: "0.1.0".into(),
-                manifest_digest: digest.clone(),
-                artifact_digest: format!("sha256:{}", "a".repeat(64)),
-                grpc_authority: "http://127.0.0.1:1".into(),
-            },
-            configuration_digest: config.clone(),
-            client_configuration: Default::default(),
-        }],
+        plugins: vec![
+            ResolvedPlugin::new(
+                TenantPluginGrant {
+                    grant_id: "grant-1".into(),
+                    revision: 2,
+                    tenant_id: "201".into(),
+                    plugin_id: "example.resource".into(),
+                    plugin_version: "0.1.0".into(),
+                    manifest_digest: digest.clone(),
+                    approved_operations: ["example.resource.run".into()].into(),
+                    approved_permissions: ["example.resource.read".into()].into(),
+                    approved_data_scopes: ["im.conversation.read".into()].into(),
+                    enabled: true,
+                    revoked: false,
+                    suspended: false,
+                    valid_from_ms: now,
+                    valid_until_ms: now + 60000,
+                },
+                Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap()),
+                PluginDeployment {
+                    deployment_id: "deploy-1".into(),
+                    plugin_id: "example.resource".into(),
+                    plugin_version: "0.1.0".into(),
+                    manifest_digest: digest.clone(),
+                    artifact_digest: format!("sha256:{}", "a".repeat(64)),
+                    grpc_authority: "http://127.0.0.1:1".into(),
+                },
+                config.clone(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        ],
     })));
     let signer = PluginCallSigner::new("resource-test".into(), [43; 32]).unwrap();
     let mut verifier = PluginCallVerifier::default();
@@ -312,4 +320,147 @@ async fn dedicated_bridge_rpc_rejects_cell_identity_and_duplicate_tickets() {
     );
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn signed_events_read_only_their_actor_membership_as_core_and_recheck_scopes() {
+    use flare_im_capability_core::plugin::event::*;
+    use flare_im_capability_core::plugin::resource::HostCapability;
+    struct EventBackend(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ResourceAccessBackend for EventBackend {
+        async fn read(&self, _: &ResourceActor, _: &ResourceRequest) -> Result<Value> {
+            panic!("an event must never reach a backend as a user invocation")
+        }
+        async fn tenant_members(
+            &self,
+            tenant: &str,
+            conversation: &str,
+            _: &str,
+            users: &[String],
+        ) -> Result<std::collections::BTreeSet<String>> {
+            assert_eq!((tenant, conversation), ("201", "conversation-1"));
+            assert_eq!(users, ["u1"]);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(["u1".into()].into())
+        }
+    }
+    let (_, projection, _, signer, user, policy) = fixture();
+    {
+        let mut snapshot = projection.0.lock().unwrap();
+        let old = &snapshot.plugins[0];
+        let mut manifest = old.manifest().clone();
+        manifest.permissions[0].data_scopes = vec![
+            MESSAGE_EVENTS_SCOPE.into(),
+            MESSAGE_BODY_SCOPE.into(),
+            HostCapability::ConversationMembersCheck.id().into(),
+        ];
+        manifest.capabilities[0].operations[0].host_capabilities =
+            vec![HostCapability::ConversationMembersCheck];
+        manifest.event_subscriptions = vec![PluginEventSubscription {
+            event_type: MESSAGE_CREATED.into(),
+            schema_version: 1,
+            operation: "example.resource.run".into(),
+            permission_ids: vec!["example.resource.read".into()],
+            include_body: true,
+        }];
+        manifest.validate().unwrap();
+        let digest = digest_bytes(&serde_json::to_vec(&manifest).unwrap());
+        let mut grant = old.grant.clone();
+        grant.manifest_digest = digest.clone();
+        grant.approved_data_scopes = manifest.permissions[0]
+            .data_scopes
+            .iter()
+            .cloned()
+            .collect();
+        let mut deployment = old.deployment.clone();
+        deployment.manifest_digest = digest;
+        snapshot.plugins[0] = ResolvedPlugin::new(
+            grant,
+            Arc::new(manifest),
+            deployment,
+            old.configuration_digest.clone(),
+            Default::default(),
+            [("run".into(), true)].into(),
+        )
+        .unwrap();
+    }
+    let mut verifier = PluginCallVerifier::default();
+    verifier
+        .insert(signer.key_id().into(), signer.public_key())
+        .unwrap();
+    let backend = Arc::new(EventBackend(AtomicUsize::new(0)));
+    let bridge = ResourceBridge::new(
+        projection.clone(),
+        policy,
+        verifier,
+        backend.clone(),
+        Arc::new(Budget(AtomicUsize::new(0))),
+    );
+    let claims = PluginEventClaims {
+        tenant_id: user.tenant_id,
+        plugin_id: user.plugin_id,
+        plugin_version: user.plugin_version,
+        manifest_digest: projection.0.lock().unwrap().plugins[0]
+            .grant
+            .manifest_digest
+            .clone(),
+        deployment_id: user.deployment_id,
+        grant_id: user.grant_id,
+        grant_revision: user.grant_revision,
+        configuration_digest: user.configuration_digest,
+        enabled_features: ["observe".into()].into(),
+        active_since_ms: 1000,
+        operation: user.operation,
+        event_id: "message-1".into(),
+        request_digest: digest_bytes(b"event"),
+        actor_id: user.actor_id,
+        conversation_id: user.conversation_id.unwrap(),
+        issued_at_ms: user.issued_at_ms,
+        expires_at_ms: user.expires_at_ms,
+    };
+    let token = signer
+        .sign_event(&claims, chrono::Utc::now().timestamp_millis())
+        .unwrap();
+    let membership = br#"{"capability":"im.conversation.members.check","userIds":["u1"]}"#;
+    let value = bridge
+        .call(
+            &token,
+            "im.conversation.members.check",
+            "message-1",
+            membership,
+        )
+        .await
+        .unwrap();
+    assert_eq!(value, json!({"members":["u1"],"nonMembers":[]}));
+    for (operation, payload) in [
+        ("im.conversation.read", READ),
+        (
+            "im.conversation.members.check",
+            br#"{"capability":"im.conversation.members.check","userIds":["other"]}"#.as_slice(),
+        ),
+    ] {
+        assert!(
+            bridge
+                .call(&token, operation, "message-1", payload)
+                .await
+                .is_err()
+        );
+    }
+    projection.0.lock().unwrap().plugins[0]
+        .grant
+        .approved_data_scopes
+        .remove(MESSAGE_BODY_SCOPE);
+    assert!(
+        bridge
+            .call(
+                &token,
+                "im.conversation.members.check",
+                "message-1",
+                membership
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(backend.0.load(Ordering::SeqCst), 1);
 }

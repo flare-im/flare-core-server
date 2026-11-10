@@ -1,22 +1,25 @@
 //! [`PluginCardBindingSource`] on the Core database: `plugin_entity_bindings` (migration 0016, the
-//! index on `(tenant_id, server_msg_id)`) and `plugin_authorization_snapshots` (0017), read only.
-//! Parsing a projection validates every manifest in it, so parsed rules are cached per (tenant,
-//! projection version), like Storage Writer does for binding.
+//! index on `(tenant_id, server_msg_id)`), `plugin_authorization_snapshots` (0017) and the
+//! registry's `plugin_versions`, read only. A projection names its manifests by digest: each digest
+//! is read and parsed once per process, and the rules are cached per (tenant, projection version),
+//! like Storage Writer does for binding.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use flare_im_capability_core::plugin::runtime::PluginRuntimeSnapshot;
+use flare_im_capability_core::plugin::PluginManifest;
+use flare_im_capability_core::plugin::runtime::{ManifestCache, PluginProjection};
 use flare_server_core::error::{ErrorCode, Result, map_infra_error};
 use sqlx::{Pool, Postgres};
 
 use crate::domain::model::plugin_card::{EntityRules, PluginCardBindingSource};
 
-/// Tenants whose parsed projection is kept; the cache starts over when it is full.
+/// Tenants whose rules are kept; the cache starts over when it is full.
 const MAX_CACHED_TENANTS: usize = 1024;
 
 pub struct PostgresPluginCardBindings {
     pool: Pool<Postgres>,
     rules: Mutex<HashMap<String, Arc<EntityRules>>>,
+    manifests: ManifestCache,
 }
 
 fn db_error(operation: &str, err: sqlx::Error) -> flare_server_core::error::FlareError {
@@ -28,7 +31,56 @@ impl PostgresPluginCardBindings {
         Self {
             pool,
             rules: Mutex::new(HashMap::new()),
+            manifests: ManifestCache::default(),
         }
+    }
+
+    /// The manifests of `projection` by digest. The registry is read only for digests this process
+    /// has not parsed yet. A digest it does not hold, or whose text does not hash to it, stays out
+    /// of the answer, so its plugin is skipped.
+    async fn manifests(
+        &self,
+        projection: &PluginProjection,
+    ) -> Result<HashMap<String, Arc<PluginManifest>>> {
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        for projected in &projection.plugins {
+            let digest = projected.manifest_digest();
+            match self.manifests.get(digest) {
+                Some(manifest) => {
+                    found.insert(digest.to_owned(), manifest);
+                }
+                None => missing.push(digest.to_owned()),
+            }
+        }
+        if missing.is_empty() {
+            return Ok(found);
+        }
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT manifest_digest, manifest_json FROM plugin_versions \
+             WHERE manifest_digest = ANY($1)",
+        )
+        .bind(&missing)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| db_error("read plugin manifests", err))?;
+        for (digest, raw) in rows {
+            match self.manifests.insert(&digest, raw.as_bytes()) {
+                Ok(manifest) => {
+                    found.insert(digest, manifest);
+                }
+                Err(error) => {
+                    tracing::warn!(digest, %error, "registered plugin manifest is invalid; its plugin cards stay unmarked");
+                }
+            }
+        }
+        for digest in missing.iter().filter(|digest| !found.contains_key(*digest)) {
+            tracing::warn!(
+                digest,
+                "plugin manifest is not in the registry; its plugin cards stay unmarked"
+            );
+        }
+        Ok(found)
     }
 }
 
@@ -87,8 +139,8 @@ impl PluginCardBindingSource for PostgresPluginCardBindings {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
-        let snapshot = match serde_json::from_value::<PluginRuntimeSnapshot>(snapshot) {
-            Ok(snapshot) if snapshot.validate(now_ms).is_ok() => snapshot,
+        let projection = match serde_json::from_value::<PluginProjection>(snapshot) {
+            Ok(projection) if projection.validate(now_ms).is_ok() => projection,
             _ => {
                 tracing::warn!(
                     tenant_id,
@@ -98,7 +150,12 @@ impl PluginCardBindingSource for PostgresPluginCardBindings {
                 return Ok(None);
             }
         };
-        let rules = Arc::new(EntityRules::from_snapshot(&snapshot, now_ms));
+        let manifests = self.manifests(&projection).await?;
+        let rules = Arc::new(EntityRules::from_projection(
+            &projection,
+            &manifests,
+            now_ms,
+        ));
         if let Ok(mut cache) = self.rules.lock() {
             if cache.len() >= MAX_CACHED_TENANTS && !cache.contains_key(tenant_id) {
                 cache.clear();

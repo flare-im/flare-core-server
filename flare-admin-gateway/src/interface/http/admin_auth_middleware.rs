@@ -552,16 +552,16 @@ mod tests {
         headers.insert(keys::ACTOR_ID, HeaderValue::from_static("attacker"));
         assert!(authorize_admin_request(&Method::POST, "/users/u1/kick", &headers, &staff).is_ok());
 
-        // Plugin registration is platform-only: organization staff are refused even with the code.
+        // A platform route: organization staff are refused even with the code.
         let mut write_headers = HeaderMap::new();
         write_headers.insert(AUDIT_REASON_HEADER, HeaderValue::from_static("ops-audit"));
         write_headers.insert(IDEMPOTENCY_KEY_HEADER, HeaderValue::from_static("idem-1"));
-        let org_staff = staff_with("core:plugins:write", Some("org-1"));
+        let org_staff = staff_with("core:plugins:platform:write", Some("org-1"));
         assert_eq!(
             status_of(
                 &authorize_admin_request(
                     &Method::POST,
-                    "/plugins/register",
+                    "/platform/plugin-registry/versions",
                     &write_headers,
                     &org_staff
                 )
@@ -569,11 +569,11 @@ mod tests {
             ),
             StatusCode::FORBIDDEN
         );
-        let platform_staff = staff_with("core:plugins:write", None);
+        let platform_staff = staff_with("core:plugins:platform:write", None);
         assert!(
             authorize_admin_request(
                 &Method::POST,
-                "/plugins/register",
+                "/platform/plugin-registry/versions",
                 &write_headers,
                 &platform_staff
             )

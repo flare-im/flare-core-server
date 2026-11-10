@@ -1,6 +1,5 @@
 use crate::domain::model::ConversationType;
 use flare_im_contracts::utils::{TimelineMetadata, current_millis, normalize_tenant_id};
-use flare_im_message_pipeline::SubmittedMessage;
 use flare_proto::common::Message;
 use flare_server_core::error::{ErrorCode, Result};
 use flare_server_core::flare_err;
@@ -126,16 +125,6 @@ impl MessageSubmission {
             message_id,
             timeline,
         })
-    }
-}
-
-impl SubmittedMessage for MessageSubmission {
-    fn message(&self) -> &Message {
-        &self.message
-    }
-
-    fn message_id(&self) -> &str {
-        &self.message_id
     }
 }
 

@@ -56,38 +56,47 @@ fn snapshot() -> PluginRuntimeSnapshot {
         version: 3,
         issued_at_ms: now,
         valid_until_ms: now + 300_000,
-        plugins: vec![ProjectedPlugin {
-            grant: TenantPluginGrant {
-                grant_id: "g-poll".into(),
-                revision: 4,
-                tenant_id: "app-a".into(),
-                plugin_id: "example.poll".into(),
-                plugin_version: manifest.version.clone(),
-                manifest_digest: digest.clone(),
-                approved_operations: manifest.operation_ids(),
-                approved_permissions: manifest.permissions.iter().map(|p| p.id.clone()).collect(),
-                approved_data_scopes: manifest
-                    .permissions
-                    .iter()
-                    .flat_map(|p| p.data_scopes.iter().cloned())
-                    .collect(),
-                enabled: true,
-                revoked: false,
-                valid_from_ms: now,
-                valid_until_ms: now + 300_000,
-            },
-            manifest_json: raw,
-            deployment: PluginDeployment {
-                deployment_id: "poll-1".into(),
-                plugin_id: "example.poll".into(),
-                plugin_version: manifest.version.clone(),
-                manifest_digest: digest,
-                artifact_digest: manifest.artifact.as_ref().unwrap().digest.clone(),
-                grpc_authority: "http://127.0.0.1:1".into(),
-            },
-            configuration_digest: configuration_digest(&json!({"maxOptions": 6})).unwrap(),
-            client_configuration: Default::default(),
-        }],
+        plugins: vec![
+            ResolvedPlugin::new(
+                TenantPluginGrant {
+                    grant_id: "g-poll".into(),
+                    revision: 4,
+                    tenant_id: "app-a".into(),
+                    plugin_id: "example.poll".into(),
+                    plugin_version: manifest.version.clone(),
+                    manifest_digest: digest.clone(),
+                    approved_operations: manifest.operation_ids(),
+                    approved_permissions: manifest
+                        .permissions
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect(),
+                    approved_data_scopes: manifest
+                        .permissions
+                        .iter()
+                        .flat_map(|p| p.data_scopes.iter().cloned())
+                        .collect(),
+                    enabled: true,
+                    revoked: false,
+                    suspended: false,
+                    valid_from_ms: now,
+                    valid_until_ms: now + 300_000,
+                },
+                std::sync::Arc::new(manifest.clone()),
+                PluginDeployment {
+                    deployment_id: "poll-1".into(),
+                    plugin_id: "example.poll".into(),
+                    plugin_version: manifest.version.clone(),
+                    manifest_digest: digest,
+                    artifact_digest: manifest.artifact.as_ref().unwrap().digest.clone(),
+                    grpc_authority: "http://127.0.0.1:1".into(),
+                },
+                configuration_digest(&json!({"maxOptions": 6})).unwrap(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap(),
+        ],
     }
 }
 
@@ -97,8 +106,10 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
-        Ok(Some(self.0.lock().unwrap().clone()).filter(|s| s.tenant_id == tenant))
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
+        Ok(Some(self.0.lock().unwrap().clone())
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
 

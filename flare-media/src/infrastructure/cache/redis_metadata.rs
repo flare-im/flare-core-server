@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::domain::model::{
-    FileAccessType, MediaAssetStatus, MediaFileMetadata, tenant_storage_segment,
+    FileAccessType, MediaAssetStatus, MediaFileMetadata, MediaOwnerKind, MediaPurpose,
+    tenant_storage_segment,
 };
 use crate::domain::repository::MediaMetadataCache;
 
@@ -20,6 +21,10 @@ use crate::domain::repository::MediaMetadataCache;
 struct CachedMetadata {
     #[serde(default)]
     owner_id: Option<String>,
+    #[serde(default)]
+    owner_kind: MediaOwnerKind,
+    #[serde(default)]
+    purpose: MediaPurpose,
     file_id: String,
     file_name: String,
     mime_type: String,
@@ -77,6 +82,8 @@ impl MediaMetadataCache for RedisMetadataCache {
     async fn cache_metadata(&self, ctx: &Context, metadata: &MediaFileMetadata) -> Result<()> {
         let cached = CachedMetadata {
             owner_id: metadata.owner_id.clone(),
+            owner_kind: metadata.owner_kind,
+            purpose: metadata.purpose,
             file_id: metadata.file_id.clone(),
             file_name: metadata.file_name.clone(),
             mime_type: metadata.mime_type.clone(),
@@ -152,6 +159,8 @@ impl MediaMetadataCache for RedisMetadataCache {
 
             Ok(Some(MediaFileMetadata {
                 owner_id: cached.owner_id,
+                owner_kind: cached.owner_kind,
+                purpose: cached.purpose,
                 file_id: cached.file_id,
                 file_name: cached.file_name,
                 mime_type: cached.mime_type,

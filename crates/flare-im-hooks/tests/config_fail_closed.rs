@@ -15,9 +15,6 @@ fn profile(name: &str) -> PathBuf {
 fn unspecified_config_uses_explicit_empty_core_profile() {
     let cfg = HookConfigLoader::new().load().unwrap();
     assert!(cfg.pre_send.is_empty());
-    assert!(cfg.post_send.is_empty());
-    assert!(cfg.delivery.is_empty());
-    assert!(cfg.recall.is_empty());
 }
 
 #[test]
@@ -145,16 +142,15 @@ fn all_shipped_hook_profiles_follow_the_strict_contract() {
     }
 }
 
-#[tokio::test]
-async fn social_profile_installs_one_mandatory_pre_send_for_all_chat_tenants() {
+#[test]
+fn social_profile_installs_one_mandatory_pre_send_for_all_chat_tenants() {
     let config = HookConfigLoader::new()
         .add_candidate(profile("hooks.social.toml"))
         .load()
         .unwrap();
     let registry = HookRegistry::new();
     config
-        .install(registry.clone(), &DefaultHookFactory::new().unwrap())
-        .await
+        .install(&registry, &DefaultHookFactory::new().unwrap())
         .unwrap();
     for tenant in ["0", "tenant-a", "tenant-b"] {
         for conversation_type in [
@@ -173,7 +169,7 @@ async fn social_profile_installs_one_mandatory_pre_send_for_all_chat_tenants() {
                 context,
                 HookContextData::new().with_conversation_type(conversation_type),
             ));
-            let plans = registry.plan_pre_send(&ctx).await;
+            let plans = registry.plan_pre_send(&ctx);
             assert_eq!(plans.len(), 1, "{tenant}/{conversation_type}");
             assert_eq!(plans[0].metadata().name.as_ref(), "social-policy-pre-send");
             assert!(plans[0].metadata().require_success);

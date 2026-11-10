@@ -129,6 +129,7 @@ impl ConnectionRepository {
             origin.connection_id(),
         )
         .with_credential_id("signaling-gateway");
+        let identity=if let Some(sid)=origin.identity_session_id() {identity.with_session_id(sid)} else {identity};
         let token = signer.sign(&identity).map_err(|_| {
             ErrorBuilder::new(
                 ErrorCode::PermissionDenied,
@@ -242,6 +243,7 @@ impl IConnectionPort for ConnectionRepository {
                 .build_error()
             })?;
         if request.metadata.get("connection_id").map(String::as_str) != Some(origin.connection_id())
+            || request.metadata.get("identity_session_id").map(String::as_str) != origin.identity_session_id()
         {
             return Err(ErrorBuilder::new(
                 ErrorCode::PermissionDenied,
@@ -424,7 +426,7 @@ impl IConnectionPort for ConnectionRepository {
                 connection_id.to_owned(),
                 user_id.to_owned(),
                 tenant_id.to_owned(),
-            ),
+            ).with_identity_session_id(core_info.metadata.get("identity_session_id").cloned()),
         )))
     }
 }
@@ -566,6 +568,7 @@ mod static_route_tests {
             ("app_build", " 20261104 "),
             ("distribution", "testflight"),
             ("tenant_id", "spoofed"),
+            ("identity_session_id", "spoofed-session"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -581,6 +584,7 @@ mod static_route_tests {
             Some("testflight")
         );
         assert_eq!(metadata.get("tenant_id").map(String::as_str), Some("acme"));
+        assert!(!metadata.contains_key("identity_session_id"));
 
         let link: HashMap<String, String> = [("connection_epoch", "7"), ("access_serial", "0")]
             .into_iter()

@@ -1,6 +1,6 @@
 //! **能力扩展栈装配**（写路径基础设施）：策略后端、`CapabilityGrpcServer`、内建 Resolver。
 //!
-//! 此处仅构建基础注册表与服务；远端插件经 `RegisterPluginEndpoint` 登记，调用 `Dispatch` 时再解析。
+//! 此处仅构建基础注册表与服务；远端插件按授权快照，调用 `Dispatch` 时再解析。
 
 use std::sync::Arc;
 
@@ -45,15 +45,15 @@ pub async fn init_capability_extension_stack(
         runtime_config_file.as_deref(),
     ));
     // 审计随 DB 挂载：没有 DB 就没有审计。这本身是合理的降级（开发期不该被
-    // 强制起一个库），但**不能静默** —— 授权的授予/吊销/租户开关一旦无痕，
+    // 强制起一个库），但**不能静默** —— 租户开关一旦无痕，
     // 计费争议就无从对账，而运维往往到出事才发现这个部署根本没在记。
     let audit = db_pool
         .as_ref()
         .map(|p| Arc::new(PostgresCapabilityAuditLog::new(p.clone())));
     if audit.is_none() {
         tracing::warn!(
-            "capability policy audit is DISABLED (no db_pool): grant / revoke / \
-             tenant_switch will leave no trace. Do not run a billed deployment this way."
+            "capability policy audit is DISABLED (no db_pool): tenant_switch will leave no \
+             trace. Do not run a billed deployment this way."
         );
     }
     let rate_limiter = runtime
@@ -62,6 +62,7 @@ pub async fn init_capability_extension_stack(
         .map(|n| Arc::new(DispatchRateLimiter::new(n)));
     let capability_metrics = Arc::new(CapabilityInvocationMetrics::default());
 
+    let registry_pool = db_pool.clone();
     let capability_policy: Arc<dyn CapabilityPolicyBackend> = if let Some(pool) = db_pool {
         Arc::new(PostgresCapabilityPolicy::new(pool))
     } else {
@@ -88,23 +89,32 @@ pub async fn init_capability_extension_stack(
         dispatch_verifier,
         staff_verifier,
     );
-    match std::env::var("FLARE_PLATFORM_PUBLIC_KEY") {
-        Ok(key) => {
-            capability_grpc = capability_grpc.with_registration_verifier(
-                flare_server_core::TokenService::from_ed25519_public_key(&key, "flare-platform")
-                    .map_err(|_| {
-                        flare_server_core::error::FlareError::system(
-                            "invalid platform registration public key",
-                        )
-                    })?,
-            )
-        }
-        Err(std::env::VarError::NotPresent) => (),
-        Err(_) => {
-            return Err(flare_server_core::error::FlareError::system(
-                "invalid platform registration public key encoding",
-            ));
-        }
+    if let Some(pool) = registry_pool {
+        let cipher = Arc::new(super::plugin_reconcile::config_cipher(&pool).await?);
+        let repository = Arc::new(
+            crate::infrastructure::persistence::postgres_plugin_registry::PostgresPluginRegistry::new(pool)
+                .with_cipher(cipher),
+        );
+        let development =
+            crate::infrastructure::config::plugin_development::plugin_development_enabled();
+        let reconciler = super::plugin_reconcile::reconciler(
+            repository.clone(),
+            plugin_routes.as_ref(),
+            development,
+        );
+        capability_grpc = capability_grpc.with_plugin_registry(
+            repository,
+            crate::infrastructure::config::plugin_publishers::publisher_trust_from_env()?,
+            flare_im_service_kit::control_auth::PlatformAssertionVerifier::from_env().map_err(
+                |_| {
+                    flare_server_core::error::FlareError::system(
+                        "invalid FLARE_PLATFORM_PUBLIC_KEY",
+                    )
+                },
+            )?,
+            development,
+            reconciler,
+        );
     }
 
     tracing::info!("capability extension stack initialized");

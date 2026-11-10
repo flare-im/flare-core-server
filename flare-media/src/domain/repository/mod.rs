@@ -33,6 +33,28 @@ pub trait MessageAttachmentReader: Send + Sync {
 /// 如果需要极致性能，建议改用泛型参数而非 trait 对象。
 #[async_trait::async_trait]
 pub trait MediaObjectRepository: Send + Sync {
+    /// Server-only final write after image validation; this path is never signed for PUT.
+    async fn put_validated_object(
+        &self,
+        object_path: &str,
+        mime_type: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let _ = (object_path, mime_type, bytes);
+        Err(flare_server_core::flare_err!(
+            flare_server_core::error::ErrorCode::OperationNotSupported,
+            "validated object write unavailable"
+        ))
+    }
+    /// Read at most max_bytes + 1 and reject excess data. Used only after an
+    /// authoritative HEAD and declared-size check for administrative images.
+    async fn read_object_bounded(&self, object_path: &str, max_bytes: u64) -> Result<Vec<u8>> {
+        let _ = (object_path, max_bytes);
+        Err(flare_server_core::flare_err!(
+            flare_server_core::error::ErrorCode::OperationNotSupported,
+            "bounded object read unavailable"
+        ))
+    }
     async fn put_object(&self, context: &UploadContext<'_>) -> Result<String>;
     async fn delete_object(&self, object_path: &str) -> Result<()>;
     async fn presign_object(&self, object_path: &str, expires_in: i64) -> Result<String>;

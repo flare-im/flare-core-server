@@ -44,11 +44,10 @@ Each service re-verifies the forwarded token with its own copy of the Cell key s
 | Online `OnlineService.KickDevice` | `core:users:kick` (the session must belong to the signed application) |
 | Online `OnlineService.KickTenant` | `core:tenant:kick` with the signed application equal to the request tenant; or the scheduler's platform assertion (see below). A call with `x-flare-ctx` takes the staff branch, one without takes the scheduler branch; each fails closed on its own key |
 | Capability `CapabilityAdminService.GetTenantRuntime` | `core:tenant:read` |
-| Capability `CapabilityAdminService.ListTenantCapabilitySwitches`, `CapabilityService.{ListCapabilities, ListUserCapabilities}` | `core:capabilities:read` |
-| Capability `CapabilityService.{GrantUserCapability, RevokeUserCapability, SetTenantCapabilitySwitch}` | `core:capabilities:write` |
-| Capability `CapabilityService.ListRegisteredPlugins` | `core:plugins:read`, or a Cell-signed `Service` context whose signed tenant is the request tenant |
-| Capability `CapabilityService.{RegisterPluginEndpoint, DeregisterPluginEndpoint}` | `core:plugins:write` from platform staff (`org_id` absent), or the plugin host's own `Service` context for its own tenant |
-| Capability `CapabilityService.Administer` | `core:hooks:read` for `flare.extension.v1.hook_config.{get, list, get_statistics, query_executions}`, `core:hooks:write` for `{create, update, delete, set_status}`; the code is checked before the payload is decoded, and hook-id operations first resolve the stored configuration's tenant. The in-process governance call gets a context rebuilt from the verified claims (actor type `Staff`, `user_id` = the employee), never from `GenericRequest.metadata` |
+| Capability `CapabilityAdminService.ListTenantCapabilitySwitches`, `CapabilityService.ListCapabilities` | `core:capabilities:read` |
+| Capability `CapabilityService.SetTenantCapabilitySwitch` | `core:capabilities:write` |
+| Capability `CapabilityService.ListRegisteredPlugins` | `core:plugins:read` |
+| Capability `CapabilityService.Administer` | `core:hooks:read` for `flare.extension.v1.hook_config.{get, list, get_statistics, query_executions}`, `hook_point.list` and `hook_profile.list`; `core:hooks:write` (application scope) or `core:hooks:platform:write` (platform scope) for `{create, update, delete, set_status}`; `core:hooks:platform:write` for `hook_config.test`; the code is checked before the payload is decoded, and hook-id operations first resolve the stored configuration's tenant. The in-process governance call gets a context rebuilt from the verified claims (actor type `Staff`, `user_id` = the employee), never from `GenericRequest.metadata` |
 | Storage Reader `StorageReaderService.{SearchMessages, GetMessage, QueryMessageEvents, QueryMessageWriteLedger}` | `core:messages:read` |
 | Storage Reader `StorageReaderService.ExportMessages` | `core:messages:export` |
 

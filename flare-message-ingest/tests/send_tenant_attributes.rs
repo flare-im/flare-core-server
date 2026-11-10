@@ -22,9 +22,7 @@ use flare_im_seq::SequenceAllocator;
 use flare_im_service_kit::metrics::MessageOrchestratorMetrics;
 use flare_message_ingest::application::MessageIngestHandler;
 use flare_message_ingest::application::commands::SendMessageCommand;
-use flare_message_ingest::application::extension::{
-    ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting,
-};
+use flare_message_ingest::application::extension::{ExtensionOrchestrator, ExtensionRouting};
 use flare_message_ingest::config::SessionCreationMode;
 use flare_message_ingest::domain::model::{ConversationType, MessageDefaults};
 use flare_message_ingest::domain::repository::{RecipientRepository, WalRepositoryItem};
@@ -198,20 +196,17 @@ async fn handler(hook: Option<TenantRewritingHook>) -> MessageIngestHandler {
     ));
     let registry = HookRegistry::new();
     if let Some(hook) = hook {
-        registry
-            .register_pre_send(
-                HookMetadata::default().with_name("tenant-rewrite"),
-                HookSelector::default(),
-                Arc::new(hook),
-            )
-            .await;
+        registry.register_pre_send(
+            HookMetadata::default().with_name("tenant-rewrite"),
+            HookSelector::default(),
+            Arc::new(hook),
+        );
     }
     let extension_orchestrator = Arc::new(ExtensionOrchestrator::new(
         Arc::new(HookExecutionService::new(
             Arc::new(HookDispatcher::new(registry)),
             None,
         )),
-        ExtensionPolicy::new(true),
         ExtensionRouting::new(Vec::new(), Vec::new()),
     ));
     MessageIngestHandler::new(

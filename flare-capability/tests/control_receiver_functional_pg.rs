@@ -65,17 +65,18 @@ fn runtime(
     }
 }
 async fn exercise(pool: &PgPool) -> anyhow::Result<()> {
-    // Only the three actual read-model CREATE blocks from the canonical Core
-    // development DDL. Never execute its DROP/default seed/Timescale sections.
+    // Only the actual read-model CREATE blocks from the canonical Core development DDL: the
+    // three this receiver writes, and the two GetVersions also reads (plugin and client policy
+    // projection versions). Never execute its DROP/default seed/Timescale sections.
     let ddl = include_str!("../../deploy/init.sql");
-    for name in [
-        "tenants",
-        "credential_projection_versions",
-        "credential_keys",
+    for head in [
+        "CREATE TABLE tenants (",
+        "CREATE TABLE credential_projection_versions (",
+        "CREATE TABLE credential_keys (",
+        "CREATE TABLE tenant_client_policy (",
+        "CREATE TABLE IF NOT EXISTS plugin_authorization_snapshots (",
     ] {
-        let start = ddl
-            .find(&format!("CREATE TABLE {name} ("))
-            .expect("own canonical projection table");
+        let start = ddl.find(head).expect("own canonical projection table");
         let end = ddl[start..].find("\n);").expect("complete table block") + start + 3;
         sqlx::raw_sql(&ddl[start..end]).execute(pool).await?;
     }

@@ -41,6 +41,13 @@
       "riskLevel": "low"
     }
   ],
+  "features": [
+    {
+      "id": "fetch",
+      "label": { "en-US": "Link preview", "zh-CN": "链接预览" },
+      "gates": { "operations": ["link.preview.v1"] }
+    }
+  ],
   "artifact": {
     "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "signatureRef": "unsigned:local-example"

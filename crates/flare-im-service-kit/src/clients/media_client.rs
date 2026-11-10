@@ -295,6 +295,30 @@ impl MediaServiceClientWrapper {
         Ok(response.into_inner())
     }
 
+    pub async fn get_admin_upload_policy(
+        &mut self,
+        caller: &MediaCaller,
+        request: AdminUploadPolicyRequest,
+    ) -> Result<AdminUploadPolicyResponse> {
+        Ok(self
+            .client
+            .get_admin_upload_policy(caller.request(request)?)
+            .await?
+            .into_inner())
+    }
+
+    pub async fn admin_initiate_direct_upload(
+        &mut self,
+        caller: &MediaCaller,
+        request: AdminInitiateDirectUploadRequest,
+    ) -> Result<InitiateDirectUploadResponse> {
+        Ok(self
+            .client
+            .admin_initiate_direct_upload(caller.request(request)?)
+            .await?
+            .into_inner())
+    }
+
     pub async fn get_direct_upload_status(
         &mut self,
         caller: &MediaCaller,

@@ -1,19 +1,49 @@
 //! # Hook配置PostgreSQL持久化
 //!
-//! 提供Hook配置的数据库存储和查询能力
+//! 控制面的写入与查询。每次写入在同一事务里递增 `hook_config_versions`，Ingest 约每秒查一次、只取
+//! 变了的范围（见 `flare_im_hooks::hooks::HookConfigReloader`）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use flare_server_core::error::{AnyhowContext, FlareError, Result};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
-use crate::domain::model::{HookConfig, HookConfigItem, HookSelectorConfig, HookTransportConfig};
+use crate::domain::model::{HookConfigItem, HookSelectorConfig, HookTransportConfig};
 
 const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
+/// 写入串行化用的咨询锁键。版本号必须按提交顺序递增：Ingest 轮询「版本大于已加载版本」，后提交的
+/// 小版本会被漏掉。Hook 配置写入很少，串行没有代价。
+const HOOK_CONFIG_VERSION_LOCK: i64 = 0x686f_6f6b_5f63_6667;
+
+/// 范围的版本加一：`scope` 为应用，空串为平台（`tenant_id` 为空的行）。在写入事务提交之前调用，锁
+/// 持有到提交。
+async fn bump_config_version(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Option<&str>,
+) -> std::result::Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(HOOK_CONFIG_VERSION_LOCK)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO hook_config_versions (scope, version)
+        SELECT $1, COALESCE(max(version), 0) + 1 FROM hook_config_versions
+        ON CONFLICT (scope) DO UPDATE
+           SET version = EXCLUDED.version,
+               changed_at = CURRENT_TIMESTAMP
+        "#,
+    )
+    .bind(tenant_id.unwrap_or(""))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Hook配置数据库行
 #[derive(Debug, Clone, FromRow)]
@@ -23,14 +53,10 @@ pub struct HookConfigRow {
     pub tenant_id: Option<String>,
     pub hook_type: String,
     pub name: String,
-    pub version: Option<String>,
     pub description: Option<String>,
     pub enabled: bool,
-    pub priority: i32,
-    pub group_name: Option<String>,
+    pub hook_order: i32,
     pub timeout_ms: i64,
-    pub max_retries: i32,
-    pub error_policy: String,
     pub require_success: bool,
     pub selector_config: Value,
     pub transport_config: Value,
@@ -61,14 +87,10 @@ impl TryFrom<HookConfigRow> for HookConfigItem {
 
         Ok(HookConfigItem {
             name: row.name,
-            version: row.version,
             description: row.description,
             enabled: row.enabled,
-            priority: row.priority,
-            group: row.group_name,
+            order: row.hook_order,
             timeout_ms: row.timeout_ms as u64,
-            max_retries: row.max_retries as u32,
-            error_policy: row.error_policy,
             require_success: row.require_success,
             selector,
             transport,
@@ -77,29 +99,14 @@ impl TryFrom<HookConfigRow> for HookConfigItem {
     }
 }
 
-/// 按租户分桶的 Hook 配置行（见 [`PostgresHookConfigRepository::load_by_tenant`]）。
-#[derive(Debug, Clone, Default)]
-pub struct TenantHookRows {
-    /// `tenant_id IS NULL` 的行：对所有租户生效。
-    pub global: HookConfig,
-    /// 各租户自己登记的行，键为 `tenant_id`。
-    pub tenants: HashMap<String, HookConfig>,
-    /// 有行解析失败的租户：调用方沿用该租户上一版配置。
-    pub failed_tenants: HashSet<String>,
-}
-
-/// 把一行按 `hook_type` 放进对应列表（[`HookConfig::list_mut`]，与字段名同一张类型表）；
-/// 未知类型只告警。以前这里逐个列类型、漏了 `get_conversation_participants`，该类行被当成未知类型丢掉。
-fn push_row(config: &mut HookConfig, row: HookConfigRow) -> Result<()> {
-    let hook_type = row.hook_type.clone();
-    let hook_item: HookConfigItem = row.try_into()?;
-    match config.list_mut(&hook_type) {
-        Some(list) => list.push(hook_item),
-        None => {
-            tracing::warn!(hook_type = %hook_type, "Unknown hook type");
-        }
-    }
-    Ok(())
+/// `hook_deployment_summary` 的一行：一个服务装载的部署 Hook。
+#[derive(Debug, Clone, FromRow)]
+pub struct HookDeploymentSummaryRow {
+    pub service: String,
+    pub source: Option<String>,
+    pub hooks: Value,
+    pub instance_id: Option<String>,
+    pub loaded_at: DateTime<Utc>,
 }
 
 /// Hook配置数据库仓储
@@ -151,129 +158,6 @@ impl PostgresHookConfigRepository {
         })
     }
 
-    /// 加载所有启用的Hook配置
-    pub async fn load_all(&self, tenant_id: Option<&str>) -> Result<HookConfig> {
-        let query = if let Some(tenant) = tenant_id {
-            sqlx::query_as::<_, HookConfigRow>(
-                r#"
-                SELECT * FROM hook_configs
-                WHERE enabled = true
-                  AND (tenant_id IS NULL OR tenant_id = $1)
-                ORDER BY hook_type, priority ASC
-                "#,
-            )
-            .bind(tenant)
-            .fetch_all(&*self.pool)
-            .await
-            .map_err(|e| {
-                flare_server_core::error::FlareError::system(format!(
-                    "failed to fetch hook configs: {}",
-                    e
-                ))
-            })?
-        } else {
-            sqlx::query_as::<_, HookConfigRow>(
-                r#"
-                SELECT * FROM hook_configs
-                WHERE enabled = true
-                  AND tenant_id IS NULL
-                ORDER BY hook_type, priority ASC
-                "#,
-            )
-            .fetch_all(&*self.pool)
-            .await
-            .map_err(|e| {
-                flare_server_core::error::FlareError::system(format!(
-                    "failed to fetch hook configs: {}",
-                    e
-                ))
-            })?
-        };
-
-        let mut config = HookConfig::default();
-
-        for row in query {
-            push_row(&mut config, row)?;
-        }
-
-        Ok(config)
-    }
-
-    /// 按租户分桶加载所有启用的 Hook 配置（多租户进程，未设 `TENANT_ID` 时用）。
-    ///
-    /// `tenant_id IS NULL` 的行进全局桶，对所有租户生效；其余每个租户一个桶，只含该租户登记
-    /// 的行。全局行解析失败时整次加载失败（与 [`Self::load_all`] 相同）；某个租户的行解析失败
-    /// 只记入 [`TenantHookRows::failed_tenants`]，不影响其他租户。
-    pub async fn load_by_tenant(&self) -> Result<TenantHookRows> {
-        let rows = sqlx::query_as::<_, HookConfigRow>(
-            r#"
-            SELECT * FROM hook_configs
-            WHERE enabled = true
-            ORDER BY hook_type, priority ASC, id ASC
-            "#,
-        )
-        .fetch_all(&*self.pool)
-        .await
-        .map_err(|e| {
-            flare_server_core::error::FlareError::system(format!(
-                "failed to fetch hook configs: {}",
-                e
-            ))
-        })?;
-
-        let mut loaded = TenantHookRows::default();
-        for row in rows {
-            match row.tenant_id.clone() {
-                None => push_row(&mut loaded.global, row)?,
-                Some(tenant) => {
-                    if loaded.failed_tenants.contains(&tenant) {
-                        continue;
-                    }
-                    let row_id = row.id;
-                    let bucket = loaded.tenants.entry(tenant.clone()).or_default();
-                    if let Err(error) = push_row(bucket, row) {
-                        tracing::error!(
-                            tenant_id = %tenant,
-                            row_id,
-                            %error,
-                            "invalid tenant hook config row; keeping that tenant's previous hooks"
-                        );
-                        loaded.tenants.remove(&tenant);
-                        loaded.failed_tenants.insert(tenant);
-                    }
-                }
-            }
-        }
-        Ok(loaded)
-    }
-
-    /// 只加载一个租户自己登记的启用行（不含全局行），供 Administer 写入后按租户重载。
-    pub async fn load_tenant(&self, tenant_id: &str) -> Result<HookConfig> {
-        let rows = sqlx::query_as::<_, HookConfigRow>(
-            r#"
-            SELECT * FROM hook_configs
-            WHERE enabled = true
-              AND tenant_id = $1
-            ORDER BY hook_type, priority ASC, id ASC
-            "#,
-        )
-        .bind(tenant_id)
-        .fetch_all(&*self.pool)
-        .await
-        .map_err(|e| {
-            flare_server_core::error::FlareError::system(format!(
-                "failed to fetch tenant hook configs: {}",
-                e
-            ))
-        })?;
-
-        let mut config = HookConfig::default();
-        for row in rows {
-            push_row(&mut config, row)?;
-        }
-        Ok(config)
-    }
-
     /// 保存Hook配置
     pub async fn save(
         &self,
@@ -295,52 +179,51 @@ impl PostgresHookConfigRepository {
             )
         };
 
-        let mut tx = self.pool.begin().await.map_err(write_error)?;
-        let row = sqlx::query_as::<_, (i64,)>(
+        // 平台行的 tenant_id 是 NULL，表约束管不到，唯一性在部分索引上。
+        let conflict_target = if tenant_id.is_some() {
+            "(tenant_id, hook_type, name)"
+        } else {
+            "(hook_type, name) WHERE tenant_id IS NULL"
+        };
+        let statement = format!(
             r#"
             INSERT INTO hook_configs (
-                tenant_id, hook_type, name, version, description, enabled,
-                priority, group_name, timeout_ms, max_retries, error_policy,
+                tenant_id, hook_type, name, description, enabled, hook_order, timeout_ms,
                 require_success, selector_config, transport_config, metadata, created_by
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-            ON CONFLICT (tenant_id, hook_type, name)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT {conflict_target}
             DO UPDATE SET
-                version = EXCLUDED.version,
                 description = EXCLUDED.description,
                 enabled = EXCLUDED.enabled,
-                priority = EXCLUDED.priority,
-                group_name = EXCLUDED.group_name,
+                hook_order = EXCLUDED.hook_order,
                 timeout_ms = EXCLUDED.timeout_ms,
-                max_retries = EXCLUDED.max_retries,
-                error_policy = EXCLUDED.error_policy,
                 require_success = EXCLUDED.require_success,
                 selector_config = EXCLUDED.selector_config,
                 transport_config = EXCLUDED.transport_config,
                 metadata = EXCLUDED.metadata,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(hook_type)
-        .bind(&hook_item.name)
-        .bind(&hook_item.version)
-        .bind(&hook_item.description)
-        .bind(hook_item.enabled)
-        .bind(hook_item.priority)
-        .bind(&hook_item.group)
-        .bind(hook_item.timeout_ms as i64)
-        .bind(hook_item.max_retries as i32)
-        .bind(&hook_item.error_policy)
-        .bind(hook_item.require_success)
-        .bind(selector_json)
-        .bind(transport_json)
-        .bind(metadata_json)
-        .bind(created_by)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(write_error)?;
+            "#
+        );
+
+        let mut tx = self.pool.begin().await.map_err(write_error)?;
+        let row = sqlx::query_as::<_, (i64,)>(&statement)
+            .bind(tenant_id)
+            .bind(hook_type)
+            .bind(&hook_item.name)
+            .bind(&hook_item.description)
+            .bind(hook_item.enabled)
+            .bind(hook_item.order)
+            .bind(hook_item.timeout_ms as i64)
+            .bind(hook_item.require_success)
+            .bind(selector_json)
+            .bind(transport_json)
+            .bind(metadata_json)
+            .bind(created_by)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(write_error)?;
 
         flare_im_service_kit::audit_effects::durable::record(
             &mut tx,
@@ -351,6 +234,9 @@ impl PostgresHookConfigRepository {
         )
         .await
         .map_err(write_error)?;
+        bump_config_version(&mut tx, tenant_id)
+            .await
+            .map_err(write_error)?;
         tx.commit().await.map_err(write_error)?;
         Ok(row.0)
     }
@@ -418,7 +304,8 @@ impl PostgresHookConfigRepository {
         }
     }
 
-    /// 有没有该类型、该名字的全局行（`tenant_id IS NULL`，停用的也算）。
+    /// 这个类型、这个名字有没有被平台或部署占用：全局行（`tenant_id IS NULL`，停用的也算），或部署
+    /// 摘要里的 Hook。
     pub async fn global_name_exists(&self, hook_type: &str, name: &str) -> Result<bool> {
         sqlx::query_scalar::<_, bool>(
             r#"
@@ -427,6 +314,12 @@ impl PostgresHookConfigRepository {
                 WHERE tenant_id IS NULL
                   AND hook_type = $1
                   AND name = $2
+            ) OR EXISTS (
+                SELECT 1
+                FROM hook_deployment_summary AS summary,
+                     jsonb_array_elements(summary.hooks) AS hook
+                WHERE hook->>'hook_type' = $1
+                  AND hook->>'name' = $2
             )
             "#,
         )
@@ -461,32 +354,24 @@ impl PostgresHookConfigRepository {
         let tenant = sqlx::query_scalar::<_, Option<String>>(
             r#"
             UPDATE hook_configs
-            SET version = $1,
-                description = $2,
-                enabled = $3,
-                priority = $4,
-                group_name = $5,
-                timeout_ms = $6,
-                max_retries = $7,
-                error_policy = $8,
-                require_success = $9,
-                selector_config = $10,
-                transport_config = $11,
-                metadata = $12,
-                name = $14,
+            SET description = $1,
+                enabled = $2,
+                hook_order = $3,
+                timeout_ms = $4,
+                require_success = $5,
+                selector_config = $6,
+                transport_config = $7,
+                metadata = $8,
+                name = $10,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $13
+            WHERE id = $9
             RETURNING tenant_id
             "#,
         )
-        .bind(&hook_item.version)
         .bind(&hook_item.description)
         .bind(hook_item.enabled)
-        .bind(hook_item.priority)
-        .bind(&hook_item.group)
+        .bind(hook_item.order)
         .bind(hook_item.timeout_ms as i64)
-        .bind(hook_item.max_retries as i32)
-        .bind(&hook_item.error_policy)
         .bind(hook_item.require_success)
         .bind(selector_json)
         .bind(transport_json)
@@ -507,6 +392,9 @@ impl PostgresHookConfigRepository {
             )
             .await
             .map_err(write_error)?;
+            bump_config_version(&mut tx, tenant.as_deref())
+                .await
+                .map_err(write_error)?;
         }
         tx.commit().await.map_err(write_error)?;
         Ok(tenant.is_some())
@@ -551,6 +439,9 @@ impl PostgresHookConfigRepository {
             )
             .await
             .map_err(write_error)?;
+            bump_config_version(&mut tx, tenant.as_deref())
+                .await
+                .map_err(write_error)?;
         }
         tx.commit().await.map_err(write_error)?;
         Ok(tenant.is_some())
@@ -590,6 +481,9 @@ impl PostgresHookConfigRepository {
             )
             .await
             .map_err(write_error)?;
+            bump_config_version(&mut tx, tenant_id)
+                .await
+                .map_err(write_error)?;
         }
         tx.commit().await.map_err(write_error)?;
         Ok(id.is_some())
@@ -615,101 +509,61 @@ impl PostgresHookConfigRepository {
             )
             .await
             .map_err(write_error)?;
+            bump_config_version(&mut tx, tenant.as_deref())
+                .await
+                .map_err(write_error)?;
         }
         tx.commit().await.map_err(write_error)?;
         Ok(tenant.is_some())
     }
 
-    /// 查询Hook配置（支持过滤）
+    /// 一个范围自己的 Hook：`tenant_id` 为应用，`None` 为平台。应用的列表不含平台行，平台 Hook 的目标
+    /// 不给应用看。
     pub async fn query(
         &self,
         tenant_id: Option<&str>,
         hook_type: Option<&str>,
         enabled_only: bool,
     ) -> Result<Vec<HookConfigRow>> {
-        let rows = if let Some(tenant) = tenant_id {
-            if enabled_only {
-                sqlx::query_as::<_, HookConfigRow>(
-                    r#"
-                    SELECT * FROM hook_configs
-                    WHERE enabled = true
-                      AND (tenant_id IS NULL OR tenant_id = $1)
-                      AND ($2::TEXT IS NULL OR hook_type = $2)
-                    ORDER BY hook_type, priority ASC
-                    "#,
-                )
-                .bind(tenant)
-                .bind(hook_type)
-                .fetch_all(&*self.pool)
-                .await
-                .map_err(|e| {
-                    flare_server_core::error::FlareError::system(format!(
-                        "failed to query hook configs: {}",
-                        e
-                    ))
-                })?
-            } else {
-                sqlx::query_as::<_, HookConfigRow>(
-                    r#"
-                    SELECT * FROM hook_configs
-                    WHERE (tenant_id IS NULL OR tenant_id = $1)
-                      AND ($2::TEXT IS NULL OR hook_type = $2)
-                    ORDER BY hook_type, priority ASC
-                    "#,
-                )
-                .bind(tenant)
-                .bind(hook_type)
-                .fetch_all(&*self.pool)
-                .await
-                .map_err(|e| {
-                    flare_server_core::error::FlareError::system(format!(
-                        "failed to query hook configs: {}",
-                        e
-                    ))
-                })?
-            }
-        } else {
-            if enabled_only {
-                sqlx::query_as::<_, HookConfigRow>(
-                    r#"
-                    SELECT * FROM hook_configs
-                    WHERE enabled = true
-                      AND tenant_id IS NULL
-                      AND ($1::TEXT IS NULL OR hook_type = $1)
-                    ORDER BY hook_type, priority ASC
-                    "#,
-                )
-                .bind(hook_type)
-                .fetch_all(&*self.pool)
-                .await
-                .map_err(|e| {
-                    flare_server_core::error::FlareError::system(format!(
-                        "failed to query hook configs: {}",
-                        e
-                    ))
-                })?
-            } else {
-                sqlx::query_as::<_, HookConfigRow>(
-                    r#"
-                    SELECT * FROM hook_configs
-                    WHERE tenant_id IS NULL
-                      AND ($1::TEXT IS NULL OR hook_type = $1)
-                    ORDER BY hook_type, priority ASC
-                    "#,
-                )
-                .bind(hook_type)
-                .fetch_all(&*self.pool)
-                .await
-                .map_err(|e| {
-                    flare_server_core::error::FlareError::system(format!(
-                        "failed to query hook configs: {}",
-                        e
-                    ))
-                })?
-            }
-        };
+        sqlx::query_as::<_, HookConfigRow>(
+            r#"
+            SELECT * FROM hook_configs
+            WHERE tenant_id IS NOT DISTINCT FROM $1
+              AND ($2::TEXT IS NULL OR hook_type = $2)
+              AND (NOT $3 OR enabled)
+            ORDER BY hook_type, hook_order ASC, id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(hook_type)
+        .bind(enabled_only)
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| {
+            flare_server_core::error::FlareError::system(format!(
+                "failed to query hook configs: {}",
+                e
+            ))
+        })
+    }
 
-        Ok(rows)
+    /// 部署摘要，每个服务一行。
+    pub async fn deployment_summaries(&self) -> Result<Vec<HookDeploymentSummaryRow>> {
+        sqlx::query_as::<_, HookDeploymentSummaryRow>(
+            r#"
+            SELECT service, source, hooks, instance_id, loaded_at
+            FROM hook_deployment_summary
+            ORDER BY service
+            "#,
+        )
+        .fetch_all(&*self.pool)
+        .await
+        .map_err(|e| {
+            flare_server_core::error::FlareError::system(format!(
+                "failed to read hook deployment summary: {}",
+                e
+            ))
+        })
     }
 }
 
@@ -724,54 +578,5 @@ impl PostgresHookConfigRepository {
         Self {
             pool: Arc::new(pool),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(hook_type: &str, name: &str) -> HookConfigRow {
-        HookConfigRow {
-            id: 1,
-            hook_id: None,
-            tenant_id: Some("tenant-a".into()),
-            hook_type: hook_type.into(),
-            name: name.into(),
-            version: None,
-            description: None,
-            enabled: true,
-            priority: 100,
-            group_name: None,
-            timeout_ms: 500,
-            max_retries: 0,
-            error_policy: "fail_fast".into(),
-            require_success: true,
-            selector_config: serde_json::json!({}),
-            transport_config: serde_json::json!({"type": "local", "target": "noop"}),
-            metadata: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            created_by: None,
-        }
-    }
-
-    /// 修复前 `push_row` 逐个列类型、漏了 `get_conversation_participants`：这类行被当成未知类型
-    /// 丢掉，库里登记的该类 Hook 永远加载不到。
-    #[test]
-    fn conversation_participants_rows_are_loaded() {
-        let mut config = HookConfig::default();
-        push_row(
-            &mut config,
-            row("get_conversation_participants", "participants"),
-        )
-        .unwrap();
-        push_row(&mut config, row("pre_send", "gate")).unwrap();
-        push_row(&mut config, row("message_read", "not-a-config-list")).unwrap();
-        assert_eq!(config.get_conversation_participants.len(), 1);
-        assert_eq!(config.get_conversation_participants[0].name, "participants");
-        assert_eq!(config.pre_send.len(), 1);
-        // 没有对应列表的类型仍只告警、不装。
-        assert_eq!(config.hook_count(), 2);
     }
 }

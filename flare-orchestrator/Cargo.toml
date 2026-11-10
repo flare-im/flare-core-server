@@ -40,7 +40,6 @@ flare-im-contracts = { workspace = true }
 flare-im-message-pipeline = { workspace = true }
 flare-im-service-kit = { workspace = true }
 flare-im-seq = { workspace = true }
-flare-im-hooks = { workspace = true }
 
 [dev-dependencies]
 # Signed test contexts (a throwaway Ed25519 key per test) for the message operation policy.

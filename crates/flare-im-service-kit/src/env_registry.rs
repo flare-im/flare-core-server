@@ -237,12 +237,6 @@ pub const REGISTERED_ENV_VARS: &[EnvVarSpec] = &[
         EnvPurpose::ConfigPath,
     ),
     env(
-        "CONFIG_CENTER_ENDPOINT",
-        EnvOwner::Capability,
-        EnvPurpose::ServiceEndpoint,
-    ),
-    env("CONFIG_FILE", EnvOwner::Capability, EnvPurpose::ConfigPath),
-    env(
         "CONVERSATION_CONFLICT_RESOLUTION",
         EnvOwner::Conversation,
         EnvPurpose::RuntimeTuning,
@@ -401,9 +395,37 @@ pub const REGISTERED_ENV_VARS: &[EnvVarSpec] = &[
         EnvPurpose::Redis,
     ),
     env(
+        "FLARE_TENANT_NOTICE_PUBLISHERS",
+        EnvOwner::Capability,
+        EnvPurpose::Auth,
+    ),
+    env(
+        "FLARE_NOTICE_REFRESH_RPS_PER_NODE",
+        EnvOwner::AccessGateway,
+        EnvPurpose::RuntimeTuning,
+    ),
+    env(
         "FLARE_PLUGIN_CARD_INGEST_URL",
         EnvOwner::Capability,
         EnvPurpose::ServiceEndpoint,
+    ),
+    env(
+        "FLARE_PLUGIN_PUBLISHER_KEYS",
+        EnvOwner::Capability,
+        EnvPurpose::Auth,
+    ),
+    // `<kid>:<base64 32 bytes>`, comma separated while rotating. Required once a stored plugin
+    // configuration holds a secret value; the value is never logged.
+    env(
+        "FLARE_PLUGIN_CONFIG_KEY",
+        EnvOwner::Capability,
+        EnvPurpose::Auth,
+    ),
+    // Local plugin development only. Release builds and deployment templates never set it.
+    env(
+        "FLARE_PLUGIN_DEV_MODE",
+        EnvOwner::Capability,
+        EnvPurpose::TestOnly,
     ),
     env(
         "FLARE_PLUGIN_CALL_PUBLIC_KEYS",
@@ -908,9 +930,9 @@ pub const REGISTERED_ENV_VARS: &[EnvVarSpec] = &[
         EnvPurpose::ServiceEndpoint,
     ),
     env(
-        "MESSAGE_INGEST_CAPABILITY_HOOKS_AUTO",
+        "MESSAGE_INGEST_RUNTIME_CONFIG_FILE",
         EnvOwner::MessageIngest,
-        EnvPurpose::RuntimeTuning,
+        EnvPurpose::ConfigPath,
     ),
     env(
         "MESSAGE_INGEST_DEFAULT_BUSINESS_TYPE",
@@ -934,26 +956,6 @@ pub const REGISTERED_ENV_VARS: &[EnvVarSpec] = &[
     ),
     env(
         "MESSAGE_INGEST_EXTENSION_HOOK_MESSAGE_TYPE_ALLOWLIST",
-        EnvOwner::MessageIngest,
-        EnvPurpose::RuntimeTuning,
-    ),
-    env(
-        "MESSAGE_INGEST_EXTENSION_POST_SEND_FAIL_OPEN",
-        EnvOwner::MessageIngest,
-        EnvPurpose::RuntimeTuning,
-    ),
-    env(
-        "MESSAGE_INGEST_EXTENSION_POST_SEND_RETRY",
-        EnvOwner::MessageIngest,
-        EnvPurpose::RuntimeTuning,
-    ),
-    env(
-        "MESSAGE_INGEST_EXTENSION_POST_SEND_TIMEOUT_MS",
-        EnvOwner::MessageIngest,
-        EnvPurpose::RuntimeTuning,
-    ),
-    env(
-        "MESSAGE_INGEST_EXTENSION_PRE_SEND_RETRY",
         EnvOwner::MessageIngest,
         EnvPurpose::RuntimeTuning,
     ),
@@ -1760,11 +1762,6 @@ pub const REGISTERED_ENV_VARS: &[EnvVarSpec] = &[
         "STORAGE_WRITER_METRICS_PORT",
         EnvOwner::Storage,
         EnvPurpose::Observability,
-    ),
-    env(
-        "TENANT_ID",
-        EnvOwner::Capability,
-        EnvPurpose::TenantDefaults,
     ),
     env(
         "ACCESS_GATEWAY_MAX_HANDSHAKE_CONCURRENCY",

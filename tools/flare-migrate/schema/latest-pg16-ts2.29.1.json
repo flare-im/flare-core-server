@@ -138,17 +138,6 @@
     },
     {
       "collation": "default",
-      "default": "''::text",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "api_version",
-      "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text"
-    },
-    {
-      "collation": "default",
       "default": null,
       "generated": "",
       "identity": "",
@@ -199,8 +188,41 @@
       "kind": "column",
       "name": "app_id",
       "not_null": true,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "app_id",
+      "not_null": true,
       "table": "plugin_authorization_snapshots",
       "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "app_id",
+      "not_null": true,
+      "table": "plugin_dev_apps",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::jsonb",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "approved",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "jsonb"
     },
     {
       "collation": null,
@@ -223,6 +245,17 @@
       "not_null": true,
       "table": "ack_archive_records",
       "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "artifact_digest",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "text"
     },
     {
       "collation": null,
@@ -300,6 +333,17 @@
       "not_null": false,
       "table": "conversations",
       "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "binding_id",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "character varying(128)"
     },
     {
       "collation": null,
@@ -406,6 +450,17 @@
       "generated": "",
       "identity": "",
       "kind": "column",
+      "name": "bytes",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "bytea"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
       "name": "calls",
       "not_null": true,
       "table": "capability_plugin_resource_calls",
@@ -430,29 +485,7 @@
       "kind": "column",
       "name": "capability_id",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "capability_id",
-      "not_null": true,
       "table": "capability_tenant_switches",
-      "type": "text"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "capability_id",
-      "not_null": true,
-      "table": "capability_user_grants",
       "type": "text"
     },
     {
@@ -474,8 +507,30 @@
       "kind": "column",
       "name": "changed_at",
       "not_null": true,
+      "table": "hook_config_versions",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "CURRENT_TIMESTAMP",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "changed_at",
+      "not_null": true,
       "table": "message_visibility",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "changelog",
+      "not_null": false,
+      "table": "plugin_versions",
+      "type": "text"
     },
     {
       "collation": "default",
@@ -927,6 +982,28 @@
       "not_null": false,
       "table": "tenants",
       "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::jsonb",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "configuration",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "jsonb"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "configured",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
     },
     {
       "collation": null,
@@ -1876,6 +1953,39 @@
     },
     {
       "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "created_at",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "created_at",
+      "not_null": true,
+      "table": "plugin_dev_apps",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "created_at",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
       "default": "CURRENT_TIMESTAMP",
       "generated": "",
       "identity": "",
@@ -2447,17 +2557,6 @@
       "type": "double precision"
     },
     {
-      "collation": "default",
-      "default": "'{}'::text[]",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "declared_operations",
-      "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text[]"
-    },
-    {
       "collation": null,
       "default": null,
       "generated": "",
@@ -2478,6 +2577,28 @@
       "not_null": false,
       "table": "messages",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "deployment_id",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "deployment_id",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "character varying(128)"
     },
     {
       "collation": "default",
@@ -2524,6 +2645,17 @@
       "type": "jsonb"
     },
     {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "development",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "boolean"
+    },
+    {
       "collation": "default",
       "default": null,
       "generated": "",
@@ -2533,6 +2665,28 @@
       "not_null": false,
       "table": "user_sync_cursor",
       "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "digest",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "display_name",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "character varying(160)"
     },
     {
       "collation": "default",
@@ -3009,6 +3163,17 @@
     },
     {
       "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "enabled",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -3085,15 +3250,15 @@
       "type": "text"
     },
     {
-      "collation": "default",
-      "default": "'fail_fast'::text",
+      "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "error_policy",
+      "name": "event_active_since_ms",
       "not_null": true,
-      "table": "hook_configs",
-      "type": "text"
+      "table": "plugin_app_states",
+      "type": "bigint"
     },
     {
       "collation": null,
@@ -3180,17 +3345,6 @@
       "kind": "column",
       "name": "expires_at",
       "not_null": false,
-      "table": "capability_user_grants",
-      "type": "timestamp with time zone"
-    },
-    {
-      "collation": null,
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "expires_at",
-      "not_null": false,
       "table": "media_references",
       "type": "timestamp with time zone"
     },
@@ -3203,6 +3357,17 @@
       "name": "expires_at_ms",
       "not_null": true,
       "table": "capability_plugin_resource_calls",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "export_until_ms",
+      "not_null": false,
+      "table": "plugin_app_states",
       "type": "bigint"
     },
     {
@@ -3248,6 +3413,17 @@
       "not_null": false,
       "table": "message_write_ledger",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": null,
+      "default": "'{}'::jsonb",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "features",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "jsonb"
     },
     {
       "collation": "default",
@@ -3360,28 +3536,6 @@
       "type": "timestamp with time zone"
     },
     {
-      "collation": null,
-      "default": "CURRENT_TIMESTAMP",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "granted_at",
-      "not_null": true,
-      "table": "capability_user_grants",
-      "type": "timestamp with time zone"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "group_name",
-      "not_null": false,
-      "table": "hook_configs",
-      "type": "text"
-    },
-    {
       "collation": "default",
       "default": null,
       "generated": "",
@@ -3389,8 +3543,19 @@
       "kind": "column",
       "name": "grpc_authority",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
+      "table": "plugin_deployments",
       "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "healthy_until_ms",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "bigint"
     },
     {
       "collation": null,
@@ -3413,6 +3578,17 @@
       "not_null": true,
       "table": "conversations",
       "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "holder",
+      "not_null": true,
+      "table": "plugin_reconcile_lease",
+      "type": "text"
     },
     {
       "collation": "default",
@@ -3448,6 +3624,17 @@
       "type": "text"
     },
     {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "hook_order",
+      "not_null": true,
+      "table": "hook_configs",
+      "type": "integer"
+    },
+    {
       "collation": "default",
       "default": null,
       "generated": "",
@@ -3479,6 +3666,17 @@
       "not_null": false,
       "table": "hook_executions",
       "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "'[]'::jsonb",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "hooks",
+      "not_null": true,
+      "table": "hook_deployment_summary",
+      "type": "jsonb"
     },
     {
       "collation": null,
@@ -3609,6 +3807,17 @@
       "kind": "column",
       "name": "id",
       "not_null": true,
+      "table": "plugin_reconcile_lease",
+      "type": "integer"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "id",
+      "not_null": true,
       "table": "capability_service_settings",
       "type": "smallint"
     },
@@ -3644,6 +3853,17 @@
       "not_null": true,
       "table": "ack_archive_records",
       "type": "smallint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "instance_id",
+      "not_null": false,
+      "table": "hook_deployment_summary",
+      "type": "text"
     },
     {
       "collation": null,
@@ -3734,15 +3954,26 @@
       "type": "character varying(12)"
     },
     {
-      "collation": null,
-      "default": "'{}'::jsonb",
+      "collation": "default",
+      "default": null,
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "labels",
+      "name": "key_id",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "jsonb"
+      "table": "plugin_versions",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "kind",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "text"
     },
     {
       "collation": "default",
@@ -3753,6 +3984,17 @@
       "name": "last_error",
       "not_null": false,
       "table": "message_write_ledger",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "last_error",
+      "not_null": false,
+      "table": "plugin_deployments",
       "type": "text"
     },
     {
@@ -3776,17 +4018,6 @@
       "not_null": false,
       "table": "tenant_notice_outbox",
       "type": "text"
-    },
-    {
-      "collation": null,
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "last_healthy_at",
-      "not_null": false,
-      "table": "capability_plugin_endpoints",
-      "type": "timestamp with time zone"
     },
     {
       "collation": null,
@@ -3911,6 +4142,17 @@
     },
     {
       "collation": "default",
+      "default": "'pending'::text",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "lifecycle",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
       "default": "'active'::text",
       "generated": "",
       "identity": "",
@@ -3921,14 +4163,58 @@
       "type": "text"
     },
     {
-      "collation": "default",
-      "default": "''::text",
+      "collation": null,
+      "default": "CURRENT_TIMESTAMP",
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "manifest_sha256",
+      "name": "loaded_at",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
+      "table": "hook_deployment_summary",
+      "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "manifest_digest",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "manifest_digest",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "manifest_digest",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "manifest_json",
+      "not_null": true,
+      "table": "plugin_versions",
       "type": "text"
     },
     {
@@ -3954,17 +4240,6 @@
       "type": "timestamp with time zone"
     },
     {
-      "collation": null,
-      "default": "0",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "max_retries",
-      "not_null": true,
-      "table": "hook_configs",
-      "type": "integer"
-    },
-    {
       "collation": "default",
       "default": null,
       "generated": "",
@@ -3974,6 +4249,17 @@
       "not_null": false,
       "table": "media_assets",
       "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "media_type",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "character varying(64)"
     },
     {
       "collation": null,
@@ -4258,6 +4544,17 @@
       "kind": "column",
       "name": "namespace",
       "not_null": true,
+      "table": "plugin_namespaces",
+      "type": "character varying(192)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "namespace",
+      "not_null": true,
       "table": "media_references",
       "type": "text"
     },
@@ -4351,6 +4648,17 @@
     },
     {
       "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "offline_hold",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -4406,6 +4714,28 @@
     },
     {
       "collation": "default",
+      "default": "''::character varying",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "organization_id",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "owned",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
+    },
+    {
+      "collation": "default",
       "default": null,
       "generated": "",
       "identity": "",
@@ -4424,6 +4754,17 @@
       "name": "owner_id",
       "not_null": true,
       "table": "media_references",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": "'user'::text",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "owner_kind",
+      "not_null": true,
+      "table": "media_assets",
       "type": "text"
     },
     {
@@ -4447,6 +4788,17 @@
       "not_null": true,
       "table": "threads",
       "type": "integer"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "path",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "character varying(256)"
     },
     {
       "collation": null,
@@ -4542,10 +4894,10 @@
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "plan_code",
-      "not_null": false,
-      "table": "capability_user_grants",
-      "type": "text"
+      "name": "plugin_id",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "character varying(128)"
     },
     {
       "collation": "default",
@@ -4555,8 +4907,41 @@
       "kind": "column",
       "name": "plugin_id",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text"
+      "table": "plugin_deployments",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_id",
+      "not_null": true,
+      "table": "plugin_namespaces",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_id",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "character varying(128)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_id",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "character varying(128)"
     },
     {
       "collation": "default",
@@ -4604,14 +4989,47 @@
     },
     {
       "collation": "default",
-      "default": "''::text",
+      "default": null,
       "generated": "",
       "identity": "",
       "kind": "column",
       "name": "plugin_version",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text"
+      "table": "plugin_app_states",
+      "type": "character varying(64)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_version",
+      "not_null": true,
+      "table": "plugin_deployments",
+      "type": "character varying(64)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_version",
+      "not_null": true,
+      "table": "plugin_version_assets",
+      "type": "character varying(64)"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "plugin_version",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "character varying(64)"
     },
     {
       "collation": null,
@@ -4623,17 +5041,6 @@
       "not_null": false,
       "table": "conversations",
       "type": "jsonb"
-    },
-    {
-      "collation": null,
-      "default": "100",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "priority",
-      "not_null": true,
-      "table": "hook_configs",
-      "type": "integer"
     },
     {
       "collation": null,
@@ -4663,10 +5070,54 @@
       "generated": "",
       "identity": "",
       "kind": "column",
+      "name": "projected_revision",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "published",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
       "name": "published_version",
       "not_null": true,
       "table": "plugin_entity_bindings",
       "type": "bigint"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "publisher_id",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "character varying(192)"
+    },
+    {
+      "collation": "default",
+      "default": "'general'::text",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "purpose",
+      "not_null": true,
+      "table": "media_assets",
+      "type": "text"
     },
     {
       "collation": null,
@@ -4700,6 +5151,17 @@
       "not_null": true,
       "table": "message_read_records",
       "type": "timestamp with time zone"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "readme",
+      "not_null": false,
+      "table": "plugin_versions",
+      "type": "text"
     },
     {
       "collation": "default",
@@ -4766,17 +5228,6 @@
       "not_null": true,
       "table": "media_references",
       "type": "text"
-    },
-    {
-      "collation": null,
-      "default": "now()",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "registered_at",
-      "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "timestamp with time zone"
     },
     {
       "collation": null,
@@ -4900,6 +5351,39 @@
       "type": "timestamp with time zone"
     },
     {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "revision",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "revision",
+      "not_null": true,
+      "table": "plugin_registry_revisions",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "revoked",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "boolean"
+    },
+    {
       "collation": "default",
       "default": "'{}'::text[]",
       "generated": "",
@@ -4956,6 +5440,116 @@
     },
     {
       "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_attempts",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "integer"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_configuration",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "jsonb"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_configuration_digest",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_enabled",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_enabled_digest",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_error",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_error_detail",
+      "not_null": false,
+      "table": "plugin_app_states",
+      "type": "text"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_healthy_until_ms",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_next_attempt_ms",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "0",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "runtime_revision",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
       "default": "1",
       "generated": "",
       "identity": "",
@@ -4989,13 +5583,24 @@
     },
     {
       "collation": "default",
-      "default": "''::text",
+      "default": null,
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "seat_model",
+      "name": "scope",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
+      "table": "hook_config_versions",
+      "type": "text"
+    },
+    {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "scope",
+      "not_null": true,
+      "table": "plugin_registry_revisions",
       "type": "text"
     },
     {
@@ -5868,6 +6473,17 @@
       "type": "text"
     },
     {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "service",
+      "not_null": true,
+      "table": "hook_deployment_summary",
+      "type": "text"
+    },
+    {
       "collation": null,
       "default": "0",
       "generated": "",
@@ -5912,6 +6528,17 @@
       "type": "boolean"
     },
     {
+      "collation": "default",
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "signature",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "character varying(128)"
+    },
+    {
       "collation": null,
       "default": null,
       "generated": "",
@@ -5941,7 +6568,7 @@
       "kind": "column",
       "name": "source",
       "not_null": false,
-      "table": "capability_user_grants",
+      "table": "hook_deployment_summary",
       "type": "text"
     },
     {
@@ -6034,6 +6661,28 @@
     },
     {
       "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "suspended",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
+      "default": "false",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "suspended",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "boolean"
+    },
+    {
+      "collation": null,
       "default": null,
       "generated": "",
       "identity": "",
@@ -6106,17 +6755,6 @@
       "kind": "column",
       "name": "tenant_id",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "text"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "tenant_id",
-      "not_null": true,
       "table": "capability_plugin_resource_calls",
       "type": "text"
     },
@@ -6129,17 +6767,6 @@
       "name": "tenant_id",
       "not_null": true,
       "table": "capability_tenant_switches",
-      "type": "text"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "tenant_id",
-      "not_null": true,
-      "table": "capability_user_grants",
       "type": "text"
     },
     {
@@ -6995,10 +7622,32 @@
       "generated": "",
       "identity": "",
       "kind": "column",
-      "name": "unverified",
+      "name": "until_ms",
       "not_null": true,
-      "table": "capability_plugin_endpoints",
-      "type": "boolean"
+      "table": "plugin_reconcile_lease",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "updated_at",
+      "not_null": true,
+      "table": "plugin_app_states",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": "((EXTRACT(epoch FROM clock_timestamp()) * (1000)::numeric))::bigint",
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "updated_at",
+      "not_null": true,
+      "table": "plugin_versions",
+      "type": "bigint"
     },
     {
       "collation": null,
@@ -7009,17 +7658,6 @@
       "name": "updated_at",
       "not_null": false,
       "table": "alert_rules",
-      "type": "timestamp with time zone"
-    },
-    {
-      "collation": null,
-      "default": "now()",
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "updated_at",
-      "not_null": true,
-      "table": "capability_plugin_endpoints",
       "type": "timestamp with time zone"
     },
     {
@@ -7217,17 +7855,6 @@
       "kind": "column",
       "name": "user_id",
       "not_null": true,
-      "table": "capability_user_grants",
-      "type": "text"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "user_id",
-      "not_null": true,
       "table": "conversation_participants",
       "type": "text"
     },
@@ -7349,6 +7976,17 @@
       "kind": "column",
       "name": "version",
       "not_null": true,
+      "table": "hook_config_versions",
+      "type": "bigint"
+    },
+    {
+      "collation": null,
+      "default": null,
+      "generated": "",
+      "identity": "",
+      "kind": "column",
+      "name": "version",
+      "not_null": true,
       "table": "message_plugin_states",
       "type": "bigint"
     },
@@ -7406,17 +8044,6 @@
       "not_null": false,
       "table": "user_sync_cursor",
       "type": "integer"
-    },
-    {
-      "collation": "default",
-      "default": null,
-      "generated": "",
-      "identity": "",
-      "kind": "column",
-      "name": "version",
-      "not_null": false,
-      "table": "hook_configs",
-      "type": "text"
     },
     {
       "collation": null,
@@ -7526,96 +8153,6 @@
     {
       "deferrable": false,
       "deferred": false,
-      "definition": "CHECK (((char_length(grpc_authority) >= 1) AND (char_length(grpc_authority) <= 512)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_authority_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((char_length(capability_id) >= 1) AND (char_length(capability_id) <= 128)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_capability_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((jsonb_typeof(labels) = 'object'::text) AND (octet_length((labels)::text) <= 16384)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_labels_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((char_length(plugin_version) <= 64) AND (char_length(api_version) <= 64) AND (char_length(manifest_sha256) <= 128) AND (char_length(seat_model) <= 32)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_manifest_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((cardinality(declared_operations) <= 256) AND (array_position(declared_operations, NULL::text) IS NULL)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_operations_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "PRIMARY KEY (tenant_id, plugin_id)",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_pkey",
-      "table": "capability_plugin_endpoints",
-      "type": "p",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK (((char_length(plugin_id) >= 1) AND (char_length(plugin_id) <= 128)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_plugin_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((((char_length(tenant_id) >= 1) AND (char_length(tenant_id) <= 256)) AND (tenant_id <> '*'::text)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_tenant_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "CHECK ((unverified = (cardinality(declared_operations) = 0)))",
-      "kind": "constraint",
-      "name": "capability_plugin_endpoints_unverified_check",
-      "table": "capability_plugin_endpoints",
-      "type": "c",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
       "definition": "CHECK (((char_length(actor_id) >= 1) AND (char_length(actor_id) <= 192)))",
       "kind": "constraint",
       "name": "capability_plugin_resource_calls_actor_id_check",
@@ -7710,16 +8247,6 @@
       "kind": "constraint",
       "name": "capability_tenant_switches_pkey",
       "table": "capability_tenant_switches",
-      "type": "p",
-      "validated": true
-    },
-    {
-      "deferrable": false,
-      "deferred": false,
-      "definition": "PRIMARY KEY (tenant_id, user_id, capability_id)",
-      "kind": "constraint",
-      "name": "capability_user_grants_pkey",
-      "table": "capability_user_grants",
       "type": "p",
       "validated": true
     },
@@ -7876,6 +8403,26 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "PRIMARY KEY (scope)",
+      "kind": "constraint",
+      "name": "hook_config_versions_pkey",
+      "table": "hook_config_versions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((version > 0))",
+      "kind": "constraint",
+      "name": "hook_config_versions_version_check",
+      "table": "hook_config_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "UNIQUE (hook_id)",
       "kind": "constraint",
       "name": "hook_configs_hook_id_key",
@@ -7901,6 +8448,16 @@
       "name": "hook_configs_tenant_id_hook_type_name_key",
       "table": "hook_configs",
       "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (service)",
+      "kind": "constraint",
+      "name": "hook_deployment_summary_pkey",
+      "table": "hook_deployment_summary",
+      "type": "p",
       "validated": true
     },
     {
@@ -7946,11 +8503,41 @@
     {
       "deferrable": false,
       "deferred": false,
+      "definition": "CHECK (((owner_kind <> 'application'::text) OR ((owner_id IS NOT NULL) AND (owner_id = tenant_id))))",
+      "kind": "constraint",
+      "name": "media_assets_application_owner",
+      "table": "media_assets",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((owner_kind = ANY (ARRAY['user'::text, 'application'::text])))",
+      "kind": "constraint",
+      "name": "media_assets_owner_kind_check",
+      "table": "media_assets",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
       "definition": "PRIMARY KEY (tenant_id, file_id)",
       "kind": "constraint",
       "name": "media_assets_pkey",
       "table": "media_assets",
       "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((purpose = ANY (ARRAY['general'::text, 'avatar'::text, 'image'::text])))",
+      "kind": "constraint",
+      "name": "media_assets_purpose_check",
+      "table": "media_assets",
+      "type": "c",
       "validated": true
     },
     {
@@ -8538,6 +9125,136 @@
       "deferred": false,
       "definition": "CHECK ((app_id ~ '^[0-9A-Za-z_-]{1,32}$'::text))",
       "kind": "constraint",
+      "name": "plugin_app_states_app_id_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((jsonb_typeof(approved) = 'object'::text))",
+      "kind": "constraint",
+      "name": "plugin_app_states_approved_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((jsonb_typeof(configuration) = 'object'::text) AND (octet_length((configuration)::text) <= 32768)))",
+      "kind": "constraint",
+      "name": "plugin_app_states_configuration_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (deployment_id) REFERENCES plugin_deployments(deployment_id)",
+      "kind": "constraint",
+      "name": "plugin_app_states_deployment_id_fkey",
+      "table": "plugin_app_states",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((jsonb_typeof(features) = 'object'::text))",
+      "kind": "constraint",
+      "name": "plugin_app_states_features_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((lifecycle = ANY (ARRAY['pending'::text, 'installed'::text, 'uninstalled'::text, 'revoked'::text, 'failed'::text])))",
+      "kind": "constraint",
+      "name": "plugin_app_states_lifecycle_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (app_id, binding_id)",
+      "kind": "constraint",
+      "name": "plugin_app_states_pkey",
+      "table": "plugin_app_states",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (plugin_id, plugin_version, manifest_digest) REFERENCES plugin_versions(plugin_id, plugin_version, manifest_digest)",
+      "kind": "constraint",
+      "name": "plugin_app_states_plugin_id_plugin_version_manifest_digest_fkey",
+      "table": "plugin_app_states",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((projected_revision >= 0))",
+      "kind": "constraint",
+      "name": "plugin_app_states_projected_revision_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((revision > 0))",
+      "kind": "constraint",
+      "name": "plugin_app_states_revision_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((runtime_attempts >= 0))",
+      "kind": "constraint",
+      "name": "plugin_app_states_runtime_attempts_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK (((runtime_configuration IS NULL) OR ((jsonb_typeof(runtime_configuration) = 'object'::text) AND (octet_length((runtime_configuration)::text) <= 32768))))",
+      "kind": "constraint",
+      "name": "plugin_app_states_runtime_configuration_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((runtime_revision >= 0))",
+      "kind": "constraint",
+      "name": "plugin_app_states_runtime_revision_check",
+      "table": "plugin_app_states",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((app_id ~ '^[0-9A-Za-z_-]{1,32}$'::text))",
+      "kind": "constraint",
       "name": "plugin_authorization_snapshots_app_id_check",
       "table": "plugin_authorization_snapshots",
       "type": "c",
@@ -8611,6 +9328,66 @@
       "name": "plugin_authorization_snapshots_version_check",
       "table": "plugin_authorization_snapshots",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((artifact_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+      "kind": "constraint",
+      "name": "plugin_deployments_artifact_digest_check",
+      "table": "plugin_deployments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((octet_length(grpc_authority) <= 512))",
+      "kind": "constraint",
+      "name": "plugin_deployments_grpc_authority_check",
+      "table": "plugin_deployments",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (deployment_id)",
+      "kind": "constraint",
+      "name": "plugin_deployments_pkey",
+      "table": "plugin_deployments",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (plugin_id, plugin_version, manifest_digest) REFERENCES plugin_versions(plugin_id, plugin_version, manifest_digest)",
+      "kind": "constraint",
+      "name": "plugin_deployments_plugin_id_plugin_version_manifest_diges_fkey",
+      "table": "plugin_deployments",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((app_id ~ '^[0-9A-Za-z_-]{1,32}$'::text))",
+      "kind": "constraint",
+      "name": "plugin_dev_apps_app_id_check",
+      "table": "plugin_dev_apps",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (app_id)",
+      "kind": "constraint",
+      "name": "plugin_dev_apps_pkey",
+      "table": "plugin_dev_apps",
+      "type": "p",
       "validated": true
     },
     {
@@ -8771,6 +9548,176 @@
       "name": "plugin_entity_lifecycle_outbox_unconfirmed_check",
       "table": "plugin_entity_lifecycle_outbox",
       "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (namespace)",
+      "kind": "constraint",
+      "name": "plugin_namespaces_pkey",
+      "table": "plugin_namespaces",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((id = 1))",
+      "kind": "constraint",
+      "name": "plugin_reconcile_lease_id_check",
+      "table": "plugin_reconcile_lease",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (id)",
+      "kind": "constraint",
+      "name": "plugin_reconcile_lease_pkey",
+      "table": "plugin_reconcile_lease",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (scope)",
+      "kind": "constraint",
+      "name": "plugin_registry_revisions_pkey",
+      "table": "plugin_registry_revisions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((revision >= 0))",
+      "kind": "constraint",
+      "name": "plugin_registry_revisions_revision_check",
+      "table": "plugin_registry_revisions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((octet_length(bytes) <= 33554432))",
+      "kind": "constraint",
+      "name": "plugin_version_assets_bytes_check",
+      "table": "plugin_version_assets",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+      "kind": "constraint",
+      "name": "plugin_version_assets_digest_check",
+      "table": "plugin_version_assets",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (plugin_id, plugin_version, path)",
+      "kind": "constraint",
+      "name": "plugin_version_assets_pkey",
+      "table": "plugin_version_assets",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "FOREIGN KEY (plugin_id, plugin_version) REFERENCES plugin_versions(plugin_id, plugin_version)",
+      "kind": "constraint",
+      "name": "plugin_version_assets_plugin_id_plugin_version_fkey",
+      "table": "plugin_version_assets",
+      "type": "f",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((NOT (published AND revoked)))",
+      "kind": "constraint",
+      "name": "plugin_versions_check",
+      "table": "plugin_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((NOT (development AND published)))",
+      "kind": "constraint",
+      "name": "plugin_versions_development_unpublished",
+      "table": "plugin_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((kind = ANY (ARRAY['im'::text, 'business'::text])))",
+      "kind": "constraint",
+      "name": "plugin_versions_kind_check",
+      "table": "plugin_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((manifest_digest ~ '^sha256:[0-9a-f]{64}$'::text))",
+      "kind": "constraint",
+      "name": "plugin_versions_manifest_digest_check",
+      "table": "plugin_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (manifest_digest)",
+      "kind": "constraint",
+      "name": "plugin_versions_manifest_digest_key",
+      "table": "plugin_versions",
+      "type": "u",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "CHECK ((octet_length(manifest_json) <= 1048576))",
+      "kind": "constraint",
+      "name": "plugin_versions_manifest_json_check",
+      "table": "plugin_versions",
+      "type": "c",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "PRIMARY KEY (plugin_id, plugin_version)",
+      "kind": "constraint",
+      "name": "plugin_versions_pkey",
+      "table": "plugin_versions",
+      "type": "p",
+      "validated": true
+    },
+    {
+      "deferrable": false,
+      "deferred": false,
+      "definition": "UNIQUE (plugin_id, plugin_version, manifest_digest)",
+      "kind": "constraint",
+      "name": "plugin_versions_plugin_id_plugin_version_manifest_digest_key",
+      "table": "plugin_versions",
+      "type": "u",
       "validated": true
     },
     {
@@ -8944,6 +9891,12 @@
       "validated": true
     },
     {
+      "definition": "CREATE OR REPLACE FUNCTION public.plugin_event_activation_epoch()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n    IF TG_OP = 'INSERT' THEN\n        NEW.event_active_since_ms := (extract(epoch FROM clock_timestamp())*1000)::bigint;\n    ELSIF ROW(OLD.approved,OLD.lifecycle,OLD.enabled,OLD.suspended,OLD.owned,OLD.offline_hold,\n              OLD.manifest_digest,OLD.configuration,OLD.features)\n       IS DISTINCT FROM\n          ROW(NEW.approved,NEW.lifecycle,NEW.enabled,NEW.suspended,NEW.owned,NEW.offline_hold,\n              NEW.manifest_digest,NEW.configuration,NEW.features) THEN\n        NEW.event_active_since_ms := GREATEST(OLD.event_active_since_ms+1,\n            (extract(epoch FROM clock_timestamp())*1000)::bigint);\n    ELSE\n        NEW.event_active_since_ms := OLD.event_active_since_ms;\n    END IF;\n    RETURN NEW;\nEND;\n$function$\n",
+      "identity": "",
+      "kind": "function",
+      "name": "plugin_event_activation_epoch"
+    },
+    {
       "definition": "CREATE OR REPLACE FUNCTION public.set_updated_at()\n RETURNS trigger\n LANGUAGE plpgsql\nAS $function$\nBEGIN\n    NEW.updated_at = CURRENT_TIMESTAMP;\n    RETURN NEW;\nEND;\n$function$\n",
       "identity": "",
       "kind": "function",
@@ -8987,16 +9940,6 @@
       "ready": true,
       "replica_identity": false,
       "table": "capability_audit_log",
-      "valid": true
-    },
-    {
-      "clustered": false,
-      "definition": "CREATE UNIQUE INDEX capability_plugin_endpoints_pkey ON public.capability_plugin_endpoints USING btree (tenant_id, plugin_id)",
-      "kind": "index",
-      "name": "capability_plugin_endpoints_pkey",
-      "ready": true,
-      "replica_identity": false,
-      "table": "capability_plugin_endpoints",
       "valid": true
     },
     {
@@ -9047,16 +9990,6 @@
       "ready": true,
       "replica_identity": false,
       "table": "capability_tenant_switches",
-      "valid": true
-    },
-    {
-      "clustered": false,
-      "definition": "CREATE UNIQUE INDEX capability_user_grants_pkey ON public.capability_user_grants USING btree (tenant_id, user_id, capability_id)",
-      "kind": "index",
-      "name": "capability_user_grants_pkey",
-      "ready": true,
-      "replica_identity": false,
-      "table": "capability_user_grants",
       "valid": true
     },
     {
@@ -9151,6 +10084,16 @@
     },
     {
       "clustered": false,
+      "definition": "CREATE UNIQUE INDEX hook_config_versions_pkey ON public.hook_config_versions USING btree (scope)",
+      "kind": "index",
+      "name": "hook_config_versions_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "hook_config_versions",
+      "valid": true
+    },
+    {
+      "clustered": false,
       "definition": "CREATE UNIQUE INDEX hook_configs_hook_id_key ON public.hook_configs USING btree (hook_id)",
       "kind": "index",
       "name": "hook_configs_hook_id_key",
@@ -9177,6 +10120,16 @@
       "ready": true,
       "replica_identity": false,
       "table": "hook_configs",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX hook_deployment_summary_pkey ON public.hook_deployment_summary USING btree (service)",
+      "kind": "index",
+      "name": "hook_deployment_summary_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "hook_deployment_summary",
       "valid": true
     },
     {
@@ -9291,16 +10244,6 @@
     },
     {
       "clustered": false,
-      "definition": "CREATE INDEX idx_capability_user_grants_tenant_user ON public.capability_user_grants USING btree (tenant_id, user_id)",
-      "kind": "index",
-      "name": "idx_capability_user_grants_tenant_user",
-      "ready": true,
-      "replica_identity": false,
-      "table": "capability_user_grants",
-      "valid": true
-    },
-    {
-      "clustered": false,
       "definition": "CREATE INDEX idx_conversation_participants_conv_joined ON public.conversation_participants USING btree (tenant_id, conversation_id, joined_at, user_id)",
       "kind": "index",
       "name": "idx_conversation_participants_conv_joined",
@@ -9357,6 +10300,16 @@
       "ready": true,
       "replica_identity": false,
       "table": "events",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE INDEX idx_hook_config_versions_version ON public.hook_config_versions USING btree (version)",
+      "kind": "index",
+      "name": "idx_hook_config_versions_version",
+      "ready": true,
+      "replica_identity": false,
+      "table": "hook_config_versions",
       "valid": true
     },
     {
@@ -9751,6 +10704,36 @@
     },
     {
       "clustered": false,
+      "definition": "CREATE INDEX idx_plugin_app_states_deployment ON public.plugin_app_states USING btree (deployment_id)",
+      "kind": "index",
+      "name": "idx_plugin_app_states_deployment",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_app_states",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE INDEX idx_plugin_app_states_reconcile ON public.plugin_app_states USING btree (updated_at, app_id, binding_id)",
+      "kind": "index",
+      "name": "idx_plugin_app_states_reconcile",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_app_states",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE INDEX idx_plugin_deployments_release ON public.plugin_deployments USING btree (plugin_id, plugin_version, manifest_digest, created_at)",
+      "kind": "index",
+      "name": "idx_plugin_deployments_release",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_deployments",
+      "valid": true
+    },
+    {
+      "clustered": false,
       "definition": "CREATE INDEX idx_plugin_entity_bindings_message ON public.plugin_entity_bindings USING btree (tenant_id, server_msg_id)",
       "kind": "index",
       "name": "idx_plugin_entity_bindings_message",
@@ -9767,6 +10750,16 @@
       "ready": true,
       "replica_identity": false,
       "table": "plugin_entity_lifecycle_outbox",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE INDEX idx_plugin_versions_updated ON public.plugin_versions USING btree (updated_at, plugin_id, plugin_version)",
+      "kind": "index",
+      "name": "idx_plugin_versions_updated",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_versions",
       "valid": true
     },
     {
@@ -10771,12 +11764,42 @@
     },
     {
       "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_app_states_pkey ON public.plugin_app_states USING btree (app_id, binding_id)",
+      "kind": "index",
+      "name": "plugin_app_states_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_app_states",
+      "valid": true
+    },
+    {
+      "clustered": false,
       "definition": "CREATE UNIQUE INDEX plugin_authorization_snapshots_pkey ON public.plugin_authorization_snapshots USING btree (app_id)",
       "kind": "index",
       "name": "plugin_authorization_snapshots_pkey",
       "ready": true,
       "replica_identity": false,
       "table": "plugin_authorization_snapshots",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_deployments_pkey ON public.plugin_deployments USING btree (deployment_id)",
+      "kind": "index",
+      "name": "plugin_deployments_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_deployments",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_dev_apps_pkey ON public.plugin_dev_apps USING btree (app_id)",
+      "kind": "index",
+      "name": "plugin_dev_apps_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_dev_apps",
       "valid": true
     },
     {
@@ -10807,6 +11830,76 @@
       "ready": true,
       "replica_identity": false,
       "table": "plugin_entity_lifecycle_outbox",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_namespaces_pkey ON public.plugin_namespaces USING btree (namespace)",
+      "kind": "index",
+      "name": "plugin_namespaces_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_namespaces",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_reconcile_lease_pkey ON public.plugin_reconcile_lease USING btree (id)",
+      "kind": "index",
+      "name": "plugin_reconcile_lease_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_reconcile_lease",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_registry_revisions_pkey ON public.plugin_registry_revisions USING btree (scope)",
+      "kind": "index",
+      "name": "plugin_registry_revisions_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_registry_revisions",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_version_assets_pkey ON public.plugin_version_assets USING btree (plugin_id, plugin_version, path)",
+      "kind": "index",
+      "name": "plugin_version_assets_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_version_assets",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_versions_manifest_digest_key ON public.plugin_versions USING btree (manifest_digest)",
+      "kind": "index",
+      "name": "plugin_versions_manifest_digest_key",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_versions",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_versions_pkey ON public.plugin_versions USING btree (plugin_id, plugin_version)",
+      "kind": "index",
+      "name": "plugin_versions_pkey",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_versions",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX plugin_versions_plugin_id_plugin_version_manifest_digest_key ON public.plugin_versions USING btree (plugin_id, plugin_version, manifest_digest)",
+      "kind": "index",
+      "name": "plugin_versions_plugin_id_plugin_version_manifest_digest_key",
+      "ready": true,
+      "replica_identity": false,
+      "table": "plugin_versions",
       "valid": true
     },
     {
@@ -10857,6 +11950,16 @@
       "ready": true,
       "replica_identity": false,
       "table": "threads",
+      "valid": true
+    },
+    {
+      "clustered": false,
+      "definition": "CREATE UNIQUE INDEX uq_hook_configs_platform_name ON public.hook_configs USING btree (hook_type, name) WHERE (tenant_id IS NULL)",
+      "kind": "index",
+      "name": "uq_hook_configs_platform_name",
+      "ready": true,
+      "replica_identity": false,
+      "table": "hook_configs",
       "valid": true
     },
     {
@@ -10916,17 +12019,6 @@
     {
       "force_row_security": false,
       "kind": "relation",
-      "name": "capability_plugin_endpoints",
-      "options": null,
-      "partition": null,
-      "persistence": "p",
-      "replica_identity": "d",
-      "row_security": false,
-      "type": "r"
-    },
-    {
-      "force_row_security": false,
-      "kind": "relation",
       "name": "capability_plugin_resource_calls",
       "options": null,
       "partition": null,
@@ -10950,17 +12042,6 @@
       "force_row_security": false,
       "kind": "relation",
       "name": "capability_tenant_switches",
-      "options": null,
-      "partition": null,
-      "persistence": "p",
-      "replica_identity": "d",
-      "row_security": false,
-      "type": "r"
-    },
-    {
-      "force_row_security": false,
-      "kind": "relation",
-      "name": "capability_user_grants",
       "options": null,
       "partition": null,
       "persistence": "p",
@@ -11037,7 +12118,29 @@
     {
       "force_row_security": false,
       "kind": "relation",
+      "name": "hook_config_versions",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
       "name": "hook_configs",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "hook_deployment_summary",
       "options": null,
       "partition": null,
       "persistence": "p",
@@ -11587,7 +12690,40 @@
     {
       "force_row_security": false,
       "kind": "relation",
+      "name": "plugin_app_states",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
       "name": "plugin_authorization_snapshots",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_deployments",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_dev_apps",
       "options": null,
       "partition": null,
       "persistence": "p",
@@ -11610,6 +12746,61 @@
       "force_row_security": false,
       "kind": "relation",
       "name": "plugin_entity_lifecycle_outbox",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_namespaces",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_reconcile_lease",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_registry_revisions",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_version_assets",
+      "options": null,
+      "partition": null,
+      "persistence": "p",
+      "replica_identity": "d",
+      "row_security": false,
+      "type": "r"
+    },
+    {
+      "force_row_security": false,
+      "kind": "relation",
+      "name": "plugin_versions",
       "options": null,
       "partition": null,
       "persistence": "p",
@@ -11682,6 +12873,13 @@
       "replica_identity": "d",
       "row_security": false,
       "type": "r"
+    },
+    {
+      "definition": "CREATE TRIGGER plugin_event_activation_epoch BEFORE INSERT OR UPDATE ON public.plugin_app_states FOR EACH ROW EXECUTE FUNCTION plugin_event_activation_epoch()",
+      "enabled": "O",
+      "kind": "trigger",
+      "name": "plugin_event_activation_epoch",
+      "table": "plugin_app_states"
     },
     {
       "definition": "CREATE TRIGGER trigger_capability_service_settings_updated_at BEFORE UPDATE ON public.capability_service_settings FOR EACH ROW EXECUTE FUNCTION set_updated_at()",

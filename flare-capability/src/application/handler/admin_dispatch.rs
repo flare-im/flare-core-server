@@ -254,13 +254,10 @@ pub async fn dispatch_admin(
             p.grant.plugin_id == request.plugin_id
                 && p.grant.enabled
                 && !p.grant.revoked
-                && now >= p.grant.valid_from_ms
-                && now < p.grant.valid_until_ms
+                && p.grant.in_effect(now)
         })
         .ok_or_else(|| denied("plugin is not enabled for this application"))?;
-    let manifest = projected
-        .manifest()
-        .map_err(|_| denied("plugin projection invalid"))?;
+    let manifest = projected.manifest();
     // An admin operation is a read or an action by its declared mode.
     let declared = manifest
         .admin

@@ -1,4 +1,4 @@
-# Message Ingest 服务配置（上行发送、seq、WAL、Pre/PostSend Hook、conversation ensure）
+# Message Ingest 服务配置（上行发送、seq、WAL、PreSend Hook、conversation ensure）
 # JetStream 使用 base.toml 中 [jetstream.message]；写入 TOPIC_MESSAGE_MAIN 后由 flare-orchestrator fanout。
 
 [services.message_ingest]
@@ -22,7 +22,8 @@ metrics_enabled = true
 metrics_address = "0.0.0.0"
 metrics_port = 19180
 metrics_path = "/metrics"
-# 租户投影库（base.toml [postgres.tenant_runtime]）：tenant 维度阈值先取投影 quota.core.send_qps
+# Core 库（base.toml [postgres.tenant_runtime]）：hook_configs 在这里热加载，读不到时服务不就绪；
+# 执行记录批量写 hook_executions。tenant 维度阈值先取投影 quota.core.send_qps
 # （0 = 回落下面的全局值）；可用 MESSAGE_INGEST_TENANT_RUNTIME_POSTGRES_URL 覆盖，不配置则只用全局值。
 # 已知 suspended/deleting 租户无论策略均拒绝发送；生产设 MESSAGE_INGEST_TENANT_POLICY=strict，
 # 未投影/回源失败亦拒绝。Core-only 联调默认 lenient。
@@ -38,3 +39,20 @@ send_publish_timeout_ms = 5000
 [services.message_ingest.server]
 address = "0.0.0.0"
 port = 50182
+
+# Hook 执行证据（hook_executions）：拒绝、失败、超时全量，成功与熔断短路按比例采样（0.01 即每 100 次
+# 留 1 次，一行代表 100 次）；缓冲满时先丢采样的，丢弃计入指标。环境变量 FLARE_HOOK_EXECUTIONS_* 优先。
+[hook_executions]
+enabled = true
+buffer_capacity = 10000
+batch_size = 500
+flush_interval_ms = 1000
+success_sample_ratio = 0.01
+
+# 每个 (应用, Hook) 一个熔断器，状态只在本实例内：窗口内连续失败或超时达到阈值即打开，打开期间必需的
+# Hook 回可重试的 503，可选的跳过；到期放一次探测。环境变量 FLARE_HOOK_CIRCUIT_* 优先。
+[hook_circuit]
+enabled = true
+failure_threshold = 5
+failure_window_secs = 30
+open_secs = 20

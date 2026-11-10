@@ -29,13 +29,21 @@ async fn postgres_media_owner_migration_and_tenant_cleanup() {
         .replace(
             "CREATE TABLE media_references",
             "CREATE TEMPORARY TABLE media_references",
+        )
+        .replace(
+            "CREATE TABLE media_read_grants",
+            "CREATE TEMPORARY TABLE media_read_grants",
         );
     // Model an old deployment: the migration must add owner_id without trusting metadata.
     let schema = schema
+        .replace("ALTER TABLE media_assets ADD CONSTRAINT media_assets_application_owner\n    CHECK (owner_kind <> 'application' OR (owner_id IS NOT NULL AND owner_id = tenant_id));", "")
         .lines()
         .filter(|line| {
             *line != "    owner_id TEXT,"
                 && !line.starts_with("COMMENT ON COLUMN media_assets.owner_id")
+                && !line.contains("owner_kind")
+                && !line.contains("purpose TEXT")
+                && !line.starts_with("COMMENT ON COLUMN media_assets.purpose")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -55,6 +63,12 @@ async fn postgres_media_owner_migration_and_tenant_cleanup() {
     let patch = include_str!("../../../../deploy/patches/20260929_media_authenticated_owner.sql");
     sqlx::raw_sql(patch).execute(&pool).await.unwrap();
     sqlx::raw_sql(patch).execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../../migrations/0029_20261109_application_media_ownership.sql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
     let store = PostgresMetadataStore {
         pool: Arc::new(pool),
     };

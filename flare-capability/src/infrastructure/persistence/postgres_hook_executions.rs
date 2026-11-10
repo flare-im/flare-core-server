@@ -1,7 +1,7 @@
-//! `hook_executions`（源 DDL 0015 加了 `sample_weight`、`hook_version` 与两条索引）：Hook 执行证据。
+//! `hook_executions`：Hook 执行证据的读与保留期（写入在 Ingest）。
 //!
-//! 写入一批一条语句（`UNNEST`）；统计与查询都限定租户与 Hook（走
-//! `idx_hook_executions_tenant_hook_executed`），计数按 `sample_weight` 加权；保留期清理按执行时间
+//! 统计与查询都限定租户与 Hook（走 `idx_hook_executions_tenant_hook_executed`，再按 `hook_id` 只留
+//! 这一条 Hook 的行：同名删掉重建的 Hook 号不同），计数按 `sample_weight` 加权；保留期清理按执行时间
 //! 从旧到新分批删（走 `idx_hook_executions_executed_at`），每批先物化再删，多实例同时清理时互相
 //! 跳过已锁的行。
 
@@ -14,8 +14,8 @@ use flare_server_core::error::{ErrorBuilder, ErrorCode, FlareError, Result};
 use sqlx::{PgPool, Row};
 
 use crate::domain::model::{
-    HOOK_CIRCUIT_OPEN_CODE, HookExecutionFilter, HookExecutionRecord, HookExecutionScope,
-    HookExecutionStatistics, HookExecutionTimeRange, StoredHookExecution,
+    HOOK_CIRCUIT_OPEN_CODE, HookExecutionFilter, HookExecutionScope, HookExecutionStatistics,
+    HookExecutionTimeRange, StoredHookExecution,
 };
 use crate::domain::repository::HookExecutionRepository;
 
@@ -25,8 +25,8 @@ const STATISTICS_SQL: &str = "
 WITH scoped AS (
     SELECT success, latency_ms, error_code, sample_weight::int8 AS w
       FROM hook_executions
-     WHERE tenant_id = $1 AND hook_type = $2 AND hook_name = $3
-       AND executed_at >= $4 AND executed_at < $5
+     WHERE ($1::TEXT IS NULL OR tenant_id = $1) AND hook_type = $2 AND hook_name = $3
+       AND hook_id = $7 AND executed_at >= $4 AND executed_at < $5
 ), called AS (
     SELECT latency_ms,
            sum(w) OVER (ORDER BY latency_ms ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum,
@@ -46,21 +46,10 @@ SELECT
 const ERROR_CODES_SQL: &str = "
 SELECT error_code, sum(sample_weight)::int8 AS count
   FROM hook_executions
- WHERE tenant_id = $1 AND hook_type = $2 AND hook_name = $3
-   AND executed_at >= $4 AND executed_at < $5
+ WHERE ($1::TEXT IS NULL OR tenant_id = $1) AND hook_type = $2 AND hook_name = $3
+   AND hook_id = $6 AND executed_at >= $4 AND executed_at < $5
    AND NOT success AND error_code IS NOT NULL
  GROUP BY error_code";
-
-const INSERT_SQL: &str = "
-INSERT INTO hook_executions (
-    execution_id, hook_id, hook_name, hook_type, tenant_id, hook_version, message_id,
-    request_id, trace_id, success, latency_ms, error_code, error_message, executed_at,
-    sample_weight)
-SELECT * FROM UNNEST(
-    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
-    $8::text[], $9::text[], $10::bool[], $11::int4[], $12::text[], $13::text[],
-    $14::timestamptz[], $15::int4[])
-ON CONFLICT (execution_id) DO NOTHING";
 
 /// 这一批先在物化的 CTE 里选定并加锁，只算一次。不能写成 `WHERE execution_id IN (SELECT ...
 /// LIMIT .. FOR UPDATE)`：规划器可把它做成每个外层行重扫一次的半连接，重扫时跳过本语句已删的行、
@@ -81,8 +70,8 @@ const QUERY_SQL: &str = "
 SELECT execution_id, message_id, success, latency_ms, error_code, error_message, executed_at,
        sample_weight
   FROM hook_executions
- WHERE tenant_id = $1 AND hook_type = $2 AND hook_name = $3
-   AND executed_at >= $4 AND executed_at < $5
+ WHERE ($1::TEXT IS NULL OR tenant_id = $1) AND hook_type = $2 AND hook_name = $3
+   AND hook_id = $9 AND executed_at >= $4 AND executed_at < $5
    AND ($6::text IS NULL OR message_id = $6)
    AND (NOT $7 OR success)
  ORDER BY executed_at DESC, execution_id DESC
@@ -137,64 +126,6 @@ fn utc(time: SystemTime) -> Result<DateTime<Utc>> {
 
 #[async_trait::async_trait]
 impl HookExecutionRepository for PostgresHookExecutionRepository {
-    async fn insert_batch(&self, records: &[HookExecutionRecord]) -> Result<u64> {
-        if records.is_empty() {
-            return Ok(0);
-        }
-        let mut execution_ids = Vec::with_capacity(records.len());
-        let mut hook_ids = Vec::with_capacity(records.len());
-        let mut hook_names = Vec::with_capacity(records.len());
-        let mut hook_types = Vec::with_capacity(records.len());
-        let mut tenant_ids = Vec::with_capacity(records.len());
-        let mut hook_versions = Vec::with_capacity(records.len());
-        let mut message_ids = Vec::with_capacity(records.len());
-        let mut request_ids = Vec::with_capacity(records.len());
-        let mut trace_ids = Vec::with_capacity(records.len());
-        let mut successes = Vec::with_capacity(records.len());
-        let mut latencies = Vec::with_capacity(records.len());
-        let mut error_codes = Vec::with_capacity(records.len());
-        let mut error_messages = Vec::with_capacity(records.len());
-        let mut executed_ats = Vec::with_capacity(records.len());
-        let mut weights = Vec::with_capacity(records.len());
-        for record in records {
-            execution_ids.push(record.execution_id.clone());
-            hook_ids.push(record.hook_id());
-            hook_names.push(record.hook_name.clone());
-            hook_types.push(record.hook_type.clone());
-            tenant_ids.push(record.tenant_id.clone());
-            hook_versions.push(record.hook_version.clone());
-            message_ids.push(record.message_id.clone());
-            request_ids.push(record.request_id.clone());
-            trace_ids.push(record.trace_id.clone());
-            successes.push(record.outcome.answered());
-            latencies.push(record.latency_ms());
-            error_codes.push(record.outcome.error_code().map(str::to_string));
-            error_messages.push(record.outcome.error_message());
-            executed_ats.push(utc(record.executed_at)?);
-            weights.push(i32::try_from(record.sample_weight.max(1)).unwrap_or(i32::MAX));
-        }
-        let result = sqlx::query(INSERT_SQL)
-            .bind(execution_ids)
-            .bind(hook_ids)
-            .bind(hook_names)
-            .bind(hook_types)
-            .bind(tenant_ids)
-            .bind(hook_versions)
-            .bind(message_ids)
-            .bind(request_ids)
-            .bind(trace_ids)
-            .bind(successes)
-            .bind(latencies)
-            .bind(error_codes)
-            .bind(error_messages)
-            .bind(executed_ats)
-            .bind(weights)
-            .execute(self.pool.as_ref())
-            .await
-            .map_err(|e| storage_error("insert", e))?;
-        Ok(result.rows_affected())
-    }
-
     async fn delete_executed_before(&self, cutoff: SystemTime, limit: u32) -> Result<u64> {
         let result = sqlx::query(DELETE_SQL)
             .bind(utc(cutoff)?)
@@ -217,6 +148,7 @@ impl HookExecutionRepository for PostgresHookExecutionRepository {
             .bind(utc(range.from)?)
             .bind(utc(range.to)?)
             .bind(HOOK_CIRCUIT_OPEN_CODE)
+            .bind(&scope.hook_id)
             .fetch_one(self.pool.as_ref())
             .await
             .map_err(|e| storage_error("statistics", e))?;
@@ -226,6 +158,7 @@ impl HookExecutionRepository for PostgresHookExecutionRepository {
             .bind(&scope.hook_name)
             .bind(utc(range.from)?)
             .bind(utc(range.to)?)
+            .bind(&scope.hook_id)
             .fetch_all(self.pool.as_ref())
             .await
             .map_err(|e| storage_error("statistics_codes", e))?;
@@ -269,6 +202,7 @@ impl HookExecutionRepository for PostgresHookExecutionRepository {
             .bind(filter.message_id.as_deref())
             .bind(filter.success_only)
             .bind(i64::from(filter.limit))
+            .bind(&filter.scope.hook_id)
             .fetch_all(self.pool.as_ref())
             .await
             .map_err(|e| storage_error("query", e))?;
@@ -346,9 +280,10 @@ mod tests {
             .unwrap();
         let repository = PostgresHookExecutionRepository::new(Arc::new(pool));
         let scope = HookExecutionScope {
-            tenant_id: "t1".into(),
+            tenant_id: Some("t1".into()),
             hook_type: "pre_send".into(),
             hook_name: "dlp".into(),
+            hook_id: "7".into(),
         };
         let range = HookExecutionTimeRange {
             from: SystemTime::UNIX_EPOCH,

@@ -1,144 +1,19 @@
-//! Hook 执行证据：每次调用 Hook 的结果，写进 `hook_executions`（源 DDL 0015 加了 `sample_weight` 与
-//! `hook_version`），`hook_config.get_statistics` 与 `hook_config.query_executions` 读它。
-//!
-//! 记录不带消息正文，也不带下游的错误原文（其中可能有内部地址）：失败只记错误码与固定说明，拒绝只记
-//! Hook 给的拒绝原因码。放行与熔断短路按比例采样（一行代表 `sample_weight` 次），拒绝、调用失败与
-//! 超时全量记录。
+//! Hook 执行证据的查询模型：`hook_config.get_statistics` 与 `hook_config.query_executions` 读
+//! `hook_executions`。写入在 Ingest（见 `flare_im_hooks::hooks::execution`）。
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-/// Hook 明确拒绝。
-pub const HOOK_REJECTED_CODE: &str = "HOOK_REJECTED";
-/// 调用超过 Hook 的超时。
-pub const HOOK_TIMEOUT_CODE: &str = "HOOK_TIMEOUT";
-/// 熔断打开，没有调用 Hook。
-pub const HOOK_CIRCUIT_OPEN_CODE: &str = "HOOK_CIRCUIT_OPEN";
-/// 调用失败、错误没有错误码时的代码。
-pub const HOOK_CALL_FAILED_CODE: &str = "HOOK_CALL_FAILED";
-
-/// 存进库里的拒绝原因码、消息号、请求号、追踪号的长度上限（字符）。
-pub const MAX_RECORDED_FIELD_CHARS: usize = 256;
-
-/// 一次 Hook 调用的结果。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HookExecutionOutcome {
-    /// Hook 放行（事件类 Hook：调用成功）。按比例采样。
-    Allowed,
-    /// Hook 明确拒绝，`reason` 是 Hook 给的拒绝原因码。全量记录。
-    Rejected { reason: String },
-    /// 调用失败（连不上、对端报错、应答解不开），`code` 为错误码。全量记录。
-    Failed { code: &'static str },
-    /// 超过 Hook 的超时。全量记录。
-    TimedOut,
-    /// 熔断打开，没有调用 Hook。按比例采样：熔断本就是为了在故障期间卸载，每次短路都写一行会把
-    /// 一次故障变成一场写库风暴。
-    CircuitOpen,
-}
-
-/// 记录的取舍：采样的一类在缓冲满时先丢。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HookExecutionClass {
-    /// 放行与熔断短路：按比例采样，缓冲满时先丢。
-    Sampled,
-    /// 拒绝、失败、超时：全量记录。
-    Always,
-}
-
-impl HookExecutionClass {
-    /// 指标标签取值（固定）。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Sampled => "sampled",
-            Self::Always => "always",
-        }
-    }
-}
-
-impl HookExecutionOutcome {
-    pub fn class(&self) -> HookExecutionClass {
-        match self {
-            Self::Allowed | Self::CircuitOpen => HookExecutionClass::Sampled,
-            Self::Rejected { .. } | Self::Failed { .. } | Self::TimedOut => {
-                HookExecutionClass::Always
-            }
-        }
-    }
-
-    /// Hook 给出了结论（放行或拒绝）。存为 `success`；熔断按它判断 Hook 是否健康。
-    pub fn answered(&self) -> bool {
-        matches!(self, Self::Allowed | Self::Rejected { .. })
-    }
-
-    /// 存进 `error_code` 的代码；放行没有。
-    pub fn error_code(&self) -> Option<&str> {
-        match self {
-            Self::Allowed => None,
-            Self::Rejected { .. } => Some(HOOK_REJECTED_CODE),
-            Self::Failed { code } => Some(code),
-            Self::TimedOut => Some(HOOK_TIMEOUT_CODE),
-            Self::CircuitOpen => Some(HOOK_CIRCUIT_OPEN_CODE),
-        }
-    }
-
-    /// 存进 `error_message` 的说明：拒绝是 Hook 的拒绝原因码，其余是固定文字（不带下游原文）。
-    pub fn error_message(&self) -> Option<String> {
-        match self {
-            Self::Allowed => None,
-            Self::Rejected { reason } if reason.is_empty() => None,
-            Self::Rejected { reason } => Some(bounded(reason)),
-            Self::Failed { .. } => Some("hook call failed".to_string()),
-            Self::TimedOut => Some("hook timed out".to_string()),
-            Self::CircuitOpen => Some("hook circuit open; hook not called".to_string()),
-        }
-    }
-}
-
-/// 截到 [`MAX_RECORDED_FIELD_CHARS`] 个字符，控制字符换成空格（这些字段会被员工在控制台读到）。
-pub fn bounded(value: &str) -> String {
-    value
-        .chars()
-        .take(MAX_RECORDED_FIELD_CHARS)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
-}
-
-/// 一次 Hook 调用的记录（写入 `hook_executions` 的一行）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct HookExecutionRecord {
-    pub execution_id: String,
-    pub tenant_id: String,
-    pub hook_type: String,
-    pub hook_name: String,
-    pub hook_version: Option<String>,
-    pub message_id: Option<String>,
-    pub request_id: Option<String>,
-    pub trace_id: Option<String>,
-    pub outcome: HookExecutionOutcome,
-    /// 从发起调用到得到结果；熔断短路为 0。
-    pub latency: Duration,
-    pub executed_at: SystemTime,
-    /// 这一行代表几次执行：全量记录的为 1，按 1/N 采样留下的为 N。
-    pub sample_weight: u32,
-}
-
-impl HookExecutionRecord {
-    /// 存进 `hook_id` 的值：`hook_type:name`（与管理接口接受的 hook_id 写法相同）。
-    pub fn hook_id(&self) -> String {
-        format!("{}:{}", self.hook_type, self.hook_name)
-    }
-
-    pub fn latency_ms(&self) -> i32 {
-        i32::try_from(self.latency.as_millis()).unwrap_or(i32::MAX)
-    }
-}
-
-/// 一个租户的一条 Hook：统计与查询都限定在这里。
+/// 一条 Hook：统计与查询都限定在这里。`tenant_id` 空是平台或部署 Hook，它们跑在所有应用的消息上，
+/// 不按应用限定；名字在这两个来源和应用之间不重复（应用不能占用）。`hook_id` 是执行记录里的 Hook
+/// 身份（Ingest 的 `execution_hook_id`）：配置的 Hook 是行号，删掉后同名重建的 Hook 不继承旧记录；
+/// 部署 Hook 是 `hook_type:name`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookExecutionScope {
-    pub tenant_id: String,
+    pub tenant_id: Option<String>,
     pub hook_type: String,
     pub hook_name: String,
+    pub hook_id: String,
 }
 
 /// 管理接口接受的最晚时间：9999-12-31T23:59:59.999Z（Unix 毫秒）。更晚的值不是有效的查询时间，
@@ -234,67 +109,6 @@ pub struct HookExecutionStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn outcomes_map_to_success_class_and_codes() {
-        let rejected = HookExecutionOutcome::Rejected {
-            reason: "SPAM".into(),
-        };
-        let failed = HookExecutionOutcome::Failed {
-            code: "SERVICE_UNAVAILABLE",
-        };
-        let cases = [
-            (
-                HookExecutionOutcome::Allowed,
-                true,
-                HookExecutionClass::Sampled,
-                None,
-            ),
-            (
-                rejected.clone(),
-                true,
-                HookExecutionClass::Always,
-                Some(HOOK_REJECTED_CODE),
-            ),
-            (
-                failed.clone(),
-                false,
-                HookExecutionClass::Always,
-                Some("SERVICE_UNAVAILABLE"),
-            ),
-            (
-                HookExecutionOutcome::TimedOut,
-                false,
-                HookExecutionClass::Always,
-                Some(HOOK_TIMEOUT_CODE),
-            ),
-            (
-                HookExecutionOutcome::CircuitOpen,
-                false,
-                HookExecutionClass::Sampled,
-                Some(HOOK_CIRCUIT_OPEN_CODE),
-            ),
-        ];
-        for (outcome, answered, class, code) in cases {
-            assert_eq!(outcome.answered(), answered, "{outcome:?}");
-            assert_eq!(outcome.class(), class, "{outcome:?}");
-            assert_eq!(outcome.error_code(), code, "{outcome:?}");
-        }
-        assert_eq!(rejected.error_message().as_deref(), Some("SPAM"));
-        assert_eq!(
-            failed.error_message().as_deref(),
-            Some("hook call failed"),
-            "never the downstream error text"
-        );
-        assert_eq!(HookExecutionOutcome::Allowed.error_message(), None);
-    }
-
-    #[test]
-    fn recorded_text_is_bounded_and_free_of_control_characters() {
-        let long = "r".repeat(MAX_RECORDED_FIELD_CHARS + 10);
-        assert_eq!(bounded(&long).chars().count(), MAX_RECORDED_FIELD_CHARS);
-        assert_eq!(bounded("a\nb\u{1b}c"), "a b c");
-    }
 
     #[test]
     fn time_ranges_default_to_the_last_span_and_include_the_end_millisecond() {

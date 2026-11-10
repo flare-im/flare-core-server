@@ -1,20 +1,16 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use flare_im_contracts::abstractions::storage_payload::{EXTRA_KEY_SYNC, EXTRA_KEY_TAGS};
 use flare_im_contracts::utils::{normalize_optional_tenant_id, normalize_tenant_id};
+use flare_im_hooks::hooks::MessageDraft;
 use flare_im_hooks::hooks::hook_context_data::{HookContextData, set_hook_context_data};
-use flare_im_hooks::hooks::{MessageDraft, MessageRecord};
 use flare_proto::common::{Message, MessageContent};
 use flare_server_core::context::{Context, Ctx};
+use flare_server_core::error::{ErrorBuilder, ErrorCode, Result};
 use flare_server_core::grpc::middleware::signed_context::VerifiedContext;
 use flare_server_core::mq::nats::consumer::context_from_nats_headers;
 use prost::Message as _;
 use serde_json::json;
-
-use super::SubmittedMessage;
-use flare_server_core::error::Result;
 
 fn non_empty(value: String) -> Option<String> {
     if value.trim().is_empty() {
@@ -346,9 +342,23 @@ pub fn build_draft_from_request(request: &Message) -> Result<MessageDraft> {
     Ok(draft)
 }
 
-pub fn apply_draft_to_request(request: &mut Message, draft: &MessageDraft) {
-    // PreSend Hook 可能改写 `draft.payload`；必须与 `common.Message.content` 同步，否则 WAL/推送仍带旧正文或空 body。
-    request.content = MessageContent::decode(draft.payload.as_slice()).ok();
+/// 把跑完 Hook 的草稿写回消息。
+///
+/// PreSend Hook 可能改写 `draft.payload`：必须与 `common.Message.content` 同步，否则 WAL 与推送仍带旧
+/// 正文。调用链已经逐步校验过改写；这里解不开时报 Hook 失败（可重试的 503），消息不动，绝不把正文
+/// 换成空的。
+pub fn apply_draft_to_request(request: &mut Message, draft: &MessageDraft) -> Result<()> {
+    // 没有正文的消息草稿也是空的，解出来的空内容不写回。
+    if !draft.payload.is_empty() {
+        let content = MessageContent::decode(draft.payload.as_slice()).map_err(|_| {
+            ErrorBuilder::new(
+                ErrorCode::ServiceUnavailable,
+                "pre-send hook rewrite invalid",
+            )
+            .build_error()
+        })?;
+        request.content = Some(content);
+    }
     if let Some(conv) = draft.conversation_id.as_ref() {
         request.conversation_id = conv.clone();
     }
@@ -381,74 +391,7 @@ pub fn apply_draft_to_request(request: &mut Message, draft: &MessageDraft) {
             request.attributes.insert(key.clone(), serialized);
         }
     }
-}
-
-pub fn build_message_record<S: SubmittedMessage + ?Sized>(
-    _submission: &S,
-    request: &Message,
-) -> MessageRecord {
-    let mut metadata: HashMap<String, String> = request.attributes.clone();
-    metadata.insert(
-        "business_type".into(),
-        request
-            .attributes
-            .get("business_type")
-            .cloned()
-            .unwrap_or_default(),
-    );
-    let conversation_type_str = conversation_type_int_to_label(request.conversation_type);
-    metadata.insert("conversation_type".into(), conversation_type_str.clone());
-    let decoded_msg_content = request.content.as_ref();
-    let content_type = decoded_msg_content
-        .as_ref()
-        .map(|c| match &c.content {
-            Some(flare_proto::common::message_content::Content::Text(_)) => "text/plain",
-            Some(flare_proto::common::message_content::Content::Image(_)) => "image/*",
-            Some(flare_proto::common::message_content::Content::Video(_)) => "video/*",
-            Some(flare_proto::common::message_content::Content::Audio(_)) => "audio/*",
-            Some(flare_proto::common::message_content::Content::File(_)) => {
-                "application/octet-stream"
-            }
-            Some(flare_proto::common::message_content::Content::Location(_)) => "location",
-            Some(flare_proto::common::message_content::Content::Card(_)) => "card",
-            Some(flare_proto::common::message_content::Content::Notification(_)) => "notification",
-            Some(flare_proto::common::message_content::Content::Custom(_)) => "application/custom",
-            Some(flare_proto::common::message_content::Content::Forward(_)) => "forward",
-            Some(flare_proto::common::message_content::Content::Thread(_)) => "thread",
-            Some(flare_proto::common::message_content::Content::LinkCard(_)) => "link_card",
-            Some(_) => "application/unknown",
-            None => "application/unknown",
-        })
-        .unwrap_or("application/unknown");
-    metadata.insert("content_type".into(), content_type.to_string());
-
-    if let Some(client_msg_id) = extract_client_message_id(request) {
-        metadata
-            .entry("client_message_id".into())
-            .or_insert(client_msg_id);
-    }
-    let tags: HashMap<String, String> = request
-        .attributes
-        .get(EXTRA_KEY_TAGS)
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
-    for (key, value) in &tags {
-        metadata.insert(format!("tag::{}", key), value.clone());
-    }
-    MessageRecord {
-        message_id: request.server_id.clone(),
-        client_message_id: Some(request.client_msg_id.clone()),
-        conversation_id: request.conversation_id.clone(),
-        sender_id: request.sender_id.clone(),
-        conversation_type: Some(conversation_type_str),
-        message_type: metadata.get("content_type").cloned(),
-        persisted_at: SystemTime::now(),
-        metadata,
-    }
-}
-
-pub fn draft_from_submission<S: SubmittedMessage + ?Sized>(submission: &S) -> Result<MessageDraft> {
-    build_draft_from_request(submission.message())
+    Ok(())
 }
 
 pub fn merge_context(original: &Ctx, updated: Ctx) -> Ctx {
@@ -606,5 +549,62 @@ fn infer_from_content_type(raw: &str) -> &'static str {
         "event" => "event",
         "system" | "system_message" => "system",
         _ => "custom",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flare_proto::common::{TextContent, message_content::Content};
+
+    fn text(body: &str) -> MessageContent {
+        MessageContent {
+            content: Some(Content::Text(TextContent {
+                text: body.to_string(),
+                ..Default::default()
+            })),
+        }
+    }
+
+    /// 改写解不开时报可重试的错误，消息保持原样：以前 `.ok()` 把正文换成空的。
+    #[test]
+    fn an_undecodable_draft_is_an_error_and_leaves_the_message_alone() {
+        let mut message = Message {
+            content: Some(text("hello")),
+            ..Default::default()
+        };
+        let mut draft = build_draft_from_request(&message).unwrap();
+        draft.payload = vec![0xff, 0xff, 0xff];
+
+        let error = apply_draft_to_request(&mut message, &draft).unwrap_err();
+
+        assert_eq!(error.code(), Some(ErrorCode::ServiceUnavailable));
+        assert!(error.is_retryable(), "{error}");
+        assert_eq!(message.content, Some(text("hello")));
+    }
+
+    #[test]
+    fn a_valid_rewrite_reaches_the_message() {
+        let mut message = Message {
+            content: Some(text("hello")),
+            ..Default::default()
+        };
+        let mut draft = build_draft_from_request(&message).unwrap();
+        draft.payload = text("***").encode_to_vec();
+
+        apply_draft_to_request(&mut message, &draft).unwrap();
+
+        assert_eq!(message.content, Some(text("***")));
+    }
+
+    /// 没有正文的消息不会被写回一个空内容。
+    #[test]
+    fn a_message_without_content_stays_without_content() {
+        let mut message = Message::default();
+        let draft = build_draft_from_request(&message).unwrap();
+
+        apply_draft_to_request(&mut message, &draft).unwrap();
+
+        assert_eq!(message.content, None);
     }
 }

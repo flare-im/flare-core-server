@@ -1,7 +1,7 @@
 use super::*;
 use flare_im_capability_core::plugin::authorization::TenantPluginGrant;
 use flare_im_capability_core::plugin::runtime::{
-    PluginDeployment, ProjectedPlugin, configuration_digest, digest_bytes,
+    ProjectedLifecycle, ProjectedPlugin, digest_bytes,
 };
 use flare_im_contracts::message::Message;
 use flare_proto::common::{AppCardContent, CustomContent, TextContent};
@@ -14,14 +14,16 @@ const POLL_MANIFEST: &str = include_str!(concat!(
     "/../../../flare-protocol/flare-plugin-protocol/tests/fixtures/plugin-ui-v2-manifest.json"
 ));
 
-pub(crate) fn snapshot(
+/// A projection of the poll, and the manifests its digests name.
+pub(crate) fn projection(
     tenant: &str,
     now: i64,
     manifest: serde_json::Value,
-) -> PluginRuntimeSnapshot {
+) -> (PluginProjection, HashMap<String, Arc<PluginManifest>>) {
     let raw = serde_json::to_string(&manifest).unwrap();
     let digest = digest_bytes(raw.as_bytes());
-    PluginRuntimeSnapshot {
+    let parsed = Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap());
+    let projection = PluginProjection {
         organization_id: Some("org-1".into()),
         tenant_id: tenant.into(),
         version: 7,
@@ -40,22 +42,17 @@ pub(crate) fn snapshot(
                 approved_data_scopes: Default::default(),
                 enabled: true,
                 revoked: false,
+                suspended: false,
                 valid_from_ms: now,
                 valid_until_ms: now + 300_000,
             },
-            manifest_json: raw,
-            deployment: PluginDeployment {
-                deployment_id: "poll-1".into(),
-                plugin_id: "example.poll".into(),
-                plugin_version: "0.2.0".into(),
-                manifest_digest: digest,
-                artifact_digest: manifest["artifact"]["digest"].as_str().unwrap().into(),
-                grpc_authority: "http://127.0.0.1:1".into(),
-            },
-            configuration_digest: configuration_digest(&serde_json::json!({})).unwrap(),
-            client_configuration: Default::default(),
+            lifecycle: ProjectedLifecycle::Installed,
+            export_until_ms: None,
+            features: Default::default(),
         }],
-    }
+        bindings: Vec::new(),
+    };
+    (projection, HashMap::from([(digest, parsed)]))
 }
 
 pub(crate) fn poll_manifest() -> serde_json::Value {
@@ -143,9 +140,11 @@ struct Source {
 impl Source {
     fn with_rules(manifest: serde_json::Value) -> Self {
         let now = chrono::Utc::now().timestamp_millis();
+        let (projection, manifests) = projection("app-a", now, manifest);
         Self {
-            rules: Some(Arc::new(EntityRules::from_snapshot(
-                &snapshot("app-a", now, manifest),
+            rules: Some(Arc::new(EntityRules::from_projection(
+                &projection,
+                &manifests,
                 now,
             ))),
             ..Default::default()
@@ -355,23 +354,30 @@ fn rules_follow_the_writer_binding_rule() {
     else {
         panic!("an APP_CARD plugin card");
     };
-    let rules = EntityRules::from_snapshot(&snapshot("app-a", now, poll_manifest()), now);
+    let (enabled, manifests) = projection("app-a", now, poll_manifest());
+    let rules = EntityRules::from_projection(&enabled, &manifests, now);
     assert_eq!(
         rules.entity_of(&card_envelope, now).as_deref(),
         Some("poll-1")
     );
     assert_eq!(rules.entity_of(&card_envelope, now + 300_000), None);
     for mode in 0..3 {
-        let mut snapshot = snapshot("app-a", now, poll_manifest());
+        let mut projection = enabled.clone();
         match mode {
-            0 => snapshot.plugins[0].grant.enabled = false,
-            1 => snapshot.plugins[0].grant.revoked = true,
-            _ => snapshot.plugins[0].grant.valid_until_ms = now,
+            0 => projection.plugins[0].grant.enabled = false,
+            1 => projection.plugins[0].grant.revoked = true,
+            _ => projection.plugins[0].grant.valid_until_ms = now,
         }
         assert_eq!(
-            EntityRules::from_snapshot(&snapshot, now).entity_of(&card_envelope, now),
+            EntityRules::from_projection(&projection, &manifests, now)
+                .entity_of(&card_envelope, now),
             None,
             "mode {mode}"
         );
     }
+    // A digest the registry does not hold skips the plugin.
+    assert_eq!(
+        EntityRules::from_projection(&enabled, &HashMap::new(), now).entity_of(&card_envelope, now),
+        None
+    );
 }

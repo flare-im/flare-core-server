@@ -2,7 +2,7 @@
 
 第三方接入 Flare IM Core 时，先区分接入方是谁：终端 SDK、业务服务端、管理后台、内部服务还是扩展插件。不同入口的可靠性、权限和协议稳定性不同。
 
-**推荐策略**：生产环境业务系统接入优先使用 gRPC PreSend/PostSend Hook 和内部 typed gRPC 调用。HTTP/OpenAPI 主要用于外部三方、管理后台、低频后台任务和临时适配；不要把高 QPS 主链业务调用长期压在 HTTP facade 上。
+**推荐策略**：生产环境业务系统接入优先使用 gRPC PreSend Hook 和内部 typed gRPC 调用。HTTP/OpenAPI 主要用于外部三方、管理后台、低频后台任务和临时适配；不要把高 QPS 主链业务调用长期压在 HTTP facade 上。
 
 ## 接入模式
 
@@ -22,7 +22,7 @@
 | 高频服务端发消息、系统消息、业务事件 | typed gRPC | `MessageSendService` / `MessageEventService` / `MessageActionService` | 可信内网低开销调用，metadata 明确透传租户、用户和 trace。 |
 | 好友、群、成员变更同步到 Core | typed gRPC | `ConversationManageService` / `MessageEventService.ExecuteEvent` | 业务系统 Bridge 推荐直接调用 typed gRPC。 |
 | 发信前权限、风控、黑名单、禁言校验 | gRPC Hook | `PreSend` Hook | 主链门禁必须短超时、fail-fast，并通过服务发现或固定 endpoint 管理。 |
-| 发送后审计、BI、送达分析 | gRPC Hook 或 MQ consumer | `PostSend` / `Delivery` Hook | 旁路能力可 ignore/retry，避免拖慢主链 ACK。 |
+| 发送后审计、BI、送达分析 | MQ consumer | 消息主流事件 | 旁路能力走事件，不进发送路径 |
 | 外部三方、开放平台、业务后台低频操作 | HTTP/OpenAPI | `flare-api-gateway` | 稳定公开合同、易鉴权、易文档化。 |
 | 管理审计、导出、强制操作 | HTTP Admin facade | `flare-admin-gateway` | 需要 Admin scope、审计原因、分页和限流。 |
 
@@ -216,21 +216,20 @@ curl "http://127.0.0.1:50050/api/v1/presence/users/alice" \
 
 ## Hook 接入
 
-Hook 用于把业务规则接入主链，但不污染 Core。业务系统主链 Hook 推荐使用 gRPC transport；Webhook/HTTP Hook 只建议用于低频、临时适配或非主链旁路场景。
+Hook 用于把业务规则接入主链，但不污染 Core。Hook 只做同步拦截，只有一个点位 `message.pre_send`，可以放行、
+拒绝或改写。只想知道发生了什么的集成走事件，不要写 Hook。线上协议见
+[Hook 合同](HOOK-PLUGIN-CONTRACT.md)。
 
-当前支持的 Hook 类别包括：
+业务系统主链 Hook 推荐使用 gRPC transport；Webhook 适合低频审批、外部系统兼容或临时适配。
 
-- `PreSend`
-- `PostSend`
-- `Delivery`
-- `Recall`
-- `MessageRead`
-- `MessageReaction`
-- `ConversationLifecycle`
-- `ConversationMember`
-- Push 相关 Hook
-- Presence/User online/offline Hook
-- Custom Hook
+Hook 只有一个运行时，在 Message Ingest 里。配置有两个来源：
+
+| 来源 | 放什么 | 改配置 |
+|---|---|---|
+| 部署文件 | 必需策略，如业务系统的发信门禁 | 改部署，重启；缺失或非法时服务退出 |
+| `hook_configs` | 平台和应用配的 Hook | 经 `CapabilityService.Administer` 写入，约一秒生效 |
+
+调用链按来源排：应用 → 平台 → 部署，同来源按 `order`。部署 Hook 在最后，看到的是最终内容。
 
 ### PreSend Hook
 
@@ -248,10 +247,9 @@ Hook 用于把业务规则接入主链，但不污染 Core。业务系统主链 
 name = "business-policy-pre-send"
 description = "发信前业务系统权限校验"
 enabled = true
-priority = 110
+order = 110
 timeout_ms = 500
 require_success = true
-error_policy = "fail_fast"
 
 [pre_send.selector]
 # tenants 省略或为空 = 匹配所有租户；只对部分租户生效时写 tenants = ["tenant-a", "tenant-b"]
@@ -267,16 +265,16 @@ hook_operation = "flare.hook.v1.pre_send"
 policy = "business_message_permission"
 ```
 
-### PostSend / Delivery Hook
+失败语义：
 
-适合：
+| 情况 | `require_success = true` | `require_success = false` |
+|---|---|---|
+| 目标明确拒绝 | 拒绝发送 | 拒绝发送 |
+| 目标超时、不可达、熔断打开 | 回 503，可重试 | 跳过 |
+| 改写结果解码失败 | 回 503，保留原消息 | 跳过这次改写 |
+| 总时限耗尽 | 回 503 | 跳过 |
 
-- 审计。
-- BI 统计。
-- 送达率分析。
-- 异步业务联动。
-
-建议 `require_success = false`，`error_policy = "ignore"` 或 `retry`，避免旁路系统拖慢主链。
+每一步的时限取 `timeout_ms` 和总时限剩余的较小值，总时限是 `MESSAGE_INGEST_EXTENSION_PRE_SEND_TIMEOUT_MS`。
 
 ## Capability 接入
 
@@ -331,6 +329,6 @@ Core 需要业务系统提供：
 - 是否所有写请求都有稳定 `client_msg_id` 或 idempotency key。
 - 是否区分持久消息和临时通知。
 - 是否把好友/群/权限放在业务系统，而不是 Core。
-- 是否给 Hook 设置短超时、重试/失败策略和选择器。
+- 是否给 Hook 设置短超时、是否必需和选择器。
 - 是否给业务消息使用 typed content 或清晰的 `CustomContent.type`。
 - 是否接入 observability：trace id、request id、ledger、MQ lag、DLQ。

@@ -600,6 +600,44 @@ fn entity_inputs_list_every_card_that_passes_its_entity() {
     );
 }
 
+/// `plugin` running the manifest `raw`, the digests following it.
+pub(crate) fn with_manifest(
+    plugin: &flare_im_capability_core::plugin::runtime::ResolvedPlugin,
+    raw: &str,
+) -> flare_im_capability_core::plugin::runtime::ResolvedPlugin {
+    use flare_im_capability_core::plugin::runtime::{ResolvedPlugin, digest_bytes};
+    let digest = digest_bytes(raw.as_bytes());
+    let mut grant = plugin.grant.clone();
+    grant.manifest_digest = digest.clone();
+    let mut deployment = plugin.deployment.clone();
+    deployment.manifest_digest = digest;
+    ResolvedPlugin::new(
+        grant,
+        std::sync::Arc::new(PluginManifest::from_json(raw.as_bytes()).unwrap()),
+        deployment,
+        plugin.configuration_digest.clone(),
+        plugin.client_configuration.clone(),
+        plugin.features.clone(),
+    )
+    .unwrap()
+}
+
+/// `plugin` with the application's feature states `features`.
+pub(crate) fn with_features(
+    plugin: &flare_im_capability_core::plugin::runtime::ResolvedPlugin,
+    features: std::collections::BTreeMap<String, bool>,
+) -> flare_im_capability_core::plugin::runtime::ResolvedPlugin {
+    flare_im_capability_core::plugin::runtime::ResolvedPlugin::new(
+        plugin.grant.clone(),
+        std::sync::Arc::new(plugin.manifest().clone()),
+        plugin.deployment.clone(),
+        plugin.configuration_digest.clone(),
+        plugin.client_configuration.clone(),
+        features,
+    )
+    .unwrap()
+}
+
 /// The protocol's example poll, fully approved for `app-a`, served at `authority`.
 pub(crate) fn poll_snapshot(
     authority: String,
@@ -616,37 +654,50 @@ pub(crate) fn poll_snapshot(
         version: 3,
         issued_at_ms: now,
         valid_until_ms: now + 300_000,
-        plugins: vec![ProjectedPlugin {
-            grant: TenantPluginGrant {
-                grant_id: "g-poll".into(),
-                revision: 4,
-                tenant_id: "app-a".into(),
-                plugin_id: "example.poll".into(),
-                plugin_version: manifest.version.clone(),
-                manifest_digest: digest.clone(),
-                approved_operations: manifest.operation_ids(),
-                approved_permissions: manifest.permissions.iter().map(|p| p.id.clone()).collect(),
-                approved_data_scopes: manifest
-                    .permissions
+        plugins: vec![
+            ResolvedPlugin::new(
+                TenantPluginGrant {
+                    grant_id: "g-poll".into(),
+                    revision: 4,
+                    tenant_id: "app-a".into(),
+                    plugin_id: "example.poll".into(),
+                    plugin_version: manifest.version.clone(),
+                    manifest_digest: digest.clone(),
+                    approved_operations: manifest.operation_ids(),
+                    approved_permissions: manifest
+                        .permissions
+                        .iter()
+                        .map(|p| p.id.clone())
+                        .collect(),
+                    approved_data_scopes: manifest
+                        .permissions
+                        .iter()
+                        .flat_map(|p| p.data_scopes.iter().cloned())
+                        .collect(),
+                    enabled: true,
+                    revoked: false,
+                    suspended: false,
+                    valid_from_ms: now,
+                    valid_until_ms: now + 300_000,
+                },
+                std::sync::Arc::new(manifest.clone()),
+                PluginDeployment {
+                    deployment_id: "poll-1".into(),
+                    plugin_id: "example.poll".into(),
+                    plugin_version: manifest.version.clone(),
+                    manifest_digest: digest,
+                    artifact_digest: manifest.artifact.as_ref().unwrap().digest.clone(),
+                    grpc_authority: authority,
+                },
+                configuration_digest(&json!({"maxOptions": 6})).unwrap(),
+                Default::default(),
+                manifest
+                    .features
                     .iter()
-                    .flat_map(|p| p.data_scopes.iter().cloned())
+                    .map(|feature| (feature.id.clone(), true))
                     .collect(),
-                enabled: true,
-                revoked: false,
-                valid_from_ms: now,
-                valid_until_ms: now + 300_000,
-            },
-            manifest_json: raw,
-            deployment: PluginDeployment {
-                deployment_id: "poll-1".into(),
-                plugin_id: "example.poll".into(),
-                plugin_version: manifest.version.clone(),
-                manifest_digest: digest,
-                artifact_digest: manifest.artifact.as_ref().unwrap().digest.clone(),
-                grpc_authority: authority,
-            },
-            configuration_digest: configuration_digest(&json!({"maxOptions": 6})).unwrap(),
-            client_configuration: Default::default(),
-        }],
+            )
+            .unwrap(),
+        ],
     }
 }

@@ -210,6 +210,23 @@ impl<R: ConversationRepository + Send + Sync> UserService<R> {
         })
     }
 
+    /// Private identity-owner effect; no Staff impersonation or device-wide wildcard kick.
+    pub async fn revoke_identity_sessions(
+        &self,
+        tenant: &str,
+        user: &str,
+        sessions: &[String],
+        cutoff_ms: i64,
+        request_id: &str,
+        signing_key_id: &str,
+    ) -> Result<u32> {
+        let user = crate::domain::value_object::UserId::new(user.to_owned())
+            .map_err(|error| flare_server_core::error::FlareError::system(error.to_string()))?;
+        self.conversation_repository
+            .revoke_identity_sessions(tenant, &user, sessions, cutoff_ms, request_id, signing_key_id)
+            .await
+    }
+
     /// 踢出设备（运维操作）：连接端收到 [`kick_reason::DEVICE_KICKED`]，请求里的原因只进日志。
     pub async fn kick_device(
         &self,

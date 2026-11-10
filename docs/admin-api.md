@@ -93,16 +93,25 @@ All paths are under `/api/v1/admin`. The code column is the signed `permission` 
 | `GET /capabilities/tenant` | `core:capabilities:read` | `CapabilityAdminService.ListTenantCapabilitySwitches` | no |
 | `PUT /capabilities/tenant/{capability_id}` | `core:capabilities:write` | `CapabilityService.SetTenantCapabilitySwitch` (tenant from the context) | yes |
 | `GET /plugins` | `core:plugins:read` | `CapabilityService.ListRegisteredPlugins` (tenant from the context) | no |
-| `POST /plugins/register` | `core:plugins:write`, platform staff only | `CapabilityService.RegisterPluginEndpoint` (tenant and request id from the context) | yes |
-| `POST /plugins/deregister` | `core:plugins:write`, platform staff only | `CapabilityService.DeregisterPluginEndpoint` (tenant and request id from the context) | yes |
 | `GET /hooks` | `core:hooks:read` | `CapabilityService.Administer` `flare.extension.v1.hook_config.list` (tenant from the context) | no |
-| `POST /hooks` | `core:hooks:write` | `Administer` `hook_config.create` (tenant from the context) | yes |
+| `POST /hooks` | `core:hooks:write` | Refused: application hooks need an egress switch (`ADMIN_HOOK_APPLICATION_UNAVAILABLE`) | yes |
 | `GET /hooks/{hook_id}` | `core:hooks:read` | `Administer` `hook_config.get` | no |
 | `PUT /hooks/{hook_id}` | `core:hooks:write` | `Administer` `hook_config.update` | yes |
 | `DELETE /hooks/{hook_id}` | `core:hooks:write` | `Administer` `hook_config.delete` | yes |
 | `PUT /hooks/{hook_id}/status` | `core:hooks:write` | `Administer` `hook_config.set_status` | yes |
 | `GET /hooks/{hook_id}/statistics` | `core:hooks:read` | `Administer` `hook_config.get_statistics` | no |
 | `GET /hooks/{hook_id}/executions` | `core:hooks:read` | `Administer` `hook_config.query_executions` | no |
+| `GET /platform/hooks` | `core:hooks:read`, platform staff only | `Administer` `hook_config.list` (`tenant_id` empty) | no |
+| `POST /platform/hooks` | `core:hooks:platform:write`, platform staff only | `Administer` `hook_config.create` (`tenant_id` empty) | yes |
+| `GET /platform/hooks/points` | `core:hooks:read`, platform staff only | `Administer` `hook_point.list` | no |
+| `GET /platform/hooks/profiles` | `core:hooks:read`, platform staff only | `Administer` `hook_profile.list` | no |
+| `POST /platform/hooks/test` | `core:hooks:platform:write`, platform staff only | `Administer` `hook_config.test` | yes |
+| `GET /platform/hooks/{hook_id}` | `core:hooks:read`, platform staff only | `Administer` `hook_config.get` | no |
+| `PUT /platform/hooks/{hook_id}` | `core:hooks:platform:write`, platform staff only | `Administer` `hook_config.update` | yes |
+| `DELETE /platform/hooks/{hook_id}` | `core:hooks:platform:write`, platform staff only | `Administer` `hook_config.delete` | yes |
+| `PUT /platform/hooks/{hook_id}/status` | `core:hooks:platform:write`, platform staff only | `Administer` `hook_config.set_status` | yes |
+| `GET /platform/hooks/{hook_id}/statistics` | `core:hooks:read`, platform staff only | `Administer` `hook_config.get_statistics` | no |
+| `GET /platform/hooks/{hook_id}/executions` | `core:hooks:read`, platform staff only | `Administer` `hook_config.query_executions` | no |
 | `POST /plugin-admin/{plugin_id}/{permission}/query` | `plugin:<plugin_id>:<permission>` | `Administer` `flare.plugin.v1.admin.query` (tenant from the context) | no |
 | `POST /plugin-admin/{plugin_id}/{permission}/dispatch` | `plugin:<plugin_id>:<permission>` | `Administer` `flare.plugin.v1.admin.dispatch` (tenant from the context) | yes |
 
@@ -138,11 +147,9 @@ These routes use the Admin-Gateway-only Capability downstream. When it is disabl
 
 `PUT /capabilities/tenant/{capability_id}` takes `{"enabled": true|false}` and sets the switch of the signed application. It returns `{tenant_id, capability_id, enabled, message}`; `message` is Capability's confirmation text.
 
-`GET /plugins?capability_id=` returns `{tenant_id, plugins}`, sorted by `plugin_id`. Each plugin has `plugin_id`, `capability_id`, `grpc_authority`, `plugin_version`, `api_version`, `manifest_sha256`, `declared_operations`, `unverified`, `seat_model` and `labels`. With `capability_id`, only instances serving that capability are listed, whether by registration or by declared operation.
+`GET /plugins?capability_id=` returns `{tenant_id, plugins}`, sorted by `plugin_id`. Each plugin has `plugin_id`, `capability_id`, `grpc_authority`, `plugin_version`, `api_version`, `manifest_sha256`, `declared_operations`, `unverified` and `labels`. With `capability_id`, only instances serving that capability are listed, whether by registration or by declared operation.
 
-`POST /plugins/register` (platform staff only) takes `{plugin_id, capability_id, grpc_authority, labels, plugin_version, api_version, manifest_sha256, declared_operations, seat_model}`; the first three are required (400 `ADMIN_PLUGIN_FIELD_REQUIRED` otherwise), and `plugin_id`, `capability_id` and every `declared_operations` entry must be 1 to 128 ASCII letters, digits or `_ - . :` (400 `ADMIN_PLUGIN_FIELD_INVALID` otherwise; Capability applies the same rule and answers `INVALID_ARGUMENT`); the tenant and the request id come from the context. It returns `{tenant_id, plugin_id, accepted, message}`; `message` says `registered (unverified)` when `declared_operations` was empty, and Capability refuses a `capability_id` outside a non-empty declaration with 400 `BAD_REQUEST`. `POST /plugins/deregister` takes `{plugin_id}` and returns `{tenant_id, plugin_id, accepted}`; `accepted=false` means the instance was not registered.
-
-Plugin registrations persist across Capability restarts: Capability writes them to `capability_plugin_endpoints` (migration 0011) before it accepts them, and every Capability instance re-reads the table, so a registration made through one instance is listed by all of them within `FLARE_CAPABILITY_PLUGIN_ROUTE_REFRESH_SECS` (10 seconds by default). A registration that is neither re-registered nor healthy within `FLARE_CAPABILITY_PLUGIN_ROUTE_TTL_SECS` (one day by default) is removed. When Capability cannot write the table, register and deregister answer 503 `ADMIN_UPSTREAM_UNAVAILABLE` and nothing changes. Endpoints that Capability discovers from its own configuration are listed too, but are never stored and never expire; see the Capability README.
+Plugin deployments are registered in the plugin registry (`/platform/plugin-registry/**`); a process never registers itself. `GET /plugins` reads the application's authorized snapshot and is diagnostics only.
 
 ### Plugin admin operations
 
@@ -150,11 +157,13 @@ The two `plugin-admin/*` routes call the admin operations a plugin's manifest de
 
 ### Hooks
 
-The eight `hooks/*` routes govern Hook configurations through Capability's `Administer` RPC; Capability checks the stored configuration's tenant before any hook-id operation, so a hook of another application answers 403 `FORBIDDEN` and a missing one 404 `NOT_FOUND`. A `hook_id` is the numeric id or `hook_type:name`.
+The `hooks/*` and `platform/hooks/*` routes govern Hook configurations through Capability's `Administer` RPC. A hook is one point (`hook_type`) and one target. `hooks/*` addresses the application in the Staff context, `platform/hooks/*` the platform (`tenant_id` empty); the Social partition serves the latter at `/admin/v1/hooks/*`, for platform staff, and signs the tenant `platform`. Capability checks the stored configuration's scope before any hook-id operation, so a hook of another scope answers 403 `FORBIDDEN` and a missing one 404 `NOT_FOUND`; each write code opens only its own scope. A `hook_id` is the numeric id or `hook_type:name`; a deployment hook has no row and answers its statistics and executions on the platform routes by `hook_type:name`.
 
-`GET /hooks?hook_type=&enabled_only=&limit=` returns `{hooks, limit, has_more, total}`. `limit` defaults to 100 and is capped at 1000 (Capability pages by limit only). A hook has `hook_id`, `name`, `hook_type`, `tenant_id`, `priority`, `enabled`, `transport`, `selector`, `retry_policy`, `created_at`, `updated_at`, `hook_points` and `config_extensions`. `transport` carries `type` (`grpc`, `webhook`, `local`), `service_name`, `endpoint`, `registry_type`, `namespace`, `load_balance`, `headers`, `target`, `timeout_ms`, `metadata` and `secret_configured`; the webhook `secret` is accepted on create and update and never returned. `selector` has `tenants`, `conversation_types`, `message_types`, `business_types`, `hook_points`, `app_ids` and `conversation_ids`; `retry_policy` has `max_retries`, `retry_interval_ms` and `backoff_strategy`; `config_extensions` has `contract_version`, `attributes` and `extensions` (a map of `{type_url, value_base64}`).
+`GET /hooks?hook_type=&enabled_only=&limit=` returns `{hooks, limit, has_more, total}`. `limit` defaults to 100 and is capped at 1000 (Capability pages by limit only). A hook has `hook_id`, `name`, `hook_type`, `tenant_id`, `order`, `required`, `enabled`, `transport`, `selector`, `created_at` and `updated_at`. `selector` has `tenants`, `conversation_types` and `message_types`, what the runtime matches on. `transport` carries `type` (`grpc`, `webhook`), `service_name`, `endpoint`, `registry_type`, `namespace`, `load_balance`, `headers`, `target`, `timeout_ms`, `metadata` and `secret_configured`; the webhook `secret` is accepted on create and update and never returned. `selector` has `tenants`, `conversation_types`, `message_types`, `business_types`, `hook_points`, `app_ids` and `conversation_ids`; `retry_policy` has `max_retries`, `retry_interval_ms` and `backoff_strategy`; `config_extensions` has `contract_version`, `attributes` and `extensions` (a map of `{type_url, value_base64}`).
 
-`POST /hooks` takes `{name, hook_type, priority, transport, selector, retry_policy, hook_points, config_extensions}` (the tenant comes from the context; a `tenant_id` in the body is ignored) and returns `{hook}`. A blank `name` or `hook_type` is 400 `ADMIN_HOOK_NAME_REQUIRED` / `ADMIN_HOOK_TYPE_REQUIRED`, an unknown hook point 400 `ADMIN_HOOK_POINT_INVALID`, an extension that is not base64 400 `ADMIN_HOOK_EXTENSION_INVALID`. Capability refuses a `name` longer than 128 characters or holding a control character (`char::is_control`: line breaks, tab, ESC, DEL, C1) on create and on a rename, which comes back as 400 `BAD_REQUEST`; names stored or configured before this rule still load and run, and Capability escapes control characters wherever it logs a hook name. `GET /hooks/{hook_id}` returns `{hook}`; `PUT /hooks/{hook_id}` takes the same fields minus `hook_type` and returns `{hook}` after the update; `DELETE /hooks/{hook_id}` returns `{hook_id, deleted}`; `PUT /hooks/{hook_id}/status` takes `{"enabled": true|false}` and returns `{hook_id, enabled, updated}`.
+`POST /hooks` is refused with 400 `ADMIN_HOOK_APPLICATION_UNAVAILABLE`: application hooks need outbound validation, an egress switch and quotas first. `POST /platform/hooks` takes `{name, hook_type, order, required, transport, selector}` (`required` defaults to true; a `tenant_id` in the body is ignored) and returns `{hook}`. A blank `name` or `hook_type` is 400 `ADMIN_HOOK_NAME_REQUIRED` / `ADMIN_HOOK_TYPE_REQUIRED`. Capability refuses a `name` longer than 128 characters or holding a control character (`char::is_control`: line breaks, tab, ESC, DEL, C1) on create and on a rename, which comes back as 400 `BAD_REQUEST`; names stored or configured before this rule still load and run, and Capability escapes control characters wherever it logs a hook name. `GET /hooks/{hook_id}` returns `{hook}`; `PUT /hooks/{hook_id}` takes the same fields minus `hook_type`, leaves out what it does not send, and returns `{hook}` after the update; `DELETE /hooks/{hook_id}` returns `{hook_id, deleted}`; `PUT /hooks/{hook_id}/status` takes `{"enabled": true|false}` and returns `{hook_id, enabled, updated}`.
+
+`GET /platform/hooks/points` returns `{points}`, the point catalog (`id`, `hook_type`, `summary`). `GET /platform/hooks/profiles` returns `{profiles}`, what each service loaded from its deployment file (`service`, `source`, `instance_id`, `loaded_at`, `hooks`); a deployment hook is read-only and carries no secret, header or metadata value. `POST /platform/hooks/test` takes `{hook_id, hook_type, transport}`, calls the target once with a sample message off the send path, and returns `{outcome, latency_ms, code}`: `allowed`, `rewritten`, `rejected`, `identity_required` (reachable, wants the sender's signed identity) or `failed` (`code` is `timeout`, `unavailable` or `bad_response`). Neither `hook_id` nor `transport` is 400 `ADMIN_HOOK_TARGET_REQUIRED`. The call is bounded by the hook's timeout, at most 3 seconds, and sends no signed context.
 
 `GET /hooks/{hook_id}/statistics?start_time=&end_time=` returns `{hook_id, total_executions, success_count, failure_count, avg_latency_ms, p99_latency_ms, rate_limit_count, circuit_break_count, error_count_by_code}`; without a range Capability takes the last 24 hours, and `end_time` before `start_time` is 400 `ADMIN_HOOK_TIME_RANGE_INVALID`. Times are Unix milliseconds from 0 through 253402300799999 (the end of year 9999); Capability answers a time outside that range, or a `start_time` in the future without an `end_time`, with 400 `BAD_REQUEST`. `GET /hooks/{hook_id}/executions?message_id=&success_only=&start_time=&end_time=&limit=` returns `{hook_id, executions, limit, has_more}`, newest first; an execution has `execution_id`, `hook_id`, `message_id`, `success`, `latency_ms`, `error_code`, `error_message` and `executed_at`.
 
@@ -167,11 +176,19 @@ The four `medias/*` routes moved here from API Gateway with SEC-05. All paths ar
 | Method and path | Code | Media RPC | Write | Contract `status` |
 | --- | --- | --- | --- | --- |
 | `GET /medias/bucket?bucket=` | `core:medias:read` | `MediaService.DescribeBucket` | no | `available` |
+| `GET /medias/upload-policy?purpose=` | `core:medias:write` | `MediaService.GetAdminUploadPolicy` | no | `available` |
+| `POST /medias/uploads/initiate` | `core:medias:write` | `MediaService.AdminInitiateDirectUpload` | yes | `available` |
+| `GET /medias/uploads/{upload_id}` | `core:medias:write` | `MediaService.GetDirectUploadStatus` | no | `available` |
+| `POST /medias/uploads/presign-parts` | `core:medias:write` | `MediaService.PresignDirectUploadParts` | yes | `available` |
+| `POST /medias/uploads/commit-parts` | `core:medias:write` | `MediaService.CommitDirectUploadParts` | yes | `available` |
+| `POST /medias/uploads/complete` | `core:medias:write` | `MediaService.CompleteDirectUpload` | yes | `available` |
+| `POST /medias/uploads/abort` | `core:medias:write` | `MediaService.AbortDirectUpload` | yes | `available` |
+| `GET /medias/files/{file_id}/url` | `core:medias:read` | `MediaService.GetFileUrl` | no | `available` |
 | `GET /medias/objects?bucket=&prefix=` | `core:medias:read` | `MediaService.ListObjects` | no | `not_implemented` |
 | `POST /medias/cleanup-orphaned-assets` | `core:medias:write` | `MediaService.CleanupOrphanedAssets` | yes | `available` |
 | `POST /medias/object-acl` | `core:medias:write` | `MediaService.SetObjectAcl` | yes | `not_implemented` |
 
-Authentication, tenant scope and write headers are the same as for every other route. The downstream identity differs: Media accepts only a Cell-signed internal context (`x-flare-ctx`, EdDSA, 60 seconds) from a key it holds, so the gateway signs a fresh one for every RPC with `FLARE_INTERNAL_CTX_PRIVATE_KEY` under `kid=admin-gateway`. It names the employee as `tenant_admin` of the signed application and carries the signed request id. The staff context itself is not sent to Media, and caller-supplied `x-user-id`, `x-actor-*` or `x-flare-ctx` headers never reach it. Without the private key every media route answers 500 `MEDIA_SIGNER_UNAVAILABLE` and does not call Media. Media's side of this boundary is described in [SEC05](SEC05-media-tenant-isolation.md).
+Authentication, tenant scope and write headers are the same as for every other route. Media receives the original verified Staff assertion unchanged and checks its signed application and exact permission again. Admin Gateway holds no Media signing private key and never converts an employee to an IM user. Caller-supplied identity headers do not establish ownership. Application image upload, persistent file IDs, content validation and preview access are described in [Application image upload](admin-image-upload.md).
 
 Media rejections use the error table above. The 500 reasons are `ADMIN_MEDIA_BUCKET_FAILED`, `ADMIN_MEDIA_LIST_OBJECTS_FAILED`, `ADMIN_MEDIA_CLEANUP_FAILED` and `ADMIN_MEDIA_OBJECT_ACL_FAILED`.
 
@@ -235,8 +252,6 @@ The effect sink connects to `FLARE_AUDIT_NATS_URL` at startup (JetStream stream 
 | `POST /users/{user_id}/devices/{device_id}/kick` | `user_session` | `<user_id>/<device_id>` | `kick_device` |
 | `POST /tenant/kick-all` | `tenant_sessions` | the tenant | `kick_all` |
 | `PUT /capabilities/tenant/{capability_id}` | `tenant_capability` | the capability id | `enable` or `disable` |
-| `POST /plugins/register` (when `accepted`) | `plugin_endpoint` | the plugin id | `register` |
-| `POST /plugins/deregister` (when `accepted`) | `plugin_endpoint` | the plugin id | `deregister` |
 | `POST /hooks` | `hook_config` | the new hook id | `create` |
 | `PUT /hooks/{hook_id}` | `hook_config` | the hook id | `update` |
 | `DELETE /hooks/{hook_id}` (when `deleted`) | `hook_config` | the hook id | `delete` |

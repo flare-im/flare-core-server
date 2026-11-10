@@ -772,7 +772,7 @@ async fn multipart_requires_session_tenant_and_owner_before_io_or_abort() {
     let id = &initial.upload_id;
     let mut session = f.sessions.get_session(id).await.unwrap().unwrap();
     assert_eq!(session.tenant_id, "a");
-    assert_eq!(session.user_id, "owner");
+    assert_eq!(session.actor_id, "owner");
     for wrong in [ctx("b", "owner"), ctx("a", "other")] {
         assert!(f.service.abort_multipart_upload(&wrong, id).await.is_err());
         assert!(

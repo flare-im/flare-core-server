@@ -4,18 +4,19 @@
 
 use std::sync::Arc;
 
-use crate::composition::wiring::HookExecutionBackground;
+use crate::composition::wiring::HookRetentionBackground;
 use crate::domain::capability::CapabilityPolicyBackend;
 use crate::infrastructure::capability::{CapabilityExtensionRegistry, PluginRouteBook};
-use crate::infrastructure::config::{CapabilityRuntimeConfig, HookConfigListener};
+use crate::infrastructure::config::CapabilityRuntimeConfig;
 use crate::infrastructure::persistence::PostgresTenantProjectionRepository;
 use crate::interface::grpc::{
     CapabilityAdminGrpcServer, CapabilityGrpcServer, ExtensionPluginRouter, HookServiceServer,
-    ImHookPluginServer, TenantProjectionGrpcServer,
+    TenantProjectionGrpcServer,
 };
 
 /// 应用上下文：接口层 gRPC 依赖 + 能力注册表 + 策略后端。
 pub struct ApplicationContext {
+    pub(crate) plugin_message_events: Vec<flare_server_core::mq::consumer::MqConsumerTask>,
     pub plugin_resource_bridge:
         Option<crate::interface::grpc::resource_bridge::PluginHostBridgeGrpc>,
     /// Source-owned queue delivery, independent of IM ordering. Disabled broker retains rows.
@@ -23,8 +24,6 @@ pub struct ApplicationContext {
         Arc<sqlx::PgPool>,
         flare_im_service_kit::audit_effects::AuditEffects,
     )>,
-    /// IM `HookPlugin` 入站适配器。
-    pub im_hook_plugin: ImHookPluginServer,
     /// Hook 配置治理（写路径）；供 `CapabilityService.Administer` 与内部复用。
     pub hook_governance: Option<Arc<HookServiceServer>>,
     /// 插件 endpoint 登记簿（与 `CapabilityGrpcServer` 共享 `Arc`）。
@@ -33,7 +32,7 @@ pub struct ApplicationContext {
     pub extension_router: ExtensionPluginRouter,
     /// `ExtensionPlugin.Call` 的验签器（Cell 公钥集）；没有时路由器只回答健康检查。
     pub extension_verifier: Option<flare_server_core::SignedContextVerifier>,
-    /// 能力扩展：Guard / Resolver 注册表。
+    /// 能力扩展：Resolver 注册表。
     pub capability_registry: CapabilityExtensionRegistry,
     /// 用户授权与租户开关（内存或 PostgreSQL，与 `CapabilityService` 共用）。
     pub capability_policy: Arc<dyn CapabilityPolicyBackend>,
@@ -47,13 +46,14 @@ pub struct ApplicationContext {
     pub tenant_notice: crate::interface::grpc::TenantNoticeGrpcServer,
     /// 管理员只读（`CapabilityAdminService`）：租户开关与本地租户投影，只认转发的 Staff 上下文。
     pub capability_admin: CapabilityAdminGrpcServer<PostgresTenantProjectionRepository>,
-    /// Hook 配置跨实例失效通知的监听任务（有库时）；进程停机时停掉。
-    pub hook_config_listener: Option<HookConfigListener>,
-    /// Hook 执行证据的批量写入与保留期清理（有库且开启记录时）；随进程停机结束，停机时写完缓冲。
-    pub(crate) hook_execution_background: Option<HookExecutionBackground>,
+    /// Hook 执行证据的保留期清理（有库且开启时）；随进程停机结束。
+    pub(crate) hook_retention_background: Option<HookRetentionBackground>,
     /// 插件实体生命周期 outbox 的投递任务（有库且配置了插件调用签名器时）；随进程停机结束。
     pub(crate) entity_lifecycle_worker:
         Option<crate::application::handler::entity_lifecycle::EntityLifecycleWorker>,
+    /// 插件运行时收敛任务（有库且配置了插件调用签名器时）；随进程停机结束。
+    pub(crate) plugin_reconciler:
+        Option<Arc<crate::application::handler::plugin_reconcile::PluginReconciler>>,
     /// 租户通知 outbox 的发布任务（有库且有通知通道时）；随进程停机结束。
     pub(crate) tenant_notice_relay:
         Option<crate::application::handler::tenant_notice_relay::TenantNoticeRelay>,

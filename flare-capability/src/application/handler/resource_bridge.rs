@@ -28,7 +28,7 @@ use flare_im_capability_core::plugin::{
         MembersCheckView, RealtimeDelivery, RealtimeDeliveryView, ResourceRequest,
         ResourceWriteRequest,
     },
-    runtime::{PluginRuntimeSnapshot, ProjectedPlugin},
+    runtime::{PluginRuntimeSnapshot, ResolvedPlugin},
     state::SharedState,
 };
 use serde_json::Value;
@@ -144,6 +144,10 @@ impl ResourceBridge {
                         ServiceDispatchError::OutcomeUnknown => {
                             CapabilityError::System("plugin service outcome unknown".into())
                         }
+                        ServiceDispatchError::FeatureDisabled => CapabilityError::plugin(
+                            flare_im_service_kit::plugin_platform::PLUGIN_FEATURE_DISABLED,
+                            "service feature is not open for this application",
+                        ),
                         ServiceDispatchError::Refused => denied(),
                     })?;
                 return serde_json::to_value(reply).map_err(|_| denied());
@@ -172,7 +176,14 @@ impl ResourceBridge {
         bytes: &[u8],
     ) -> Result<Value> {
         let now = chrono::Utc::now().timestamp_millis();
-        let claims = self.verifier.verify(token, now).map_err(|_| denied())?;
+        let claims = match self.verifier.verify(token, now) {
+            Ok(claims) => claims,
+            Err(_) => {
+                return self
+                    .event_read(token, operation, request_id, bytes, now)
+                    .await;
+            }
+        };
         if request_id != claims.request_id {
             return Err(denied());
         }
@@ -208,10 +219,10 @@ impl ResourceBridge {
         {
             return Err(denied());
         }
-        let manifest = projected.manifest().map_err(|_| denied())?;
+        let manifest = projected.manifest();
         let op = manifest.operation(&claims.operation).ok_or_else(denied)?;
         if !op.host_capabilities.contains(&request.capability())
-            || super::remote_dispatch::restricted_operations(&manifest).contains(&claims.operation)
+            || super::remote_dispatch::restricted_operations(manifest).contains(&claims.operation)
         {
             return Err(denied());
         }
@@ -291,7 +302,124 @@ impl ResourceBridge {
         Ok(result)
     }
 
-    async fn snapshot(&self, tenant: &str, now: i64) -> Result<PluginRuntimeSnapshot> {
+    /// Events authorize only a membership lookup of their signed actor, under Core's service
+    /// identity. They never reach a backend API carrying a manufactured user credential.
+    async fn event_read(
+        &self,
+        token: &str,
+        operation: &str,
+        request_id: &str,
+        bytes: &[u8],
+        now: i64,
+    ) -> Result<Value> {
+        let claims = self
+            .verifier
+            .verify_event_origin(token, now)
+            .map_err(|_| denied())?;
+        if claims.event_id != request_id
+            || operation != HostCapability::ConversationMembersCheck.id()
+        {
+            return Err(denied());
+        }
+        let request: ResourceRequest = serde_json::from_slice(bytes).map_err(|_| denied())?;
+        request.validate().map_err(|_| denied())?;
+        let ResourceRequest::ConversationMembersCheck { user_ids } = request else {
+            return Err(denied());
+        };
+        if user_ids.as_slice() != [claims.actor_id.as_str()] {
+            return Err(denied());
+        }
+        self.policy
+            .ensure_not_suspended(&claims.tenant_id, &claims.operation)
+            .await?;
+        let snapshot = self.snapshot(&claims.tenant_id, now).await?;
+        let projected = snapshot
+            .plugins
+            .iter()
+            .find(|p| p.grant.grant_id == claims.grant_id)
+            .ok_or_else(denied)?;
+        if claims.plugin_id != projected.grant.plugin_id
+            || claims.plugin_version != projected.grant.plugin_version
+            || claims.manifest_digest != projected.grant.manifest_digest
+            || claims.deployment_id != projected.deployment.deployment_id
+            || claims.grant_revision != projected.grant.revision
+            || claims.configuration_digest != projected.configuration_digest
+            || claims.expires_at_ms > projected.grant.valid_until_ms
+        {
+            return Err(denied());
+        }
+        projected
+            .authorize_event(
+                flare_im_capability_core::plugin::event::MESSAGE_CREATED,
+                &claims.operation,
+                &claims.actor_id,
+                now,
+            )
+            .map_err(|_| denied())?;
+        let op = projected
+            .manifest()
+            .operation(&claims.operation)
+            .ok_or_else(denied)?;
+        if !op
+            .host_capabilities
+            .contains(&HostCapability::ConversationMembersCheck)
+        {
+            return Err(denied());
+        }
+        if !self
+            .budget
+            .reserve(
+                &claims.tenant_id,
+                &claims.plugin_id,
+                &claims.actor_id,
+                &claims.event_id,
+                claims.expires_at_ms,
+            )
+            .await?
+        {
+            return Err(denied());
+        }
+        let members = self
+            .backend
+            .tenant_members(
+                &claims.tenant_id,
+                &claims.conversation_id,
+                &claims.event_id,
+                &user_ids,
+            )
+            .await?;
+        let fresh_now = chrono::Utc::now().timestamp_millis();
+        let fresh = self.snapshot(&claims.tenant_id, fresh_now).await?;
+        let current = fresh
+            .plugins
+            .iter()
+            .find(|p| p.grant.grant_id == claims.grant_id)
+            .ok_or_else(denied)?;
+        if fresh_now >= claims.expires_at_ms
+            || current.deployment != projected.deployment
+            || current.configuration_digest != claims.configuration_digest
+            || current.grant.revision != claims.grant_revision
+        {
+            return Err(denied());
+        }
+        current
+            .authorize_event(
+                flare_im_capability_core::plugin::event::MESSAGE_CREATED,
+                &claims.operation,
+                &claims.actor_id,
+                fresh_now,
+            )
+            .map_err(|_| denied())?;
+        self.policy
+            .ensure_not_suspended(&claims.tenant_id, &claims.operation)
+            .await?;
+        serde_json::to_value(MembersCheckView::partition(&user_ids, |id| {
+            members.contains(id)
+        }))
+        .map_err(|_| denied())
+    }
+
+    async fn snapshot(&self, tenant: &str, now: i64) -> Result<Arc<PluginRuntimeSnapshot>> {
         let snapshot = self
             .authorization
             .plugin_snapshot(tenant)
@@ -299,6 +427,9 @@ impl ResourceBridge {
             .map_err(|_| denied())?
             .ok_or_else(denied)?;
         snapshot.validate(now).map_err(|_| denied())?;
+        if snapshot.tenant_id != tenant {
+            return Err(denied());
+        }
         Ok(snapshot)
     }
 
@@ -502,10 +633,8 @@ impl ResourceBridge {
             .await?;
         let snapshot = self.snapshot(&claims.tenant_id, now).await?;
         let projected = grant_of(&snapshot, &claims.grant_id)?;
-        if super::remote_dispatch::restricted_operations(
-            &projected.manifest().map_err(|_| denied())?,
-        )
-        .contains(&claims.operation)
+        if super::remote_dispatch::restricted_operations(projected.manifest())
+            .contains(&claims.operation)
         {
             return Err(denied());
         }
@@ -563,7 +692,7 @@ impl ResourceBridge {
         if claims.configuration_digest != projected.configuration_digest {
             return Err(denied());
         }
-        let manifest = projected.manifest().map_err(|_| denied())?;
+        let manifest = projected.manifest();
         if !manifest.admin_operations().contains(&claims.operation) {
             return Err(denied());
         }
@@ -613,7 +742,7 @@ impl ResourceBridge {
             expires_at_ms,
         )?;
         // The deployment holds the capability only through an approved operation that declares it.
-        let manifest = projected.manifest().map_err(|_| denied())?;
+        let manifest = projected.manifest();
         let declared = manifest
             .capabilities
             .iter()
@@ -662,10 +791,7 @@ struct Writer {
     expires_at_ms: i64,
 }
 
-fn grant_of<'s>(
-    snapshot: &'s PluginRuntimeSnapshot,
-    grant_id: &str,
-) -> Result<&'s ProjectedPlugin> {
+fn grant_of<'s>(snapshot: &'s PluginRuntimeSnapshot, grant_id: &str) -> Result<&'s ResolvedPlugin> {
     snapshot
         .plugins
         .iter()
@@ -675,7 +801,7 @@ fn grant_of<'s>(
 
 /// The credential names exactly the current grant, deployment and manifest.
 fn require_identity(
-    projected: &ProjectedPlugin,
+    projected: &ResolvedPlugin,
     plugin_id: &str,
     plugin_version: &str,
     manifest_digest: &str,
@@ -706,14 +832,14 @@ fn write_capability(operation: &str) -> Option<HostCapability> {
 /// permission whose data scope is the capability id). The writer holds the permissions the
 /// installation approved (plugin platform v2 §2): the projection authorizes, no per-user grant.
 fn authorize_writing_operation(
-    projected: &ProjectedPlugin,
+    projected: &ResolvedPlugin,
     capability: HostCapability,
     tenant_id: &str,
     actor_id: &str,
     operation: &str,
     now: i64,
 ) -> Result<()> {
-    let manifest = projected.manifest().map_err(|_| denied())?;
+    let manifest = projected.manifest();
     let op = manifest.operation(operation).ok_or_else(denied)?;
     if !op.host_capabilities.contains(&capability) {
         return Err(denied());

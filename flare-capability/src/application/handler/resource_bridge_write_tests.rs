@@ -23,8 +23,10 @@ impl PluginAuthorizationReader for Projection {
     async fn plugin_snapshot(
         &self,
         tenant: &str,
-    ) -> flare_server_core::error::Result<Option<PluginRuntimeSnapshot>> {
-        Ok(Some(self.0.lock().unwrap().clone()).filter(|s| s.tenant_id == tenant))
+    ) -> flare_server_core::error::Result<Option<Arc<PluginRuntimeSnapshot>>> {
+        Ok(Some(self.0.lock().unwrap().clone())
+            .filter(|s| s.tenant_id == tenant)
+            .map(Arc::new))
     }
 }
 struct Budget;
@@ -85,7 +87,6 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let policy = Arc::new(InMemoryCapabilityGrants::new());
-    policy.grant_user_capability("app-a", "u1", "example.poll.vote", None, None, None);
     let bindings = Arc::new(MemoryBindings::default());
     bindings.bind("app-a", "example.poll", "poll-1", "2-group", "m-1");
     let sink = Arc::new(RecordingSink::default());

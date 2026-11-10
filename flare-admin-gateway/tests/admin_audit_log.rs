@@ -242,23 +242,7 @@ async fn sensitive_reads_and_writes_are_audited_other_reads_are_not() {
         ),
         (
             "POST",
-            "/api/v1/admin/plugins/register",
-            Some(
-                r#"{"plugin_id":"plugin-c","capability_id":"example.poll","grpc_authority":"http://plugin:9","plugin_version":"1.0.0","api_version":"1.0","manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","declared_operations":["example.poll"]}"#,
-            ),
-            "plugins.register",
-            "plugin-c",
-        ),
-        (
-            "POST",
-            "/api/v1/admin/plugins/deregister",
-            Some(r#"{"plugin_id":"plugin-c"}"#),
-            "plugins.deregister",
-            "plugin-c",
-        ),
-        (
-            "POST",
-            "/api/v1/admin/hooks",
+            "/api/v1/admin/platform/hooks",
             Some(r#"{"name":"dlp","hook_type":"message_pre_send"}"#),
             "hooks.create",
             "dlp",
@@ -398,7 +382,12 @@ async fn sensitive_reads_and_writes_are_audited_other_reads_are_not() {
     let body = format!(r#"{{"name":"{long_name}","hook_type":"message_pre_send"}}"#);
     send(
         &h.router,
-        admin_request_with_body("POST", "/api/v1/admin/hooks", &h.gateway, Some(&body)),
+        admin_request_with_body(
+            "POST",
+            "/api/v1/admin/platform/hooks",
+            &h.gateway,
+            Some(&body),
+        ),
     )
     .await;
     let events = capture.take();

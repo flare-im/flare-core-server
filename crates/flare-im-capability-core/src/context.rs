@@ -32,15 +32,3 @@ impl CapabilityInvokeMeta {
         }
     }
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreSendEvaluateInput {
-    pub meta: CapabilityInvokeMeta,
-    pub sender_user_id: String,
-    pub conversation_id: String,
-    pub conversation_kind: ConversationKind,
-    pub payload_type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Vec<u8>>,
-    pub ext: Value,
-}

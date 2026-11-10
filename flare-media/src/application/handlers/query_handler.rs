@@ -31,6 +31,36 @@ pub struct MediaQueryHandler {
 }
 
 impl MediaQueryHandler {
+    pub fn handle_admin_upload_policy(
+        &self,
+        ctx: &Context,
+        purpose: crate::domain::model::MediaPurpose,
+    ) -> Result<crate::domain::model::AdminImageUploadPolicy> {
+        self.domain_service.admin_upload_policy(ctx, purpose)
+    }
+
+    pub async fn handle_validate_application_media(
+        &self,
+        ctx: &Context,
+        file_id: &str,
+        purpose: crate::domain::model::MediaPurpose,
+    ) -> Result<MediaFileMetadata> {
+        self.domain_service
+            .validate_application_media(ctx, file_id, purpose)
+            .await
+    }
+
+    pub async fn handle_resolve_application_avatar_media(
+        &self,
+        ctx: &Context,
+        file_id: &str,
+        expires_in: i64,
+    ) -> Result<PresignedUrl> {
+        self.domain_service
+            .resolve_application_avatar_media(ctx, file_id, expires_in)
+            .await
+    }
+
     pub fn new(domain_service: Arc<MediaService>) -> Self {
         Self { domain_service }
     }

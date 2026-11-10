@@ -1,17 +1,21 @@
 //! Wire 风格的依赖注入模块
 //!
-//! Message Ingest 只负责上行消息摄入：发送 gRPC、seq 分配、WAL、Pre/PostSend Hook、
+//! Message Ingest 只负责上行消息摄入：发送 gRPC、seq 分配、WAL、PreSend Hook、
 //! conversation ensure 与写入主消息流。主流消费、存储/推送 fanout 和消息操作事件由
 //! `flare-orchestrator` 独立承担。
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use flare_im_contracts::service_names::{CONVERSATION, MESSAGE_INGEST, STORAGE_READER};
 use flare_im_hooks::hooks::adapters::DefaultHookFactory;
+use flare_im_hooks::hooks::execution::{
+    HookExecutionBuffer, HookExecutionGuard, HookExecutionMetrics, HookExecutionObserver,
+    HookExecutionSink, HookRuntimeSettings, MetricsOnlyHookExecutions,
+};
 use flare_im_hooks::hooks::{
-    HookConfig, HookConfigLoader, HookDefinition, HookDispatcher, HookRegistry, HookTransportConfig,
+    HookConfig, HookConfigLoader, HookConfigReloader, HookConfigStore, HookDispatcher, HookRegistry,
 };
 use flare_im_message_pipeline::{ConversationClient, MqPushRepository, RecipientRepositoryImpl};
 use flare_im_seq::SequenceAllocator;
@@ -23,9 +27,7 @@ use flare_server_core::error::{AnyhowContext, Result};
 use flare_server_core::mq::kafka::KafkaProducer;
 use flare_server_core::mq::nats::NatsProducer;
 
-use crate::application::extension::{
-    ExtensionOrchestrator, ExtensionPolicy, ExtensionRouting, ExtensionRuntimePolicy,
-};
+use crate::application::extension::{ExtensionOrchestrator, ExtensionRouting};
 use crate::application::handlers::{
     MessageIngestHandler, SendRateLimitConfig, SendRateLimiter, WalReplayHandler,
 };
@@ -35,6 +37,7 @@ use crate::domain::service::{
     MessageIngestServiceOptions,
 };
 use crate::infrastructure::messaging::conversation_ensure_publisher::MqConversationEnsurePublisher;
+use crate::infrastructure::persistence::postgres_hook_store::PostgresHookStore;
 use crate::infrastructure::persistence::redis_wal::RedisWalRepository;
 use crate::infrastructure::persistence::wal_repository_impl::WalRepositoryItem;
 use crate::interface::grpc::MessageSendGrpcHandler;
@@ -46,6 +49,22 @@ pub struct ApplicationContext {
     pub config: Arc<MessageIngestConfig>,
     /// 用量预聚合（`messages.accepted`）；启动层把它的 flush 循环挂进运行时。
     pub usage: flare_im_usage::UsageReporter,
+    /// Hook 配置热加载与执行记录写入；启动层把它们挂进运行时。
+    pub hook_tasks: HookBackgroundTasks,
+}
+
+/// Hook 运行时的后台任务（配了 Core 库时才有）。
+#[derive(Default)]
+pub struct HookBackgroundTasks {
+    pub reloader: Option<HookConfigReloader>,
+    pub writer: Option<HookExecutionWriter>,
+}
+
+/// 执行记录的批量写入：缓冲、去处与刷新间隔。
+pub struct HookExecutionWriter {
+    pub buffer: Arc<HookExecutionBuffer>,
+    pub sink: Arc<dyn HookExecutionSink>,
+    pub flush_interval: Duration,
 }
 
 /// 构建应用上下文。
@@ -60,10 +79,13 @@ async fn initialize_with_config(
     app_config: &flare_im_service_kit::config::FlareAppConfig,
     config: Arc<MessageIngestConfig>,
 ) -> Result<ApplicationContext> {
-    // Validate and install the policy before Redis/MQ I/O or any background work.
-    // A broken explicit policy path must fail startup even when infrastructure is down.
-    let hook_dispatcher =
-        build_hook_dispatcher(config.as_ref(), app_config.uses_static_registry()).await?;
+    // Validate the deployment policy before any I/O: a broken explicit policy path must fail
+    // startup even when infrastructure is down. The database hooks come next, ahead of Redis/MQ:
+    // when they cannot be read the service does not become ready.
+    let static_registry_mode = app_config.uses_static_registry();
+    let deployment_hooks = load_deployment_hooks(config.as_ref(), static_registry_mode)?;
+    let (hook_dispatcher, hook_tasks) =
+        build_hook_runtime(config.as_ref(), &deployment_hooks, static_registry_mode).await?;
 
     let redis_client = build_redis_client(&config).await?;
     let mq_producer = build_mq_producer(&config).await?;
@@ -175,16 +197,6 @@ async fn initialize_with_config(
 
     let extension_orchestrator = Arc::new(ExtensionOrchestrator::new(
         hook_execution_service,
-        ExtensionPolicy::new(config.extension_post_send_fail_open).with_runtime(
-            ExtensionRuntimePolicy::new(
-                config.extension_pre_send_timeout_ms,
-                config.extension_pre_send_retry,
-            ),
-            ExtensionRuntimePolicy::new(
-                config.extension_post_send_timeout_ms,
-                config.extension_post_send_retry,
-            ),
-        ),
         ExtensionRouting::new(
             config.extension_tenant_allowlist.clone(),
             config.extension_hook_message_type_allowlist.clone(),
@@ -323,6 +335,7 @@ async fn initialize_with_config(
         wal_replay_handler,
         config,
         usage,
+        hook_tasks,
     })
 }
 
@@ -384,122 +397,22 @@ async fn build_mq_producer(
     }
 }
 
-fn inject_flare_capability_hook_plugin_targets(cfg: &mut HookConfig, endpoint: String) {
-    cfg.pre_send.push(HookDefinition {
-        name: "flare_capability_hook_plugin_pre_send".into(),
-        description: Some("Remote HookPlugin.Call pre_send (flare-capability gRPC)".into()),
-        enabled: true,
-        priority: 100,
-        transport: HookTransportConfig::Grpc {
-            endpoint: endpoint.clone(),
-            metadata: HashMap::new(),
-        },
-        ..Default::default()
-    });
-    cfg.post_send.push(HookDefinition {
-        name: "flare_capability_hook_plugin_post_send".into(),
-        description: Some("Remote HookPlugin.Call post_send (flare-capability gRPC)".into()),
-        enabled: true,
-        priority: 100,
-        transport: HookTransportConfig::Grpc {
-            endpoint,
-            metadata: HashMap::new(),
-        },
-        ..Default::default()
-    });
-}
-
-/// The deployment owns the execution plan. Never infer plugin ownership from
-/// a product's endpoint substring, hook name prefix or metadata convention.
-fn apply_capability_delegation(
-    cfg: &mut HookConfig,
-    enabled: bool,
-    raw: Option<&str>,
-) -> Result<usize> {
-    let reject = || {
-        flare_server_core::error::FlareError::system("invalid explicit capability hook delegation")
-    };
-    if enabled
-        && (cfg
-            .pre_send
-            .iter()
-            .any(|h| h.name == "flare_capability_hook_plugin_pre_send")
-            || cfg
-                .post_send
-                .iter()
-                .any(|h| h.name == "flare_capability_hook_plugin_post_send"))
-    {
-        return Err(reject());
-    }
-    let Some(raw) = raw else {
-        return Ok(0);
-    };
-    if raw.len() > 8192 {
-        return Err(reject());
-    }
-    let names: Vec<String> = serde_json::from_str(raw).map_err(|_| reject())?;
-    if names.len() > 64 || (!enabled && !names.is_empty()) {
-        return Err(reject());
-    }
-    let mut unique = std::collections::HashSet::new();
-    for name in &names {
-        if name.is_empty()
-            || name.len() > 128
-            || name.chars().any(char::is_control)
-            || !unique.insert(name.as_str())
-            || cfg
-                .pre_send
-                .iter()
-                .filter(|hook| hook.name == *name)
-                .count()
-                != 1
-            || cfg
-                .pre_send
-                .iter()
-                .any(|hook| hook.name == *name && !hook.enabled)
-        {
-            return Err(reject());
-        }
-    }
-    let before = cfg.pre_send.len();
-    cfg.pre_send
-        .retain(|hook| !unique.contains(hook.name.as_str()));
-    Ok(before - cfg.pre_send.len())
-}
-
 fn validate_static_hook_routes(hook_cfg: &HookConfig, static_registry_mode: bool) -> Result<()> {
     if !static_registry_mode {
         return Ok(());
     }
-    for (kind, hooks) in [
-        ("pre_send", &hook_cfg.pre_send),
-        ("post_send", &hook_cfg.post_send),
-        ("delivery", &hook_cfg.delivery),
-        ("recall", &hook_cfg.recall),
-    ] {
-        for hook in hooks.iter().filter(|hook| hook.enabled) {
-            if let HookTransportConfig::Grpc { endpoint, .. } = &hook.transport {
-                let explicit_http =
-                    endpoint.starts_with("http://") || endpoint.starts_with("https://");
-                if !explicit_http
-                    || tonic::transport::Endpoint::from_shared(endpoint.clone()).is_err()
-                {
-                    return Err(flare_server_core::error::FlareError::system(format!(
-                        "{kind} hook {} requires an explicit private http(s) gRPC URI in FLARE_REGISTRY_MODE=static; discovery:// routes cannot resolve",
-                        hook.name
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+    hook_cfg
+        .pre_send
+        .iter()
+        .filter(|hook| hook.enabled)
+        .try_for_each(|hook| hook.validate_static_route())
 }
 
-async fn build_hook_dispatcher(
+/// 部署文件：缺失或非法就报错，服务不启动。
+fn load_deployment_hooks(
     ingest_cfg: &MessageIngestConfig,
     static_registry_mode: bool,
-) -> Result<Arc<HookDispatcher>> {
-    let registry = HookRegistry::new();
+) -> Result<HookConfig> {
     let mut loader = HookConfigLoader::new();
     if let Some(ref p) = ingest_cfg.hook_config {
         loader = loader.add_candidate(PathBuf::from(p));
@@ -507,69 +420,128 @@ async fn build_hook_dispatcher(
     if let Some(ref d) = ingest_cfg.hook_config_dir {
         loader = loader.add_candidate(PathBuf::from(d));
     }
-
-    let mut hook_cfg = loader.load().map_err(|e| {
+    let hook_cfg = loader.load().map_err(|e| {
         flare_server_core::error::FlareError::system(format!("load hook config: {e}"))
     })?;
-
-    // Validate the original routes before explicit delegation can conceal a
-    // broken static deployment profile.
     validate_static_hook_routes(&hook_cfg, static_registry_mode)?;
+    Ok(hook_cfg)
+}
 
-    let removed = apply_capability_delegation(
-        &mut hook_cfg,
-        ingest_cfg.capability_hooks_auto,
-        ingest_cfg.capability_delegated_pre_send.as_deref(),
-    )?;
-
-    if ingest_cfg.capability_hooks_auto {
-        let ep = ingest_cfg.resolve_capability_grpc_uri();
-        inject_flare_capability_hook_plugin_targets(&mut hook_cfg, ep);
-        if removed > 0 {
-            tracing::info!(
-                removed,
-                "delegated explicitly selected pre_send hooks to capability"
-            );
-        }
+/// 部署摘要里写的来源：配置的路径，没配时是内置的空 profile。
+fn deployment_source(ingest_cfg: &MessageIngestConfig) -> String {
+    let paths: Vec<&str> = [
+        ingest_cfg.hook_config.as_deref(),
+        ingest_cfg.hook_config_dir.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if paths.is_empty() {
+        "embedded:hooks.core.toml".to_string()
+    } else {
+        paths.join(",")
     }
+}
 
-    // Also inspect generated capability targets before Redis/MQ initialization.
-    validate_static_hook_routes(&hook_cfg, static_registry_mode)?;
+/// 执行证据与熔断参数的配置文件（环境变量优先）。
+fn hook_runtime_config_file() -> PathBuf {
+    std::env::var("MESSAGE_INGEST_RUNTIME_CONFIG_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("config/services/message-ingest.toml"))
+}
 
-    let factory = DefaultHookFactory::new().map_err(|e| {
+/// 一个 Hook 运行时：部署文件装进部署段，`hook_configs` 全量读进平台段和应用段。读不到库就报错，
+/// 服务不就绪。没配 Core 库的进程（本地联调）只跑部署 Hook，不记录执行证据。
+async fn build_hook_runtime(
+    ingest_cfg: &MessageIngestConfig,
+    deployment_hooks: &HookConfig,
+    static_registry_mode: bool,
+) -> Result<(Arc<HookDispatcher>, HookBackgroundTasks)> {
+    let registry = HookRegistry::new();
+    let factory = Arc::new(DefaultHookFactory::new().map_err(|e| {
         flare_server_core::error::FlareError::system(format!("hook DefaultHookFactory: {e}"))
-    })?;
+    })?);
 
     // DefaultHookFactory installs each enabled definition or returns an error.
     // Disabled definitions must not masquerade as active policy gates in logs.
-    let pre_n = hook_cfg.pre_send.iter().filter(|hook| hook.enabled).count();
-    let post_n = hook_cfg
-        .post_send
-        .iter()
-        .filter(|hook| hook.enabled)
-        .count();
-    let delivery_n = hook_cfg.delivery.iter().filter(|hook| hook.enabled).count();
-    let recall_n = hook_cfg.recall.iter().filter(|hook| hook.enabled).count();
-
-    hook_cfg
-        .install(registry.clone(), &factory)
-        .await
+    deployment_hooks
+        .install(&registry, factory.as_ref())
         .map_err(|e| flare_server_core::error::FlareError::system(format!("install hooks: {e}")))?;
-
     tracing::info!(
-        pre_send = pre_n,
-        post_send = post_n,
-        delivery = delivery_n,
-        recall = recall_n,
-        capability_hooks_auto = ingest_cfg.capability_hooks_auto,
+        pre_send = deployment_hooks.enabled_count(),
         "message ingest hooks installed"
     );
 
-    Ok(Arc::new(HookDispatcher::new(registry)))
+    let settings = HookRuntimeSettings::from_sources(Some(hook_runtime_config_file().as_path()));
+    let metrics = HookExecutionMetrics::registered();
+    let mut tasks = HookBackgroundTasks::default();
+    let mut observer: Arc<dyn HookExecutionObserver> =
+        Arc::new(MetricsOnlyHookExecutions::new(Arc::clone(&metrics)));
+
+    match ingest_cfg.tenant_runtime_postgres_url.as_deref() {
+        Some(url) => {
+            let store = Arc::new(PostgresHookStore::connect_lazy(url)?);
+            let mut reloader = HookConfigReloader::new(
+                Arc::clone(&store) as Arc<dyn HookConfigStore>,
+                Arc::clone(&registry),
+                factory,
+                static_registry_mode,
+            );
+            reloader.load_initial().await.map_err(|e| {
+                flare_server_core::error::FlareError::system(format!("load database hooks: {e}"))
+            })?;
+            tasks.reloader = Some(reloader);
+
+            // 摘要只给页面看：写不进去不影响发送。
+            if let Err(error) = store
+                .write_deployment_summary(
+                    MESSAGE_INGEST,
+                    &deployment_source(ingest_cfg),
+                    &deployment_hooks.summary(),
+                    ingest_cfg.server_id.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(%error, "deployment hook summary not written");
+            }
+
+            if settings.executions.enabled {
+                let buffer = Arc::new(HookExecutionBuffer::new(
+                    settings.executions.buffer_settings(),
+                    metrics,
+                ));
+                observer = buffer.clone();
+                tasks.writer = Some(HookExecutionWriter {
+                    buffer,
+                    sink: store,
+                    flush_interval: settings.executions.flush_interval,
+                });
+            } else {
+                tracing::info!("hook execution recording disabled; circuit breakers stay on");
+            }
+        }
+        None => tracing::warn!(
+            "Core database not configured for message-ingest: only deployment hooks run, and hook executions are not recorded"
+        ),
+    }
+
+    let dispatcher = HookDispatcher::new(registry)
+        .with_guard(Arc::new(HookExecutionGuard::new(
+            settings.circuit,
+            observer,
+        )))
+        .with_budget(Duration::from_millis(
+            ingest_cfg.extension_pre_send_timeout_ms,
+        ));
+    Ok((Arc::new(dispatcher), tasks))
 }
 
 #[cfg(test)]
 mod hook_startup_tests {
+    use std::collections::HashMap;
+
+    use flare_im_hooks::hooks::{HookDefinition, HookTransportConfig};
+
     use super::*;
 
     #[test]
@@ -599,69 +571,7 @@ mod hook_startup_tests {
             );
         }
         let cfg: HookConfig = toml::from_str(include_str!("../../config/hooks.core.toml")).unwrap();
-        assert!(
-            cfg.pre_send.is_empty()
-                && cfg.post_send.is_empty()
-                && cfg.delivery.is_empty()
-                && cfg.recall.is_empty()
-        );
-    }
-
-    #[test]
-    fn delegation_is_explicit_product_neutral_and_failure_is_non_mutating() {
-        let mut cfg = HookConfig::default();
-        for (name, endpoint) in [
-            ("customer-policy", "http://business-a:9000"),
-            ("audit-policy", "http://business-b:9000"),
-        ] {
-            cfg.pre_send.push(HookDefinition {
-                name: name.into(),
-                transport: HookTransportConfig::Grpc {
-                    endpoint: endpoint.into(),
-                    metadata: HashMap::new(),
-                },
-                ..Default::default()
-            });
-        }
-        assert_eq!(
-            apply_capability_delegation(&mut cfg, true, None).unwrap(),
-            0
-        );
-        for raw in [
-            "not-json",
-            r#"["missing"]"#,
-            r#"["customer-policy","customer-policy"]"#,
-            r#"["customer-policy","missing"]"#,
-        ] {
-            assert!(apply_capability_delegation(&mut cfg, true, Some(raw)).is_err());
-            assert_eq!(cfg.pre_send.len(), 2);
-        }
-        assert!(
-            apply_capability_delegation(&mut cfg, false, Some(r#"["customer-policy"]"#)).is_err()
-        );
-        assert_eq!(
-            apply_capability_delegation(&mut cfg, true, Some(r#"["customer-policy"]"#)).unwrap(),
-            1
-        );
-        assert_eq!(cfg.pre_send[0].name, "audit-policy");
-        inject_flare_capability_hook_plugin_targets(&mut cfg, "http://capability:9010".into());
-        assert_eq!(cfg.pre_send.len(), 2);
-        assert_eq!(cfg.post_send.len(), 1);
-    }
-
-    #[test]
-    fn a_product_endpoint_name_never_implicitly_disables_a_direct_gate() {
-        let mut cfg = HookConfig::default();
-        cfg.pre_send.push(HookDefinition {
-            name: "required-gate".into(),
-            transport: HookTransportConfig::Grpc {
-                endpoint: "http://customer.example/flare-social-hook".into(),
-                metadata: HashMap::new(),
-            },
-            ..Default::default()
-        });
-        apply_capability_delegation(&mut cfg, true, None).unwrap();
-        assert_eq!(cfg.pre_send.len(), 1);
+        assert!(cfg.pre_send.is_empty());
     }
 
     #[test]
@@ -696,7 +606,7 @@ mod hook_startup_tests {
     }
 
     #[test]
-    fn static_mode_checks_all_enabled_hook_phases_only() {
+    fn static_mode_checks_enabled_hooks_only() {
         let discovery_hook = HookDefinition {
             name: "phase-hook".into(),
             transport: HookTransportConfig::Grpc {
@@ -711,17 +621,8 @@ mod hook_startup_tests {
             ..discovery_hook.clone()
         });
         assert!(validate_static_hook_routes(&config, true).is_ok());
-        for kind in 0..3 {
-            config.post_send.clear();
-            config.delivery.clear();
-            config.recall.clear();
-            match kind {
-                0 => config.post_send.push(discovery_hook.clone()),
-                1 => config.delivery.push(discovery_hook.clone()),
-                _ => config.recall.push(discovery_hook.clone()),
-            }
-            assert!(validate_static_hook_routes(&config, true).is_err());
-        }
+        config.pre_send.push(discovery_hook);
+        assert!(validate_static_hook_routes(&config, true).is_err());
     }
 
     #[test]
@@ -735,8 +636,8 @@ mod hook_startup_tests {
         assert!(validate_static_hook_routes(&config, true).is_err());
     }
 
-    #[tokio::test]
-    async fn capability_auto_cannot_hide_discovery_social_hook_in_static_mode() {
+    #[test]
+    fn the_deployment_gate_rejects_a_discovery_social_hook_in_static_mode() {
         let app_config = toml::from_str(
             r#"
             [service]
@@ -751,14 +652,26 @@ mod hook_startup_tests {
         let mut config = MessageIngestConfig::from_app_config(&app_config);
         config.hook_config =
             Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../config/hooks.social.toml").into());
-        config.capability_hooks_auto = true;
-        let error = match build_hook_dispatcher(&config, true).await {
-            Ok(_) => panic!("discovery Social hook must fail before capability auto-dedup"),
+        config.hook_config_dir = None;
+        let error = match load_deployment_hooks(&config, true) {
+            Ok(_) => panic!("a discovery Social hook must fail the static gate"),
             Err(error) => error,
         };
         assert!(
             error.to_string().contains("social-policy-pre-send"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn the_summary_names_the_configured_paths_or_the_embedded_profile() {
+        let mut config = MessageIngestConfig::default();
+        assert_eq!(deployment_source(&config), "embedded:hooks.core.toml");
+        config.hook_config = Some("/etc/flare/hooks.toml".into());
+        config.hook_config_dir = Some("/etc/flare/hooks.d".into());
+        assert_eq!(
+            deployment_source(&config),
+            "/etc/flare/hooks.toml,/etc/flare/hooks.d"
         );
     }
 

@@ -22,7 +22,7 @@ use super::audit_target::AuditTarget;
 use super::ops_handler::{admin_rpc_error, audit_write, verified_tenant};
 
 /// Media admin RPCs forward the verified Staff assertion unchanged; no private key here.
-pub struct AdminMediaIdentity(MediaCaller);
+pub struct AdminMediaIdentity(pub(super) MediaCaller);
 
 impl<S: Send + Sync> FromRequestParts<S> for AdminMediaIdentity {
     type Rejection = HttpApiError;
